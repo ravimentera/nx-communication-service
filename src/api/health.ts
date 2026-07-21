@@ -1,0 +1,89 @@
+/**
+ * Health endpoints.
+ *
+ *  GET /health           liveness — no dependencies touched, 200 if the process
+ *                        is up. Kubernetes restarts the pod on failure, so this
+ *                        must NOT fail because Postgres is briefly unreachable.
+ *  GET /health/detailed  readiness — pings each dependency and reports per-check
+ *                        status. 503 when a required dependency is down.
+ *
+ * The source's `health.routes.ts:128` called out to HEALTH_MONITOR_URL, a
+ * Mentera-internal service. That dependency is deliberately not carried over —
+ * this service checks its own dependencies directly.
+ */
+import { Router } from 'express';
+import type pg from 'pg';
+import type { Logger } from 'winston';
+
+import { checkConnection, getPoolStats } from '../platform/db/client.js';
+import type { RedisHandle } from '../platform/redis/index.js';
+
+export interface HealthDeps {
+  serviceName: string;
+  version: string;
+  pool: pg.Pool;
+  redis: RedisHandle;
+  logger: Logger;
+}
+
+type CheckStatus = 'up' | 'down' | 'degraded';
+
+interface CheckResult {
+  status: CheckStatus;
+  latencyMs?: number;
+  detail?: Record<string, unknown>;
+}
+
+async function timed(fn: () => Promise<boolean>): Promise<CheckResult> {
+  const start = process.hrtime.bigint();
+  const ok = await fn();
+  const latencyMs = Math.round(Number(process.hrtime.bigint() - start) / 1e5) / 10;
+  return { status: ok ? 'up' : 'down', latencyMs };
+}
+
+export function createHealthRouter(deps: HealthDeps): Router {
+  const router = Router();
+  const startedAt = Date.now();
+
+  router.get('/', (_req, res) => {
+    res.status(200).json({
+      status: 'ok',
+      service: deps.serviceName,
+      version: deps.version,
+      uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
+    });
+  });
+
+  router.get('/detailed', async (_req, res) => {
+    const [db, redis] = await Promise.all([
+      timed(() => checkConnection(deps.pool, deps.logger)),
+      timed(() => deps.redis.isConnected()),
+    ]);
+
+    // Redis being down is a DEGRADATION, not an outage: the platform falls back
+    // to an in-memory store and HTTP keeps serving. Only the database is
+    // required for readiness.
+    const checks = {
+      database: { ...db, detail: getPoolStats(deps.pool) as unknown as Record<string, unknown> },
+      redis: {
+        ...redis,
+        status: (redis.status === 'down' ? 'degraded' : 'up') as CheckStatus,
+        detail: { mode: deps.redis.connection ? 'redis' : 'in-memory' },
+      },
+      // Populated in P3 (queues) and P7 (pack registry).
+      queues: { status: 'up' as CheckStatus, detail: { note: 'not wired until P3' } },
+      packs: { status: 'up' as CheckStatus, detail: { note: 'not wired until P7' } },
+    };
+
+    const healthy = checks.database.status === 'up';
+    res.status(healthy ? 200 : 503).json({
+      status: healthy ? 'ok' : 'unhealthy',
+      service: deps.serviceName,
+      version: deps.version,
+      uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
+      checks,
+    });
+  });
+
+  return router;
+}

@@ -1,0 +1,92 @@
+/**
+ * Graceful degradation is a P1 exit criterion: the service must boot and serve
+ * when Redis is down.
+ */
+import winston from 'winston';
+
+import { Cache } from '../../../src/platform/redis/cache.js';
+import { createRedis } from '../../../src/platform/redis/index.js';
+
+const logger = winston.createLogger({ silent: true });
+const base = { keyPrefix: 'outreach:', skip: false, port: 6379 };
+
+describe('createRedis degradation', () => {
+  it('degrades to the in-memory store when SKIP_REDIS is set', async () => {
+    const redis = await createRedis({ ...base, skip: true }, logger);
+    expect(redis.connection).toBeNull();
+    expect(await redis.isConnected()).toBe(false);
+    await expect(redis.store.set('k', 'v')).resolves.toBeUndefined();
+    await expect(redis.store.get('k')).resolves.toBe('v');
+  });
+
+  it('degrades when no url or host is configured', async () => {
+    const redis = await createRedis(base, logger);
+    expect(redis.connection).toBeNull();
+  });
+
+  it('degrades rather than throwing when the server is unreachable', async () => {
+    const redis = await createRedis({ ...base, url: 'redis://127.0.0.1:1' }, logger);
+    expect(redis.connection).toBeNull();
+    expect(await redis.isConnected()).toBe(false);
+    await redis.close();
+  });
+});
+
+describe('in-memory store semantics', () => {
+  it('expires keys past their TTL', async () => {
+    const redis = await createRedis({ ...base, skip: true }, logger);
+    await redis.store.set('k', 'v', -1);
+    expect(await redis.store.get('k')).toBeNull();
+  });
+
+  it('matches globs in keys()', async () => {
+    const redis = await createRedis({ ...base, skip: true }, logger);
+    await redis.store.set('outreach:a:1', 'x');
+    await redis.store.set('outreach:a:2', 'x');
+    await redis.store.set('outreach:b:1', 'x');
+    expect((await redis.store.keys('outreach:a:*')).sort()).toEqual([
+      'outreach:a:1',
+      'outreach:a:2',
+    ]);
+  });
+});
+
+describe('Cache', () => {
+  it('namespaces keys with the configured prefix', async () => {
+    const redis = await createRedis({ ...base, skip: true }, logger);
+    const cache = new Cache(redis, logger);
+    expect(cache.key('recipient', 'r1')).toBe('outreach:recipient:r1');
+  });
+
+  it('round-trips JSON', async () => {
+    const redis = await createRedis({ ...base, skip: true }, logger);
+    const cache = new Cache(redis, logger);
+    await cache.set('k', { a: 1 });
+    expect(await cache.get<{ a: number }>('k')).toEqual({ a: 1 });
+  });
+
+  it('computes on miss and caches the result', async () => {
+    const redis = await createRedis({ ...base, skip: true }, logger);
+    const cache = new Cache(redis, logger);
+    // The `jest` global is not injected under ESM; a counter is simpler than
+    // pulling in @jest/globals for one call.
+    let calls = 0;
+    const compute = async () => {
+      calls += 1;
+      return { hit: false };
+    };
+
+    expect(await cache.wrap('k', compute)).toEqual({ hit: false });
+    expect(await cache.wrap('k', compute)).toEqual({ hit: false });
+    expect(calls).toBe(1);
+  });
+
+  it('invalidates by pattern', async () => {
+    const redis = await createRedis({ ...base, skip: true }, logger);
+    const cache = new Cache(redis, logger);
+    await cache.set(cache.key('t', '1'), 1);
+    await cache.set(cache.key('t', '2'), 2);
+    expect(await cache.invalidatePattern('outreach:t:*')).toBe(2);
+    expect(await cache.get(cache.key('t', '1'))).toBeNull();
+  });
+});

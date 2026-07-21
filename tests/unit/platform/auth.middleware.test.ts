@@ -1,0 +1,176 @@
+import express, { type Express, type Request } from 'express';
+import request from 'supertest';
+import winston from 'winston';
+
+import {
+  createAuthMiddleware,
+  Permission,
+  requirePermissions,
+  type AuthConfig,
+  type RequestIdentity,
+} from '../../../src/platform/http/auth.middleware.js';
+import { createErrorHandler } from '../../../src/platform/http/error-handler.js';
+
+const logger = winston.createLogger({ silent: true });
+
+function buildApp(config: Partial<AuthConfig> = {}): Express {
+  const app = express();
+  app.use(createAuthMiddleware({ config: { mode: 'gateway', ...config }, logger }));
+  app.get('/health', (_req, res) => void res.json({ status: 'ok' }));
+  app.get('/whoami', (req: Request, res) => void res.json(req.identity ?? null));
+  app.get('/admin', requirePermissions(Permission.CONFIG_WRITE), (_req, res) =>
+    void res.json({ ok: true }),
+  );
+  app.use(createErrorHandler({ logger, production: true }));
+  return app;
+}
+
+const GATEWAY = { 'x-gateway-request': 'true', 'x-user-id': 'u1', 'x-user-role': 'staff' };
+
+describe('createAuthMiddleware — gateway mode', () => {
+  it('rejects a non-gateway request with 403', async () => {
+    const res = await request(buildApp()).get('/whoami');
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('FORBIDDEN');
+  });
+
+  it('accepts x-internal-request: gateway as an alternative gate', async () => {
+    const res = await request(buildApp())
+      .get('/whoami')
+      .set({ 'x-internal-request': 'gateway', 'x-user-id': 'u1', 'x-user-role': 'staff' });
+    expect(res.status).toBe(200);
+  });
+
+  it('returns 401 when x-user-id is missing', async () => {
+    const res = await request(buildApp())
+      .get('/whoami')
+      .set({ 'x-gateway-request': 'true', 'x-user-role': 'staff' });
+    expect(res.status).toBe(401);
+    expect(res.body.error.code).toBe('UNAUTHENTICATED');
+  });
+
+  it('returns 401 when x-user-role is missing', async () => {
+    const res = await request(buildApp())
+      .get('/whoami')
+      .set({ 'x-gateway-request': 'true', 'x-user-id': 'u1' });
+    expect(res.status).toBe(401);
+  });
+
+  it('skips auth for /health', async () => {
+    const res = await request(buildApp()).get('/health');
+    expect(res.status).toBe(200);
+  });
+
+  it('skips auth for OPTIONS', async () => {
+    const res = await request(buildApp()).options('/whoami');
+    expect(res.status).not.toBe(403);
+  });
+});
+
+describe('createAuthMiddleware — dual-header tenancy window', () => {
+  it('populates tenantId from x-medspa-id alone', async () => {
+    const res = await request(buildApp()).get('/whoami').set({ ...GATEWAY, 'x-medspa-id': 'm1' });
+    expect((res.body as RequestIdentity).tenantId).toBe('m1');
+  });
+
+  it('lets x-tenant-id win when both are present', async () => {
+    const res = await request(buildApp())
+      .get('/whoami')
+      .set({ ...GATEWAY, 'x-medspa-id': 'm1', 'x-tenant-id': 't1' });
+    expect((res.body as RequestIdentity).tenantId).toBe('t1');
+  });
+
+  it('maps x-location-id to subTenantId and x-provider-id to senderId', async () => {
+    const res = await request(buildApp())
+      .get('/whoami')
+      .set({ ...GATEWAY, 'x-location-id': 'l1', 'x-provider-id': 'p1' });
+    expect((res.body as RequestIdentity).subTenantId).toBe('l1');
+    expect((res.body as RequestIdentity).senderId).toBe('p1');
+  });
+
+  it('lets the new names win for subTenantId and senderId too', async () => {
+    const res = await request(buildApp())
+      .get('/whoami')
+      .set({
+        ...GATEWAY,
+        'x-location-id': 'l1',
+        'x-sub-tenant-id': 's1',
+        'x-provider-id': 'p1',
+        'x-sender-id': 'snd1',
+      });
+    expect((res.body as RequestIdentity).subTenantId).toBe('s1');
+    expect((res.body as RequestIdentity).senderId).toBe('snd1');
+  });
+});
+
+describe('createAuthMiddleware — permissions parsing', () => {
+  it('parses a JSON array', async () => {
+    const res = await request(buildApp())
+      .get('/whoami')
+      .set({ ...GATEWAY, 'x-user-permissions': JSON.stringify(['outreach:send']) });
+    expect((res.body as RequestIdentity).permissions).toEqual(['outreach:send']);
+  });
+
+  it('falls back to [] on malformed JSON without throwing', async () => {
+    const res = await request(buildApp())
+      .get('/whoami')
+      .set({ ...GATEWAY, 'x-user-permissions': '{not json' });
+    expect(res.status).toBe(200);
+    expect((res.body as RequestIdentity).permissions).toEqual([]);
+  });
+
+  it('falls back to [] when the JSON is valid but not an array', async () => {
+    const res = await request(buildApp())
+      .get('/whoami')
+      .set({ ...GATEWAY, 'x-user-permissions': '{"a":1}' });
+    expect((res.body as RequestIdentity).permissions).toEqual([]);
+  });
+});
+
+describe('createAuthMiddleware — AUTH_MODE seam', () => {
+  it('returns 501 for apikey mode', async () => {
+    const res = await request(buildApp({ mode: 'apikey' })).get('/whoami').set(GATEWAY);
+    expect(res.status).toBe(501);
+    expect(res.body.error.code).toBe('NOT_IMPLEMENTED');
+  });
+
+  it('returns 501 for jwt mode', async () => {
+    const res = await request(buildApp({ mode: 'jwt' })).get('/whoami').set(GATEWAY);
+    expect(res.status).toBe(501);
+  });
+
+  it('gatewayOnly=false accepts a direct request', async () => {
+    const res = await request(buildApp({ gatewayOnly: false }))
+      .get('/whoami')
+      .set({ 'x-user-id': 'u1', 'x-user-role': 'staff' });
+    expect(res.status).toBe(200);
+  });
+});
+
+describe('requirePermissions', () => {
+  it('403s when the permission is absent', async () => {
+    const res = await request(buildApp()).get('/admin').set(GATEWAY);
+    expect(res.status).toBe(403);
+  });
+
+  it('passes when the permission is present', async () => {
+    const res = await request(buildApp())
+      .get('/admin')
+      .set({ ...GATEWAY, 'x-user-permissions': JSON.stringify([Permission.CONFIG_WRITE]) });
+    expect(res.status).toBe(200);
+  });
+
+  it('short-circuits for the admin role', async () => {
+    const res = await request(buildApp())
+      .get('/admin')
+      .set({ ...GATEWAY, 'x-user-role': 'admin' });
+    expect(res.status).toBe(200);
+  });
+
+  it('short-circuits for the admin permission', async () => {
+    const res = await request(buildApp())
+      .get('/admin')
+      .set({ ...GATEWAY, 'x-user-permissions': JSON.stringify([Permission.ADMIN]) });
+    expect(res.status).toBe(200);
+  });
+});

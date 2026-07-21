@@ -1,31 +1,89 @@
+import cors from 'cors';
 import express, { type Express } from 'express';
+import helmet from 'helmet';
+import type pg from 'pg';
+import type { Logger } from 'winston';
 
-import { loadConfig, type Config } from './config/index.js';
+import { createHealthRouter } from './api/health.js';
+import type { Config } from './config/index.js';
+import { createAuthMiddleware } from './platform/http/auth.middleware.js';
+import { createErrorHandler, notFoundHandler } from './platform/http/error-handler.js';
+import { createObservabilityMiddleware } from './platform/observability/middleware.js';
+import { metricsHandler } from './platform/observability/metrics.js';
+import type { RedisHandle } from './platform/redis/index.js';
+
+export const VERSION = '0.1.0';
+
+export interface AppDeps {
+  config: Config;
+  logger: Logger;
+  pool: pg.Pool;
+  redis: RedisHandle;
+}
 
 /**
- * P0 placeholder application.
+ * Wire the HTTP surface. TWO ORDERING SUBTLETIES ARE LOAD-BEARING, both
+ * inherited from the source service — do not "tidy" them:
  *
- * P1 turns this into the real composition root and adds — in this order, both
- * orderings load-bearing — observability middleware, `/metrics` BEFORE auth,
- * `/mcp` BEFORE auth, then the auth middleware, then the routers.
+ *   1. `/metrics` is mounted BEFORE auth. Prometheus scrapes with no gateway
+ *      headers; behind auth every scrape would 403.
+ *   2. `/mcp` is mounted BEFORE auth (P8). tera-orchestrator hits GET /mcp/tools
+ *      at its own startup with no per-user headers. Discovery is schema-only;
+ *      individual tool executions still validate their input.
  */
-export function createApp(config: Config = loadConfig()): Express {
+export function createApp(deps: AppDeps): Express {
+  const { config, logger } = deps;
   const app = express();
 
+  app.disable('x-powered-by');
+
+  // First, so every request downstream is measured and correlated.
+  app.use(
+    createObservabilityMiddleware({
+      serviceName: config.observability.serviceName,
+      logger,
+    }),
+  );
+
+  // (1) Pre-auth: Prometheus has no gateway headers.
+  app.get('/metrics', (req, res) => {
+    void metricsHandler(req, res);
+  });
+
+  app.use(helmet());
+  app.use(cors());
   app.use(express.json({ limit: '5mb' }));
   app.use(express.urlencoded({ extended: true, limit: '5mb' }));
 
-  app.get('/health', (_req, res) => {
-    res.status(200).json({ status: 'ok', service: config.server.serviceName });
-  });
-
   app.get('/', (_req, res) => {
-    res.status(200).json({
-      service: config.server.serviceName,
-      version: '0.1.0',
+    res.json({
+      service: config.observability.serviceName,
+      version: VERSION,
       env: config.server.env,
+      health: '/health',
+      metrics: '/metrics',
     });
   });
+
+  app.use(
+    '/health',
+    createHealthRouter({
+      serviceName: config.observability.serviceName,
+      version: VERSION,
+      pool: deps.pool,
+      redis: deps.redis,
+      logger,
+    }),
+  );
+
+  // (2) P8 mounts the MCP router here, pre-auth.
+
+  app.use(createAuthMiddleware({ config: config.auth, logger }));
+
+  // P3 onward mount the business routers here.
+
+  app.use(notFoundHandler());
+  app.use(createErrorHandler({ logger, production: config.server.isProduction }));
 
   return app;
 }
