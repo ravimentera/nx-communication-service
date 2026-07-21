@@ -1,0 +1,16 @@
+node_modules
+dist
+logs
+uploads
+coverage
+tests
+.git
+.github
+.env
+.env.*
+!.env.example
+*.log
+*.md
+!migrations/README.md
+EXTRACTION_PLAN.html
+.DS_Store

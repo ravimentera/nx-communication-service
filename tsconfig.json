@@ -1,0 +1,37 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    /* Deliberate divergence from the source service, which runs strict:false. */
+    "strict": true,
+    "noUncheckedIndexedAccess": false,
+
+    "outDir": "dist",
+    "rootDir": "src",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+
+    /* Path aliases are declared for editor convenience only. PREFER RELATIVE
+     * IMPORTS with explicit .js extensions: aliases + ESM + NodeNext is the exact
+     * combination that forced the source repo's scripts/fix-imports.cjs hack.
+     * That hack is not carried over. */
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"]
+    },
+
+    "types": ["node"]
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "tests"]
+}

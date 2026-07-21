@@ -1,0 +1,83 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: outreach-postgres
+    environment:
+      POSTGRES_DB: outreach
+      POSTGRES_USER: outreach
+      POSTGRES_PASSWORD: outreach
+    # 5433 on the host so this never collides with a local Mentera Postgres.
+    ports:
+      - '5433:5432'
+    volumes:
+      - outreach-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U outreach -d outreach']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: outreach-redis
+    command: ['redis-server', '--appendonly', 'yes']
+    ports:
+      - '6380:6379'
+    volumes:
+      - outreach-redisdata:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  outreach:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: outreach-server
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      PORT: 5007
+      LOG_LEVEL: debug
+      DATABASE_URL: postgres://outreach:outreach@postgres:5432/outreach
+      REDIS_URL: redis://redis:6379
+      REDIS_KEY_PREFIX: 'outreach:'
+    ports:
+      - '5007:5007'
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:5007/health']
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+  # `docker compose --profile migrate run --rm migrate` PRINTS the commands an
+  # operator must run. It never touches the database. See migrations/README.md.
+  migrate:
+    profiles: ['migrate']
+    image: postgres:16-alpine
+    container_name: outreach-migrate-print
+    volumes:
+      - ./migrations:/migrations:ro
+    entrypoint: ['/bin/sh', '-c']
+    command:
+      - |
+        echo "Migrations are NEVER run by tooling. Run these yourself, in order:"
+        echo
+        for f in /migrations/[0-9]*.sql; do
+          [ -e "$$f" ] || { echo "  (no migrations yet)"; break; }
+          echo "  psql \"\$$DATABASE_URL\" -v ON_ERROR_STOP=1 -f migrations/$$(basename $$f)"
+        done
+        echo
+        echo "The 9xxx series are one-shot data migrations from the mentera-core"
+        echo "database — read docs/MIGRATION_RUNBOOK.md first."
+
+volumes:
+  outreach-pgdata:
+  outreach-redisdata:
