@@ -17,7 +17,6 @@
     "test:contract": "npm test -- tests/contract",
     "lint": "eslint 'src/**/*.ts'",
     "typecheck": "tsc --noEmit",
-    "db:generate": "drizzle-kit generate",
     "migrate:print": "node scripts/print-migrations.mjs"
   },
   "dependencies": {
@@ -49,6 +48,7 @@
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@testcontainers/postgresql": "^12.0.4",
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
     "@types/jest": "^29.5.14",

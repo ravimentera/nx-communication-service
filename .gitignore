@@ -13,8 +13,3 @@ uploads/
 .DS_Store
 .idea/
 .vscode/
-
-# Planning docs — live in the working tree, never committed
-COMMIT_PLAN.md
-EXTRACTION_PLAN.md
-EXTRACTION_PLAN.html
