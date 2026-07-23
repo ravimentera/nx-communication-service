@@ -33,6 +33,19 @@ if (schema.length === 0 && data.length === 0) {
     }
   }
   console.log('');
+
+  // The local dev database runs in Docker (docker-compose.yml) and a macOS host
+  // usually has no psql client. ./migrations is mounted read-only at /migrations
+  // inside the postgres container, so the same files are applied by the same
+  // psql, one version behind nothing.
+  console.log('No psql on this machine? Same files, same order, from inside the');
+  console.log('local container (docs/LOCAL_DEV.md):\n');
+  for (const f of schema) {
+    console.log(
+      `  docker compose exec -T postgres psql -U outreach -d outreach -v ON_ERROR_STOP=1 -f /migrations/${f}`,
+    );
+  }
+  console.log('');
 }
 
 process.exit(0);

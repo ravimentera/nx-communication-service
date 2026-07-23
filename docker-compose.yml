@@ -11,6 +11,10 @@ services:
       - '5433:5432'
     volumes:
       - outreach-pgdata:/var/lib/postgresql/data
+      # Read-only. The host has no psql client, so the operator command in
+      # migrations/README.md is run from inside this container against the same
+      # files. Read-only mount = the container can never rewrite a migration.
+      - ./migrations:/migrations:ro
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U outreach -d outreach']
       interval: 10s

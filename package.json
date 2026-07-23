@@ -17,7 +17,12 @@
     "test:contract": "npm test -- tests/contract",
     "lint": "eslint 'src/**/*.ts'",
     "typecheck": "tsc --noEmit",
-    "migrate:print": "node scripts/print-migrations.mjs"
+    "migrate:print": "node scripts/print-migrations.mjs",
+    "db:up": "./scripts/db-local.sh up",
+    "db:status": "./scripts/db-local.sh status",
+    "db:psql": "./scripts/db-local.sh psql",
+    "db:down": "./scripts/db-local.sh down",
+    "db:nuke": "./scripts/db-local.sh nuke"
   },
   "dependencies": {
     "@aws-sdk/client-bedrock-agent-runtime": "^3.775.0",
