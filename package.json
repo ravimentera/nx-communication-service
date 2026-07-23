@@ -17,6 +17,7 @@
     "test:contract": "npm test -- tests/contract",
     "lint": "eslint 'src/**/*.ts'",
     "typecheck": "tsc --noEmit",
+    "db:draft": "node scripts/draft-migration.mjs",
     "migrate:print": "node scripts/print-migrations.mjs",
     "db:up": "./scripts/db-local.sh up",
     "db:status": "./scripts/db-local.sh status",

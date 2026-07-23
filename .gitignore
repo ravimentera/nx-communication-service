@@ -1,6 +1,7 @@
 node_modules/
 dist/
 coverage/
+.drizzle-draft/
 logs/
 uploads/
 *.log
