@@ -24,6 +24,8 @@ export interface HealthDeps {
   pool: pg.Pool;
   redis: RedisHandle;
   logger: Logger;
+  /** Present once the delivery plane is wired (P3). */
+  queueStats?: () => Promise<Record<string, number>>;
 }
 
 type CheckStatus = 'up' | 'down' | 'degraded';
@@ -70,8 +72,10 @@ export function createHealthRouter(deps: HealthDeps): Router {
         status: (redis.status === 'down' ? 'degraded' : 'up') as CheckStatus,
         detail: { mode: deps.redis.connection ? 'redis' : 'in-memory' },
       },
-      // Populated in P3 (queues) and P7 (pack registry).
-      queues: { status: 'up' as CheckStatus, detail: { note: 'not wired until P3' } },
+      queues: deps.queueStats
+        ? { status: 'up' as CheckStatus, detail: await deps.queueStats() }
+        : { status: 'degraded' as CheckStatus, detail: { note: 'queue disabled' } },
+      // Populated in P7.
       packs: { status: 'up' as CheckStatus, detail: { note: 'not wired until P7' } },
     };
 

@@ -5,7 +5,10 @@ import type pg from 'pg';
 import type { Logger } from 'winston';
 
 import { createHealthRouter } from './api/health.js';
+import { createInternalRouter } from './api/internal.js';
 import type { Config } from './config/index.js';
+import type { Dispatcher } from './engine/delivery/dispatcher.js';
+import type { NotificationQueue } from './engine/delivery/notification-queue.js';
 import { createAuthMiddleware } from './platform/http/auth.middleware.js';
 import { createErrorHandler, notFoundHandler } from './platform/http/error-handler.js';
 import { createObservabilityMiddleware } from './platform/observability/middleware.js';
@@ -19,6 +22,9 @@ export interface AppDeps {
   logger: Logger;
   pool: pg.Pool;
   redis: RedisHandle;
+  /** Present from P3 onward. Absent only in the platform-only boot test. */
+  dispatcher?: Dispatcher;
+  queue?: NotificationQueue;
 }
 
 /**
@@ -73,6 +79,7 @@ export function createApp(deps: AppDeps): Express {
       pool: deps.pool,
       redis: deps.redis,
       logger,
+      queueStats: deps.queue ? () => deps.queue!.stats() : undefined,
     }),
   );
 
@@ -81,6 +88,10 @@ export function createApp(deps: AppDeps): Express {
   app.use(createAuthMiddleware({ config: config.auth, logger }));
 
   // P3 onward mount the business routers here.
+  if (deps.dispatcher) {
+    // Temporary — deleted in P8 when the real v1 surface lands.
+    app.use('/internal', createInternalRouter(deps.dispatcher));
+  }
 
   app.use(notFoundHandler());
   app.use(createErrorHandler({ logger, production: config.server.isProduction }));

@@ -1,0 +1,116 @@
+/**
+ * Per-channel credential mappers. Each one lives with its adapter's knowledge
+ * of what that provider needs, so the resolver stays generic.
+ */
+import type {
+  CredentialMapper,
+  CredentialMappers,
+  MappedCredential,
+} from '../../engine/delivery/credential-mapper.js';
+import type { ChannelType } from '../../ports/channel.js';
+
+const twilioMapper: CredentialMapper = {
+  fromAgent(agent, tenant) {
+    if (!agent.twilioEnabled || !agent.twilioPhoneNumber) return null;
+    // The agent owns the number; the account still belongs to the tenant.
+    if (!tenant?.twilioAccountSid || !tenant.twilioAuthToken) return null;
+    return {
+      values: { accountSid: tenant.twilioAccountSid, authToken: tenant.twilioAuthToken },
+      from: agent.twilioPhoneNumber,
+    };
+  },
+  fromTenant(tenant) {
+    if (!tenant.twilioEnabled || !tenant.twilioAccountSid || !tenant.twilioAuthToken) return null;
+    return {
+      values: { accountSid: tenant.twilioAccountSid, authToken: tenant.twilioAuthToken },
+      from: tenant.twilioPhoneNumber ?? undefined,
+    };
+  },
+  fromEnv(env) {
+    const { accountSid, authToken, phoneNumber } = env.twilio;
+    if (!accountSid || !authToken) return null;
+    return { values: { accountSid, authToken }, from: phoneNumber };
+  },
+};
+
+const emailMapper: CredentialMapper = {
+  fromAgent(agent, tenant) {
+    if (!agent.emailEnabled || !agent.emailFromAddress) return null;
+    if (!tenant?.sendgridApiKey) return null;
+    return {
+      values: {
+        apiKey: tenant.sendgridApiKey,
+        fromName: agent.emailFromName ?? tenant.sendgridFromName ?? '',
+      },
+      from: agent.emailFromAddress,
+    };
+  },
+  fromTenant(tenant) {
+    if (!tenant.sendgridEnabled || !tenant.sendgridApiKey) return null;
+    return {
+      values: { apiKey: tenant.sendgridApiKey, fromName: tenant.sendgridFromName ?? '' },
+      from: tenant.sendgridFromEmail ?? undefined,
+    };
+  },
+  fromEnv(env): MappedCredential | null {
+    const { apiKey, fromEmail, fromName } = env.sendgrid;
+    if (apiKey) return { values: { apiKey, fromName: fromName ?? '' }, from: fromEmail };
+
+    // SMTP is the documented fallback when SendGrid is absent.
+    const { host, port, user, pass, secure } = env.smtp;
+    if (!host) return null;
+    return {
+      values: {
+        transport: 'smtp',
+        host,
+        port: String(port),
+        user: user ?? '',
+        pass: pass ?? '',
+        secure: String(secure),
+      },
+      from: fromEmail,
+    };
+  },
+};
+
+const slackMapper: CredentialMapper = {
+  fromAgent(agent, tenant) {
+    if (!agent.slackEnabled || !agent.slackUserId) return null;
+    if (!tenant?.slackBotToken) return null;
+    return { values: { botToken: tenant.slackBotToken }, from: agent.slackUserId };
+  },
+  fromTenant(tenant) {
+    if (!tenant.slackEnabled || !tenant.slackBotToken) return null;
+    return {
+      values: { botToken: tenant.slackBotToken },
+      from: tenant.slackDefaultChannel ?? undefined,
+    };
+  },
+  fromEnv(env) {
+    const { botToken, defaultChannel } = env.slack;
+    if (!botToken) return null;
+    return { values: { botToken }, from: defaultChannel };
+  },
+};
+
+/**
+ * push / webhook / in_app carry no shared secret: push targets a device token,
+ * webhook targets a URL supplied per message, in_app writes to our own table.
+ * They resolve trivially so the dispatcher can treat every channel alike.
+ */
+const secretlessMapper: CredentialMapper = {
+  fromAgent: () => null,
+  fromTenant: () => null,
+  fromEnv: () => ({ values: {} }),
+};
+
+export function createCredentialMappers(): CredentialMappers {
+  return new Map<ChannelType, CredentialMapper>([
+    ['sms', twilioMapper],
+    ['email', emailMapper],
+    ['slack', slackMapper],
+    ['push', secretlessMapper],
+    ['webhook', secretlessMapper],
+    ['in_app', secretlessMapper],
+  ]);
+}
