@@ -1,7 +1,7 @@
 -- =============================================================================
 -- 0001_core_schema.sql
 --
--- Tenancy, recipients, content, messaging, campaigns and the medspa pack tables.
+-- Tenancy, recipients, content, messaging and campaigns.
 --
 -- NEVER RUN BY TOOLING. Apply with:
 --   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0001_core_schema.sql
@@ -32,12 +32,15 @@
 --  4. ENUM-ISH COLUMNS ARE text + CHECK, never Postgres enums — cheaper to
 --     evolve, and a CHECK can be replaced in one statement.
 --
---  5. `campaigns`/`audiences`/`message_batches` and the `pack_medspa_*` tables
---     are created HERE rather than deferred to P11/P7. Their runtimes still
---     land in those phases; creating the tables with the rest of the schema
---     keeps the Drizzle model and the database in lockstep. Schema drift between
---     a declared model and the real database is precisely what produced the
---     §0.5 Seam D ghost tables, and it is not worth reproducing for tidiness.
+--  5. `campaigns`/`audiences`/`message_batches` are created HERE rather than
+--     deferred to P11. Their runtime still lands in that phase; creating the
+--     tables with the rest of the schema keeps the Drizzle model and the
+--     database in lockstep. Schema drift between a declared model and the real
+--     database is precisely what produced the §0.5 Seam D ghost tables, and it
+--     is not worth reproducing for tidiness.
+--
+--  6. NO VERTICAL-SPECIFIC TABLES AT ALL. See the note at the end of this file
+--     and §0.10. The engine's schema contains no industry's vocabulary.
 -- =============================================================================
 
 BEGIN;
@@ -665,92 +668,34 @@ CREATE INDEX IF NOT EXISTS idx_ai_interactions_tenant_created
   ON ai_interactions (tenant_id, created_at DESC);
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- MEDSPA PACK TABLES (§0.5 Seam D)
+-- NO VERTICAL-SPECIFIC TABLES (§0.5 Seam D, §0.10)
 --
--- FINDING (P2): the ghost tables are entirely tenant-blind. `grep -c medspa_id`
--- over promotion.service.ts, lead-message.service.ts,
--- treatment-follow-up.service.ts, onboarding-service.ts and
--- farewell-message.service.ts returns 0 for all five. Not one of these tables
--- has a tenant column and not one INSERT supplies a tenant, so every existing
--- row is unattributable.
+-- An earlier draft of this migration created pack_medspa_feedback,
+-- pack_medspa_promotions and pack_medspa_gift_cards here. They are gone, and
+-- nothing replaces them. The rule that removed them:
 --
--- The tables below take `tenant_id NOT NULL` regardless, per Rule 4. P9 Step 1
--- must decide with the operator whether the legacy rows are assigned wholesale
--- to the single medspa tenant that exists today, or dropped.
+--   THE ENGINE NEEDS A TABLE ONLY IF THE ENGINE READS IT.
+--
+-- It does not read promotions or gift cards. It needs their fields at render
+-- time (name, discount, expiry, code, amount), and those arrive in the event
+-- payload, validated against the playbook's `data_contract`. A gift card
+-- balance is a ledger and belongs wherever the vertical's commerce lives, not
+-- in an outreach engine. Inbound feedback IS a message: it lands in `messages`
+-- with direction='inbound', and any sentiment or adverse-event judgment on it
+-- goes in `message_analytics.metadata`.
+--
+-- Two facts made this free rather than expensive. Verified against production
+-- on 2026-08-04: all six Seam D tables plus `patient_feedback` contain ZERO
+-- rows, and none has a tenant column of any kind. And the code behind them is
+-- demo scaffolding — promotion.service.ts:169 returns a hardcoded
+-- 'Jane Smith'/'John Doe' from findEligiblePatients(), and
+-- feedback-analysis.service.ts:229,251 return a hardcoded patient and provider.
+--
+-- If a vertical ever genuinely needs relational storage beside engine data, it
+-- ships its own migration with its pack. That is opt-in and it is theirs. The
+-- core schema stays free of any industry's vocabulary:
+--
+--   grep -ri medspa src/db/ migrations/    ->  no table or column names
 -- ─────────────────────────────────────────────────────────────────────────────
-
--- ← patient_feedback. Note it exists in schema/db.ts:248 but NOT in migration
--- 0000, so the source model and the source database already disagree. P9 must
--- dump information_schema before trusting either.
-CREATE TABLE IF NOT EXISTS pack_medspa_feedback (
-  id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  tenant_id         text NOT NULL,
-  sub_tenant_id     uuid,
-  recipient_id      uuid REFERENCES recipients(id) ON DELETE SET NULL,
-  treatment_id      text,
-  message_id        uuid REFERENCES messages(id) ON DELETE SET NULL,
-  feedback_type     text NOT NULL,
-  content           text NOT NULL,
-  sentiment_score   integer,
-  is_adverse        boolean NOT NULL DEFAULT false,
-  requires_followup boolean NOT NULL DEFAULT false,
-  escalated         boolean NOT NULL DEFAULT false,
-  escalated_to      text,
-  resolved          boolean NOT NULL DEFAULT false,
-  resolved_at       timestamptz,
-  metadata          jsonb,
-  created_at        timestamptz NOT NULL DEFAULT now(),
-  updated_at        timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_pack_medspa_feedback_recipient ON pack_medspa_feedback (tenant_id, recipient_id);
-CREATE INDEX IF NOT EXISTS idx_pack_medspa_feedback_message   ON pack_medspa_feedback (message_id);
-CREATE INDEX IF NOT EXISTS idx_pack_medspa_feedback_adverse   ON pack_medspa_feedback (tenant_id, is_adverse);
-CREATE INDEX IF NOT EXISTS idx_pack_medspa_feedback_created   ON pack_medspa_feedback (created_at DESC);
-
--- ← ghost table `promotions`. Shape inferred from promotion.service.ts:25.
-CREATE TABLE IF NOT EXISTS pack_medspa_promotions (
-  id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  tenant_id         text NOT NULL,
-  sub_tenant_id     uuid,
-  name              text NOT NULL,
-  description       text,
-  treatment_types   text[] NOT NULL DEFAULT '{}'::text[],
-  discount_amount   numeric(12,2),
-  discount_type     text,
-  start_date        timestamptz,
-  end_date          timestamptz,
-  eligibility_rules jsonb NOT NULL DEFAULT '{}'::jsonb,
-  metadata          jsonb,
-  created_by        text,
-  created_at        timestamptz NOT NULL DEFAULT now(),
-  updated_at        timestamptz NOT NULL DEFAULT now(),
-  CONSTRAINT pack_medspa_promotions_discount_type_check
-    CHECK (discount_type IS NULL OR discount_type IN ('PERCENTAGE','FIXED_AMOUNT','FREE_ITEM'))
-);
-CREATE INDEX IF NOT EXISTS idx_pack_medspa_promotions_tenant ON pack_medspa_promotions (tenant_id);
-CREATE INDEX IF NOT EXISTS idx_pack_medspa_promotions_window
-  ON pack_medspa_promotions (tenant_id, start_date, end_date);
-
--- ← ghost table `gift_cards`. Shape inferred from promotion.service.ts:215.
-CREATE TABLE IF NOT EXISTS pack_medspa_gift_cards (
-  id                    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  tenant_id             text NOT NULL,
-  sub_tenant_id         uuid,
-  code                  text NOT NULL,
-  amount                numeric(12,2) NOT NULL,
-  balance               numeric(12,2) NOT NULL,
-  issued_to             uuid REFERENCES recipients(id) ON DELETE SET NULL,
-  issued_by             text,
-  treatment_restriction text,
-  expiration_date       timestamptz,
-  is_redeemed           boolean NOT NULL DEFAULT false,
-  metadata              jsonb,
-  created_at            timestamptz NOT NULL DEFAULT now(),
-  updated_at            timestamptz NOT NULL DEFAULT now(),
-  -- Scoped to the tenant: two tenants may legitimately mint the same code.
-  CONSTRAINT pack_medspa_gift_cards_tenant_code_unique UNIQUE (tenant_id, code)
-);
-CREATE INDEX IF NOT EXISTS idx_pack_medspa_gift_cards_issued_to
-  ON pack_medspa_gift_cards (issued_to);
 
 COMMIT;
