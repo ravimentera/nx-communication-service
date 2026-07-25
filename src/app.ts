@@ -6,6 +6,7 @@ import type { Logger } from 'winston';
 
 import { createHealthRouter } from './api/health.js';
 import { createInternalRouter } from './api/internal.js';
+import { createContentRouter, type ContentApiDeps } from './api/v1/content.js';
 import type { Config } from './config/index.js';
 import type { Dispatcher } from './engine/delivery/dispatcher.js';
 import type { NotificationQueue } from './engine/delivery/notification-queue.js';
@@ -25,6 +26,8 @@ export interface AppDeps {
   /** Present from P3 onward. Absent only in the platform-only boot test. */
   dispatcher?: Dispatcher;
   queue?: NotificationQueue;
+  /** Present from P4 onward. */
+  content?: ContentApiDeps;
 }
 
 /**
@@ -91,6 +94,9 @@ export function createApp(deps: AppDeps): Express {
   if (deps.dispatcher) {
     // Temporary — deleted in P8 when the real v1 surface lands.
     app.use('/internal', createInternalRouter(deps.dispatcher));
+  }
+  if (deps.content) {
+    app.use('/v1', createContentRouter(deps.content));
   }
 
   app.use(notFoundHandler());

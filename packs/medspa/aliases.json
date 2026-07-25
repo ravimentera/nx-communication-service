@@ -1,0 +1,34 @@
+{
+  "$comment": "Legacy variable names -> render-context paths. Applied to a template body before Handlebars compiles it, so every existing medspa template renders unchanged against the generic context. This is why the P9 data migration does not have to rewrite a single template body. Only bare identifiers are rewritten; anything already containing a dot is left alone, so a migrated template is unaffected.",
+
+  "patientName": "recipient.displayName",
+  "patientFirstName": "recipient.firstName",
+  "patientLastName": "recipient.lastName",
+  "patientEmail": "recipient.email",
+  "patientPhone": "recipient.phone",
+
+  "doctorName": "sender.displayName",
+  "providerName": "sender.displayName",
+  "providerEmail": "sender.email",
+  "practitionerName": "sender.displayName",
+
+  "medspaName": "tenant.name",
+  "clinicName": "tenant.name",
+  "businessName": "tenant.name",
+  "locationName": "tenant.subTenantName",
+
+  "appointmentDate": "context.appointmentDate",
+  "appointmentTime": "context.appointmentTime",
+  "appointmentType": "context.appointmentType",
+  "treatmentName": "context.treatmentName",
+  "treatmentType": "context.treatmentType",
+  "treatmentDate": "context.treatmentDate",
+  "followUpDate": "context.followUpDate",
+  "bookingUrl": "context.bookingUrl",
+  "promotionName": "context.promotionName",
+  "discountAmount": "context.discountAmount",
+  "giftCardCode": "context.giftCardCode",
+
+  "unsubscribeUrl": "message.unsubscribeUrl",
+  "unsubscribeLink": "message.unsubscribeUrl"
+}

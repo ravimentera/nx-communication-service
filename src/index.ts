@@ -3,8 +3,17 @@
  * down — §0.9: no module-scope singletons, because the adapters need per-tenant
  * credentials injected.
  */
+import { join } from 'node:path';
+
 import { createCredentialMappers } from './adapters/channels/credentials.js';
 import { createChannelRegistry } from './adapters/channels/index.js';
+import { BedrockProvider } from './adapters/llm/bedrock.provider.js';
+import { RecordingLlmProvider } from './adapters/llm/recording.provider.js';
+import { ContentGenerator } from './engine/content/generator.js';
+import { PromptAssembler } from './engine/content/prompt-assembler.js';
+import { Renderer } from './engine/content/renderer.js';
+import { DrizzleTemplateStore } from './engine/content/store.js';
+import { loadPacks } from './packs/loader.js';
 import { createApp } from './app.js';
 import { loadConfig } from './config/index.js';
 import { createDb } from './db/index.js';
@@ -112,7 +121,39 @@ async function main(): Promise<void> {
 
   const dispatcher = new Dispatcher({ db, registry, credentials, queue, logger });
 
-  const app = createApp({ config, logger, pool, redis, dispatcher, queue });
+  // ── content plane ─────────────────────────────────────────────────────────
+  const packs = loadPacks(join(process.cwd(), 'packs'), logger);
+  const renderer = new Renderer({ logger, aliases: packs.aliasMaps() });
+  const templateStore = new DrizzleTemplateStore(db, logger);
+  const llm = new RecordingLlmProvider(
+    new BedrockProvider({
+      config: {
+        region: config.llm.region,
+        defaultModel: config.llm.defaultModel,
+        maxRetries: config.llm.maxRetries,
+        timeoutMs: config.llm.timeoutMs,
+      },
+      logger,
+    }),
+    db,
+    logger,
+  );
+  const generator = new ContentGenerator({
+    llm,
+    assembler: new PromptAssembler(renderer),
+    logger,
+    // P5 supplies the real ruleset via this hook.
+  });
+
+  const app = createApp({
+    config,
+    logger,
+    pool,
+    redis,
+    dispatcher,
+    queue,
+    content: { renderer, store: templateStore, generator, packs },
+  });
 
   const server = app.listen(config.server.port, config.server.host, () => {
     logger.info('service started', {
