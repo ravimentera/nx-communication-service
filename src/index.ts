@@ -14,7 +14,11 @@ import { MenteraContextProvider } from './adapters/context/mentera.provider.js';
 import { BedrockProvider } from './adapters/llm/bedrock.provider.js';
 import { RecordingLlmProvider } from './adapters/llm/recording.provider.js';
 import { tenantPacks } from './db/schema.js';
+import { ApprovalService } from './engine/approvals/approval.service.js';
+import { PolicyService } from './engine/approvals/policy.service.js';
+import { ApprovalSlaWorker } from './engine/approvals/sla.worker.js';
 import { ComplianceGate } from './engine/compliance/gate.js';
+import { lintContent, mergeRules } from './engine/compliance/lint.js';
 import { PreferenceService } from './engine/compliance/preference.service.js';
 import { CORE_PACK, ContextRegistry } from './engine/context/registry.js';
 import { RecipientService } from './engine/recipients/recipient.service.js';
@@ -95,6 +99,12 @@ async function main(): Promise<void> {
       ? 'redis unavailable'
       : undefined;
 
+  // The queue's result recorder closes the approval that produced the message,
+  // and the approval service needs the dispatcher, which needs the queue. One
+  // mutable cell breaks the cycle, rather than giving anything a back-reference
+  // it would otherwise not need.
+  const approvalsRef: { current?: ApprovalService } = {};
+
   const queue: NotificationQueue =
     queueDisabledReason || config.queue.disableNotificationQueue
       ? new DisabledNotificationQueue(
@@ -112,7 +122,14 @@ async function main(): Promise<void> {
             concurrency: config.queue.notificationConcurrency,
           },
           resolveCredentials: (channel, scope) => credentials.resolve(channel, scope),
-          onResult: createResultRecorder(db, logger),
+          onResult: createResultRecorder(db, logger, {
+            onSent: async (job) => {
+              await approvalsRef.current?.markSent(
+                { tenantId: job.tenantId, subTenantId: job.subTenantId },
+                job.messageId,
+              );
+            },
+          }),
         });
 
   const eventQueue: EventQueue = queueDisabledReason
@@ -154,6 +171,32 @@ async function main(): Promise<void> {
     logger,
     compliance: complianceGate,
   });
+
+  // ── approvals plane ───────────────────────────────────────────────────────
+  const policies = new PolicyService({
+    db,
+    logger,
+    rotation: {
+      // Redis INCR when it is up; the in-memory store when it is not, which
+      // makes the rotation per-replica rather than global. Round-robin is a
+      // fairness heuristic, so uneven spread while degraded is acceptable.
+      next: (key) => redis.store.incr(cache.key('rr', key)),
+    },
+  });
+
+  const approvals = new ApprovalService({ db, logger, policies, dispatcher });
+  approvalsRef.current = approvals;
+
+  const slaWorker = new ApprovalSlaWorker({
+    db,
+    logger,
+    approvals,
+    policies,
+    connection: redis.connection,
+    // P7 wires the `system.approval_escalation` playbook here. Until then an
+    // escalation reassigns and logs, but sends nothing.
+  });
+  await slaWorker.start();
 
   // ── context plane ─────────────────────────────────────────────────────────
   const contextRegistry = new ContextRegistry({
@@ -199,11 +242,17 @@ async function main(): Promise<void> {
     db,
     logger,
   );
+  // The P5 ruleset, finally wired. Until now the hook was unpassed, so
+  // `lintWarnings` was always empty — which silently made `aiConfidence` (D35)
+  // pure context-completeness and P6's `threshold` mode's lint condition
+  // vacuously true.
+  const lintRules = mergeRules(...packs.compliance());
   const generator = new ContentGenerator({
     llm,
     assembler: new PromptAssembler(renderer),
     logger,
-    // P5 supplies the real ruleset via this hook.
+    lint: async ({ content, channel, tenantId }) =>
+      lintContent({ content, channel, tenantId }, lintRules),
   });
 
   const app = createApp({
@@ -219,6 +268,7 @@ async function main(): Promise<void> {
       preferences,
       gate: complianceGate,
     },
+    approvals: { approvals, policies },
   });
 
   const server = app.listen(config.server.port, config.server.host, () => {
@@ -245,6 +295,7 @@ async function main(): Promise<void> {
         // Drain the workers before dropping the connections they use.
         await queue.close();
         await eventQueue.close();
+        await slaWorker.close();
         await redis.close();
         await closeDb(pool, logger);
         process.exit(0);

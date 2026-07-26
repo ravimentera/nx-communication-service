@@ -8,11 +8,13 @@
  */
 import { randomUUID } from 'node:crypto';
 
+import { and, eq, sql } from 'drizzle-orm';
 import type { Logger } from 'winston';
 
 import type { Db } from '../../db/index.js';
 import { messages } from '../../db/schema.js';
 import type { Priority } from '../../domain/index.js';
+import { NotFoundError } from '../../platform/http/errors.js';
 import type {
   ChannelRegistry,
   ChannelType,
@@ -32,6 +34,16 @@ export interface OutboundMessage {
   priority?: Priority;
   recipientId?: string;
   senderId?: string;
+  /**
+   * Adopt an existing `messages` row instead of inserting one (P6).
+   *
+   * An approved message already has a row — written at submit time with status
+   * `PENDING_APPROVAL`, because `approvals.message_id` is NOT NULL and has to
+   * point at something. Without this the same logical message would end up as
+   * two rows, and every count, retention sweep and rate-limit window would
+   * double-count it.
+   */
+  messageId?: string;
   playbookId?: string;
   /** Stable key, e.g. 'medspa.followup'. Drives per-playbook opt-out and cooldown. */
   playbookKey?: string;
@@ -42,6 +54,11 @@ export interface OutboundMessage {
   /** A transactional message may bypass a global opt-out when URGENT. */
   transactional?: boolean;
   throttle?: { maxPerRecipientPerDay?: number; cooldownHours?: number };
+  /**
+   * Send later. Becomes a BullMQ job delay, so the wait survives a restart —
+   * unlike the source's `scheduledFor`, which was a string nothing read.
+   */
+  sendAt?: Date;
 }
 
 export interface DispatchResult {
@@ -67,7 +84,14 @@ export interface DispatcherDeps {
 export class Dispatcher {
   constructor(private readonly deps: DispatcherDeps) {}
 
-  /** One place that writes a `messages` row, whatever its fate. */
+  /**
+   * One place that writes a `messages` row, whatever its fate.
+   *
+   * Inserts, unless `msg.messageId` names a row this message already owns — in
+   * which case it updates that row in place (P6). The metadata is MERGED with
+   * `||`, never replaced: the submit-time envelope, the playbook key and the
+   * correlation id all live there and are needed after this write.
+   */
   private async persist(
     msg: OutboundMessage,
     correlationId: string,
@@ -79,6 +103,35 @@ export class Dispatcher {
     },
   ): Promise<string> {
     const rendered = options.rendered ?? msg.rendered;
+    const metadata = {
+      correlationId,
+      subject: rendered.subject,
+      to: msg.to.value,
+      ...(msg.playbookKey ? { playbookKey: msg.playbookKey } : {}),
+      ...(options.extraMetadata ?? {}),
+    };
+
+    if (msg.messageId) {
+      const [updated] = await this.deps.db
+        .update(messages)
+        .set({
+          content: rendered.body,
+          status: options.status,
+          suppressionReason: options.suppressionReason,
+          approvalId: msg.approvalId,
+          metadata: sql`coalesce(${messages.metadata}, '{}'::jsonb) || ${JSON.stringify(metadata)}::jsonb`,
+          updatedAt: new Date(),
+        })
+        // Tenant predicate on every write, without exception (Rule 4).
+        .where(and(eq(messages.tenantId, msg.tenantId), eq(messages.id, msg.messageId)))
+        .returning({ id: messages.id });
+
+      if (!updated) {
+        throw new NotFoundError(`Message '${msg.messageId}' not found for this tenant`);
+      }
+      return updated.id;
+    }
+
     const [row] = await this.deps.db
       .insert(messages)
       .values({
@@ -95,13 +148,7 @@ export class Dispatcher {
         templateId: msg.templateId,
         approvalId: msg.approvalId,
         aiGenerated: msg.aiGenerated ?? false,
-        metadata: {
-          correlationId,
-          subject: rendered.subject,
-          to: msg.to.value,
-          ...(msg.playbookKey ? { playbookKey: msg.playbookKey } : {}),
-          ...(options.extraMetadata ?? {}),
-        },
+        metadata,
       })
       .returning({ id: messages.id });
 
@@ -192,19 +239,22 @@ export class Dispatcher {
       extraMetadata: shadowed ? { shadowSuppressionReason: shadowed } : undefined,
     });
 
-    const enqueued = await this.deps.queue.enqueue({
-      messageId,
-      tenantId: msg.tenantId,
-      subTenantId: msg.subTenantId,
-      channel: msg.channel,
-      recipientId: msg.recipientId,
-      senderId: msg.senderId,
-      to: msg.to,
-      rendered,
-      priority,
-      playbookId: msg.playbookId,
-      correlationId,
-    });
+    const enqueued = await this.deps.queue.enqueue(
+      {
+        messageId,
+        tenantId: msg.tenantId,
+        subTenantId: msg.subTenantId,
+        channel: msg.channel,
+        recipientId: msg.recipientId,
+        senderId: msg.senderId,
+        to: msg.to,
+        rendered,
+        priority,
+        playbookId: msg.playbookId,
+        correlationId,
+      },
+      msg.sendAt ? { delayMs: Math.max(0, msg.sendAt.getTime() - Date.now()) } : undefined,
+    );
     const row = { id: messageId };
 
     if (!enqueued.queued) {

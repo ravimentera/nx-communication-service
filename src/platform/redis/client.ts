@@ -37,6 +37,12 @@ export interface KeyValueStore {
   set(key: string, value: string, ttlSeconds?: number): Promise<void>;
   del(...keys: string[]): Promise<number>;
   keys(pattern: string): Promise<string[]>;
+  /**
+   * Atomic increment, returning the new value. Added in P6 for the round-robin
+   * approver rotation, which needs a counter that two replicas cannot both read
+   * as the same number. `get`-then-`set` would not do.
+   */
+  incr(key: string): Promise<number>;
   ping(): Promise<boolean>;
 }
 
@@ -71,6 +77,19 @@ class MemoryStore implements KeyValueStore {
     return [...this.entries.keys()].filter((key) => regex.test(key));
   }
 
+  /**
+   * Atomic by virtue of the single-threaded event loop — nothing awaits between
+   * the read and the write, so no interleaving is possible within this process.
+   * Across processes it is not atomic, but a degraded in-memory store is
+   * per-process anyway and shares nothing to race over.
+   */
+  async incr(key: string): Promise<number> {
+    const current = Number((await this.get(key)) ?? 0);
+    const next = (Number.isFinite(current) ? current : 0) + 1;
+    await this.set(key, String(next));
+    return next;
+  }
+
   async ping(): Promise<boolean> {
     return true;
   }
@@ -95,6 +114,10 @@ class RedisStore implements KeyValueStore {
 
   async keys(pattern: string): Promise<string[]> {
     return this.redis.keys(pattern);
+  }
+
+  async incr(key: string): Promise<number> {
+    return this.redis.incr(key);
   }
 
   async ping(): Promise<boolean> {

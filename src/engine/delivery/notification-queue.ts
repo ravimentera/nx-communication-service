@@ -95,6 +95,15 @@ export interface EnqueueResult {
   reason?: string;
 }
 
+export interface EnqueueOptions {
+  /**
+   * Hold the job for this long before a worker may pick it up. Used by P6's
+   * scheduled approvals: BullMQ owns the wait, so it survives a restart. The
+   * source stored a `scheduledFor` timestamp that nothing ever read.
+   */
+  delayMs?: number;
+}
+
 /**
  * The shape everything else depends on. The disabled implementation satisfies
  * it too — unlike the source, whose mock (`notification-queue.ts:727-739`)
@@ -103,13 +112,13 @@ export interface EnqueueResult {
  * is enabled.
  */
 export interface NotificationQueue {
-  enqueue(job: Omit<SendJob, 'attempt'>): Promise<EnqueueResult>;
-  enqueueMany(jobs: Omit<SendJob, 'attempt'>[]): Promise<EnqueueResult[]>;
+  enqueue(job: Omit<SendJob, 'attempt'>, options?: EnqueueOptions): Promise<EnqueueResult>;
+  enqueueMany(jobs: Omit<SendJob, 'attempt'>[], options?: EnqueueOptions): Promise<EnqueueResult[]>;
   stats(): Promise<Record<string, number>>;
   close(): Promise<void>;
 }
 
-function jobOptions(priority: Priority, retry: QueueRetryConfig) {
+function jobOptions(priority: Priority, retry: QueueRetryConfig, options?: EnqueueOptions) {
   const urgent = priority === 'URGENT';
   return {
     priority: JOB_PRIORITY[priority],
@@ -120,6 +129,7 @@ function jobOptions(priority: Priority, retry: QueueRetryConfig) {
       : { type: 'exponential' as const, delay: retry.backoffDelayMs },
     removeOnComplete: { age: 24 * 3600, count: 1000 },
     removeOnFail: { age: 7 * 24 * 3600 },
+    ...(options?.delayMs && options.delayMs > 0 ? { delay: options.delayMs } : {}),
   };
 }
 
@@ -198,28 +208,35 @@ export class BullNotificationQueue implements NotificationQueue {
     return result;
   }
 
-  async enqueue(job: Omit<SendJob, 'attempt'>): Promise<EnqueueResult> {
+  async enqueue(
+    job: Omit<SendJob, 'attempt'>,
+    options?: EnqueueOptions,
+  ): Promise<EnqueueResult> {
     const added = await this.queue.add(
       `send-${job.channel}-${job.messageId}`,
       { ...job, attempt: 0 },
-      jobOptions(job.priority, this.deps.retry),
+      jobOptions(job.priority, this.deps.retry, options),
     );
     this.deps.logger.debug('send job queued', {
       jobId: added.id,
       channel: job.channel,
       messageId: job.messageId,
       priority: job.priority,
+      delayMs: options?.delayMs,
     });
     return { queued: true, jobId: added.id };
   }
 
-  async enqueueMany(jobs: Omit<SendJob, 'attempt'>[]): Promise<EnqueueResult[]> {
+  async enqueueMany(
+    jobs: Omit<SendJob, 'attempt'>[],
+    options?: EnqueueOptions,
+  ): Promise<EnqueueResult[]> {
     if (jobs.length === 0) return [];
     const added = await this.queue.addBulk(
       jobs.map((job) => ({
         name: `send-${job.channel}-${job.messageId}`,
         data: { ...job, attempt: 0 },
-        opts: jobOptions(job.priority, this.deps.retry),
+        opts: jobOptions(job.priority, this.deps.retry, options),
       })),
     );
     return added.map((j) => ({ queued: true, jobId: j.id }));
@@ -258,7 +275,10 @@ export class DisabledNotificationQueue implements NotificationQueue {
     private readonly reason: string,
   ) {}
 
-  async enqueue(job: Omit<SendJob, 'attempt'>): Promise<EnqueueResult> {
+  async enqueue(
+    job: Omit<SendJob, 'attempt'>,
+    _options?: EnqueueOptions,
+  ): Promise<EnqueueResult> {
     this.logger.warn('send job dropped — queue disabled', {
       reason: this.reason,
       channel: job.channel,
@@ -267,8 +287,11 @@ export class DisabledNotificationQueue implements NotificationQueue {
     return { queued: false, reason: this.reason };
   }
 
-  async enqueueMany(jobs: Omit<SendJob, 'attempt'>[]): Promise<EnqueueResult[]> {
-    return Promise.all(jobs.map((job) => this.enqueue(job)));
+  async enqueueMany(
+    jobs: Omit<SendJob, 'attempt'>[],
+    options?: EnqueueOptions,
+  ): Promise<EnqueueResult[]> {
+    return Promise.all(jobs.map((job) => this.enqueue(job, options)));
   }
 
   async stats(): Promise<Record<string, number>> {

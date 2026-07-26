@@ -119,6 +119,9 @@ export const approvals = pgTable(
     unique('approvals_message_unique').on(t.messageId),
     // The SLA sweeper's query: what is pending and past deadline?
     index('idx_approvals_tenant_status_deadline').on(t.tenantId, t.status, t.slaDeadline),
+    // Every read here carries a tenant predicate, so the bare UNIQUE(message_id)
+    // above cannot serve `getByMessageId`. Added in 0006.
+    index('idx_approvals_tenant_message').on(t.tenantId, t.messageId),
     // The approver's inbox query.
     index('idx_approvals_tenant_approver').on(
       t.tenantId,

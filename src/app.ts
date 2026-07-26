@@ -6,6 +6,7 @@ import type { Logger } from 'winston';
 
 import { createHealthRouter } from './api/health.js';
 import { createInternalRouter } from './api/internal.js';
+import { createApprovalRouter, type ApprovalApiDeps } from './api/v1/approvals.js';
 import { createContentRouter, type ContentApiDeps } from './api/v1/content.js';
 import {
   createRecipientRouter,
@@ -35,6 +36,8 @@ export interface AppDeps {
   content?: ContentApiDeps;
   /** Present from P5 onward. */
   recipients?: RecipientApiDeps;
+  /** Present from P6 onward. */
+  approvals?: ApprovalApiDeps;
 }
 
 /**
@@ -121,6 +124,9 @@ export function createApp(deps: AppDeps): Express {
   }
   if (deps.recipients) {
     app.use('/v1', createRecipientRouter(deps.recipients));
+  }
+  if (deps.approvals) {
+    app.use('/v1', createApprovalRouter(deps.approvals));
   }
 
   app.use(notFoundHandler());

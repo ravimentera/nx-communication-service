@@ -9,6 +9,8 @@ Apply in numeric order:
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0001_core_schema.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0002_approvals.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0003_playbooks.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0005_compliance.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0006_approval_policies.sql
 ```
 
 Each file is idempotent (`IF NOT EXISTS` / guarded `DO` blocks) and wrapped in a
@@ -16,13 +18,19 @@ transaction.
 
 | File | Creates |
 |---|---|
-| `0001_core_schema.sql` | tenancy, recipients, content, messaging, campaigns, medspa pack tables |
+| `0001_core_schema.sql` | tenancy, recipients, content, messaging, campaigns |
 | `0002_approvals.sql` | `approval_policies`, `approvals`; links `messages` ↔ `approvals` |
 | `0003_playbooks.sql` | `packs`, `tenant_packs`, `playbooks`, `playbook_triggers`; links everything that points at a playbook |
+| `0005_compliance.sql` | `messages.suppression_reason` and the gate's three indexes |
+| `0006_approval_policies.sql` | the two baseline approval policies, and their uniqueness indexes |
+
+**There is no `0004`.** Everything it was scheduled to create already exists in
+`0001`, so the content plane shipped no migration. The number is left unused
+rather than reassigned, so the file names keep matching the plan's phase map.
 
 The order matters: `0002` and `0003` add foreign keys whose *other* side was
 created in an earlier file. Applying `0003` before `0002` fails on a missing
-`approval_policies`.
+`approval_policies`, and `0006` seeds rows into a table `0002` creates.
 
 The `9xxx` series are one-shot data migrations from the mentera-core database —
 read `docs/MIGRATION_RUNBOOK.md` before running any of them.
