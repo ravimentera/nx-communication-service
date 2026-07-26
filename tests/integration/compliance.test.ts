@@ -1,0 +1,384 @@
+/**
+ * The compliance gate against a real Postgres, plus the point of the whole
+ * phase: preferences survive a restart.
+ */
+import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+
+import { eq } from 'drizzle-orm';
+import { Client } from 'pg';
+import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
+import winston from 'winston';
+
+import { createDb, type Db } from '../../src/db/index.js';
+import { consentRecords, messages, recipients, tenantChannelConfigs } from '../../src/db/schema.js';
+import { ComplianceGate } from '../../src/engine/compliance/gate.js';
+import { PreferenceService } from '../../src/engine/compliance/preference.service.js';
+import { RecipientService } from '../../src/engine/recipients/recipient.service.js';
+
+const logger = winston.createLogger({ silent: true });
+const TENANT = 't-comp';
+const scope = { tenantId: TENANT };
+
+let container: StartedPostgreSqlContainer;
+let pool: ReturnType<typeof createDb>['pool'];
+let db: Db;
+let preferences: PreferenceService;
+let recipientService: RecipientService;
+
+function gate(shadowMode: boolean): ComplianceGate {
+  return new ComplianceGate({
+    db,
+    logger,
+    preferences,
+    shadowMode,
+    unsubscribeUrl: async () => 'https://example.test/unsubscribe/tok',
+  });
+}
+
+async function makeRecipient(overrides: { status?: string; timezone?: string } = {}) {
+  const [row] = await db
+    .insert(recipients)
+    .values({
+      tenantId: TENANT,
+      externalRef: { system: 'test', id: `r-${Math.random().toString(36).slice(2)}` },
+      displayName: 'Ada',
+      status: overrides.status ?? 'active',
+      timezone: overrides.timezone ?? null,
+    })
+    .returning();
+  return row!;
+}
+
+const input = (recipientId: string, over: Record<string, unknown> = {}) =>
+  ({
+    scope,
+    channel: 'email' as const,
+    priority: 'MEDIUM' as const,
+    recipientId,
+    rendered: { body: 'hello' },
+    ...over,
+  }) as Parameters<ComplianceGate['check']>[0];
+
+beforeAll(async () => {
+  container = await new PostgreSqlContainer('postgres:16-alpine').start();
+
+  const client = new Client({ connectionString: container.getConnectionUri() });
+  await client.connect();
+  const dir = join(process.cwd(), 'migrations');
+  for (const file of readdirSync(dir).filter((f) => /^\d{4}_.*\.sql$/.test(f)).sort()) {
+    await client.query(readFileSync(join(dir, file), 'utf8'));
+  }
+  await client.query(`INSERT INTO tenants (id, name, timezone) VALUES ('${TENANT}','Comp','UTC')`);
+  await client.end();
+
+  const handle = createDb({ url: container.getConnectionUri() }, logger);
+  pool = handle.pool;
+  db = handle.db;
+  preferences = new PreferenceService({
+    db,
+    logger,
+    defaultTimezone: 'UTC',
+    unsubscribeBaseUrl: 'https://example.test/unsubscribe',
+  });
+  recipientService = new RecipientService({ db, logger });
+}, 240_000);
+
+afterAll(async () => {
+  await pool?.end().catch(() => {});
+  await container?.stop();
+});
+
+describe('check 1 — recipient status blocks', () => {
+  it.each([
+    ['unsubscribed', 'RECIPIENT_UNSUBSCRIBED'],
+    ['bounced', 'RECIPIENT_BOUNCED'],
+    ['deleted', 'RECIPIENT_DELETED'],
+  ])('%s → %s', async (status, reason) => {
+    const recipient = await makeRecipient({ status });
+    const verdict = await gate(false).check(input(recipient.id));
+    expect(verdict.allow).toBe(false);
+    if (!verdict.allow) {
+      expect(verdict.reason).toBe(reason);
+      expect(verdict.deferrable).toBe(false);
+    }
+  });
+
+  it('active passes', async () => {
+    const recipient = await makeRecipient();
+    expect((await gate(false).check(input(recipient.id))).allow).toBe(true);
+  });
+});
+
+describe('check 2 — global opt-out', () => {
+  it('blocks a normal message', async () => {
+    const recipient = await makeRecipient();
+    await preferences.upsert(scope, recipient.id, { allowCommunications: false });
+    const verdict = await gate(false).check(input(recipient.id));
+    expect(verdict.allow).toBe(false);
+    if (!verdict.allow) expect(verdict.reason).toBe('COMMUNICATIONS_DISABLED');
+  });
+
+  it('still blocks URGENT when the message is not transactional', async () => {
+    const recipient = await makeRecipient();
+    await preferences.upsert(scope, recipient.id, { allowCommunications: false });
+    const verdict = await gate(false).check(input(recipient.id, { priority: 'URGENT' }));
+    expect(verdict.allow).toBe(false);
+  });
+
+  it('allows URGENT + transactional — both conditions are required', async () => {
+    const recipient = await makeRecipient();
+    await preferences.upsert(scope, recipient.id, { allowCommunications: false });
+    const verdict = await gate(false).check(
+      input(recipient.id, { priority: 'URGENT', transactional: true }),
+    );
+    expect(verdict.allow).toBe(true);
+  });
+});
+
+describe('check 3 — channel preference and consent', () => {
+  it('blocks a channel the recipient did not choose', async () => {
+    const recipient = await makeRecipient();
+    await preferences.upsert(scope, recipient.id, { preferredChannels: ['sms'] });
+    const verdict = await gate(false).check(input(recipient.id, { channel: 'email' }));
+    expect(verdict.allow).toBe(false);
+    if (!verdict.allow) expect(verdict.reason).toBe('CHANNEL_OPTED_OUT');
+  });
+
+  it('treats an empty channel list as no restriction', async () => {
+    const recipient = await makeRecipient();
+    await preferences.upsert(scope, recipient.id, { preferredChannels: [] });
+    expect((await gate(false).check(input(recipient.id))).allow).toBe(true);
+  });
+
+  it('requires a consent record when the tenant sets require_opt_in', async () => {
+    await db.insert(tenantChannelConfigs).values({
+      tenantId: TENANT,
+      name: 'cfg',
+      requireOptIn: true,
+    });
+    const recipient = await makeRecipient();
+
+    const blocked = await gate(false).check(input(recipient.id));
+    expect(blocked.allow).toBe(false);
+    if (!blocked.allow) expect(blocked.reason).toBe('CONSENT_REQUIRED');
+
+    await db.insert(consentRecords).values({
+      tenantId: TENANT,
+      recipientId: recipient.id,
+      channel: 'email',
+      granted: true,
+      grantedAt: new Date(),
+    });
+    expect((await gate(false).check(input(recipient.id))).allow).toBe(true);
+
+    await db.update(tenantChannelConfigs).set({ requireOptIn: false }).where(eq(tenantChannelConfigs.tenantId, TENANT));
+  });
+});
+
+describe('check 4 — per-playbook opt-out', () => {
+  it('blocks only the opted-out playbook', async () => {
+    const recipient = await makeRecipient();
+    await preferences.upsert(scope, recipient.id, { eventOptOuts: ['medspa.promo'] });
+
+    const blocked = await gate(false).check(input(recipient.id, { playbookKey: 'medspa.promo' }));
+    expect(blocked.allow).toBe(false);
+    if (!blocked.allow) expect(blocked.reason).toBe('PLAYBOOK_OPTED_OUT');
+
+    expect(
+      (await gate(false).check(input(recipient.id, { playbookKey: 'medspa.reminder' }))).allow,
+    ).toBe(true);
+  });
+});
+
+describe('check 5 — quiet hours DEFER, they do not block', () => {
+  it('defers with a retryAt rather than blocking', async () => {
+    const recipient = await makeRecipient();
+    // A window covering the whole day except one minute, so the test does not
+    // depend on when it runs.
+    await preferences.upsert(scope, recipient.id, {
+      quietHoursStart: '00:00',
+      quietHoursEnd: '23:59',
+      quietHoursTimezone: 'UTC',
+    });
+
+    const verdict = await gate(false).check(input(recipient.id));
+    expect(verdict.allow).toBe(false);
+    if (!verdict.allow) {
+      expect(verdict.reason).toBe('QUIET_HOURS');
+      // The distinction the whole phase turns on: try later, do not discard.
+      expect(verdict.deferrable).toBe(true);
+      expect(verdict.retryAt).toBeInstanceOf(Date);
+    }
+  });
+
+  it('URGENT overrides quiet hours', async () => {
+    const recipient = await makeRecipient();
+    await preferences.upsert(scope, recipient.id, {
+      quietHoursStart: '00:00',
+      quietHoursEnd: '23:59',
+      quietHoursTimezone: 'UTC',
+    });
+    expect((await gate(false).check(input(recipient.id, { priority: 'URGENT' }))).allow).toBe(true);
+  });
+});
+
+describe('check 7 — playbook throttle blocks', () => {
+  it('blocks once the per-recipient daily cap is reached', async () => {
+    const recipient = await makeRecipient();
+    await db.insert(messages).values({
+      tenantId: TENANT,
+      recipientId: recipient.id,
+      channel: 'email',
+      direction: 'outbound',
+      content: 'earlier',
+      status: 'SENT',
+    });
+
+    const verdict = await gate(false).check(
+      input(recipient.id, { throttle: { maxPerRecipientPerDay: 1 } }),
+    );
+    expect(verdict.allow).toBe(false);
+    if (!verdict.allow) {
+      expect(verdict.reason).toBe('THROTTLED');
+      expect(verdict.deferrable).toBe(false);
+    }
+  });
+});
+
+describe('precedence', () => {
+  it('reports the earliest failing check when several apply', async () => {
+    const recipient = await makeRecipient({ status: 'unsubscribed' });
+    await preferences.upsert(scope, recipient.id, {
+      allowCommunications: false,
+      quietHoursStart: '00:00',
+      quietHoursEnd: '23:59',
+      quietHoursTimezone: 'UTC',
+    });
+    const verdict = await gate(false).check(input(recipient.id));
+    expect(verdict.allow).toBe(false);
+    // Status is check 1; opt-out is 2; quiet hours 5.
+    if (!verdict.allow) expect(verdict.reason).toBe('RECIPIENT_UNSUBSCRIBED');
+  });
+});
+
+describe('shadow mode', () => {
+  it('allows a message it would otherwise block, and says which reason', async () => {
+    const recipient = await makeRecipient({ status: 'unsubscribed' });
+    const verdict = await gate(true).check(input(recipient.id));
+    expect(verdict.allow).toBe(true);
+    if (verdict.allow) expect(verdict.shadowed).toBe('RECIPIENT_UNSUBSCRIBED');
+  });
+
+  it('is the same evaluation, just a different disposition', async () => {
+    const recipient = await makeRecipient({ status: 'bounced' });
+    const enforced = await gate(false).check(input(recipient.id));
+    const shadow = await gate(true).check(input(recipient.id));
+    expect(enforced.allow).toBe(false);
+    expect(shadow.allow).toBe(true);
+    if (!enforced.allow && shadow.allow) expect(shadow.shadowed).toBe(enforced.reason);
+  });
+});
+
+describe('check 8 — mutations', () => {
+  it('appends an unsubscribe link to bulk email', async () => {
+    const recipient = await makeRecipient();
+    const verdict = await gate(false).check(input(recipient.id));
+    expect(verdict.allow).toBe(true);
+    if (verdict.allow) {
+      expect(verdict.mutations?.body).toContain('https://example.test/unsubscribe/tok');
+    }
+  });
+
+  it('does not append one to a transactional email', async () => {
+    const recipient = await makeRecipient();
+    const verdict = await gate(false).check(input(recipient.id, { transactional: true }));
+    expect(verdict.allow).toBe(true);
+    if (verdict.allow) expect(verdict.mutations).toBeUndefined();
+  });
+
+  it('does not append one to SMS', async () => {
+    const recipient = await makeRecipient();
+    const verdict = await gate(false).check(input(recipient.id, { channel: 'sms' }));
+    if (verdict.allow) expect(verdict.mutations).toBeUndefined();
+  });
+});
+
+describe('preferences are durable — the point of deleting the Map', () => {
+  it('survives a completely new service instance', async () => {
+    const recipient = await makeRecipient();
+    await preferences.upsert(scope, recipient.id, {
+      allowCommunications: false,
+      quietHoursStart: '22:00',
+      quietHoursEnd: '06:00',
+      quietHoursTimezone: 'America/New_York',
+    });
+
+    // A fresh instance with no shared state — the source's in-memory Map would
+    // have come up empty here, which is exactly the bug.
+    const restarted = new PreferenceService({
+      db,
+      logger,
+      defaultTimezone: 'UTC',
+      unsubscribeBaseUrl: 'https://example.test/unsubscribe',
+    });
+
+    const prefs = await restarted.get(scope, recipient.id);
+    expect(prefs?.allowCommunications).toBe(false);
+    expect(prefs?.quietHoursStart).toBe('22:00');
+    expect(prefs?.quietHoursTimezone).toBe('America/New_York');
+  });
+
+  it('mints a working unsubscribe token and honours it', async () => {
+    const recipient = await makeRecipient();
+    const url = await preferences.unsubscribeUrl(scope, recipient.id);
+    const token = url.split('/').pop()!;
+    expect(token).toHaveLength(32);
+
+    const result = await preferences.unsubscribeByToken(token);
+    expect(result.recipientId).toBe(recipient.id);
+    expect((await preferences.get(scope, recipient.id))?.allowCommunications).toBe(false);
+  });
+
+  it('rejects an unknown token', async () => {
+    await expect(preferences.unsubscribeByToken('nope')).rejects.toThrow(/Unknown or expired/);
+  });
+});
+
+describe('recipients replace the cross-database patients read', () => {
+  it('listByIds([]) returns [] without touching the database', async () => {
+    expect(await recipientService.listByIds(scope, [])).toEqual([]);
+  });
+
+  it('listByIds resolves display names in one query', async () => {
+    const a = await makeRecipient();
+    const b = await makeRecipient();
+    const found = await recipientService.listByIds(scope, [a.id, b.id]);
+    expect(found).toHaveLength(2);
+    expect(found.every((r) => r.displayName === 'Ada')).toBe(true);
+  });
+
+  it('upsertByExternalRef is idempotent under concurrency', async () => {
+    const ref = { system: 'mentera-patient', id: 'p-concurrent' };
+    const results = await Promise.all(
+      Array.from({ length: 5 }, () =>
+        recipientService.upsertByExternalRef(scope, ref, { displayName: 'Grace' }),
+      ),
+    );
+    const ids = new Set(results.map((r) => r.id));
+    expect(ids.size).toBe(1);
+  });
+
+  it('does not blank a known field on a partial refresh', async () => {
+    const ref = { system: 'mentera-patient', id: 'p-partial' };
+    await recipientService.upsertByExternalRef(scope, ref, {
+      displayName: 'Grace Hopper',
+      timezone: 'America/New_York',
+    });
+    const refreshed = await recipientService.upsertByExternalRef(scope, ref, {
+      displayName: 'Grace H.',
+    });
+    expect(refreshed.displayName).toBe('Grace H.');
+    expect(refreshed.timezone).toBe('America/New_York');
+  });
+});

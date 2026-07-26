@@ -123,6 +123,12 @@ export const messages = pgTable(
     /** SendGrid/Twilio message id — how delivery webhooks find this row. */
     providerMessageId: text('provider_message_id'),
     /**
+     * Why the compliance gate stopped this message (P5). NULL on everything
+     * that was actually sent. Without it a suppressed message is
+     * indistinguishable from one that was never created.
+     */
+    suppressionReason: text('suppression_reason'),
+    /**
      * The legacy approval blob. Kept so the P9 backfill has a source to read
      * and to compare against; DROPPED in P12 once the approvals table is proven.
      */
@@ -147,6 +153,15 @@ export const messages = pgTable(
     index('idx_messages_channel').on(t.channel),
     index('idx_messages_tenant_subtenant').on(t.tenantId, t.subTenantId),
     index('idx_messages_provider_message_id').on(t.tenantId, t.providerMessageId),
+    // The compliance gate's rate-limit and throttle windows (P5, 0005).
+    index('idx_messages_rate_window').on(t.tenantId, t.channel, t.direction, t.createdAt.desc()),
+    index('idx_messages_recipient_window').on(
+      t.tenantId,
+      t.recipientId,
+      t.direction,
+      t.createdAt.desc(),
+    ),
+    // idx_messages_suppressed is partial (WHERE suppression_reason IS NOT NULL).
     // idx_messages_unread is partial (WHERE read_at IS NULL) — see 0001.
     // The source's message_history_queued_approval_idx is NOT carried forward:
     // the approvals table replaces the JSONB approval-status query entirely.

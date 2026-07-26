@@ -1,0 +1,25 @@
+{
+  "$comment": "Lint rules for the medspa pack, merged over the engine defaults. This is where HIPAA-shaped rules live — the engine itself knows nothing about them. Warnings lower aiConfidence, which makes a human more likely to review the draft; they never hard-fail a send.",
+
+  "prohibitedPhrases": [
+    "guaranteed results",
+    "cure",
+    "miracle",
+    "risk-free",
+    "FDA approved",
+    "no side effects"
+  ],
+
+  "phiPatterns": [
+    "\\bdiagnos",
+    "\\bprescri",
+    "\\bmedical record\\b",
+    "\\blab result",
+    "\\bbiops",
+    "\\bpathology\\b"
+  ],
+
+  "maxLength": { "sms": 320 },
+
+  "linkPolicy": "any"
+}

@@ -7,6 +7,11 @@ import type { Logger } from 'winston';
 import { createHealthRouter } from './api/health.js';
 import { createInternalRouter } from './api/internal.js';
 import { createContentRouter, type ContentApiDeps } from './api/v1/content.js';
+import {
+  createRecipientRouter,
+  createUnsubscribeRouter,
+  type RecipientApiDeps,
+} from './api/v1/recipients.js';
 import type { Config } from './config/index.js';
 import type { Dispatcher } from './engine/delivery/dispatcher.js';
 import type { NotificationQueue } from './engine/delivery/notification-queue.js';
@@ -28,6 +33,8 @@ export interface AppDeps {
   queue?: NotificationQueue;
   /** Present from P4 onward. */
   content?: ContentApiDeps;
+  /** Present from P5 onward. */
+  recipients?: RecipientApiDeps;
 }
 
 /**
@@ -88,6 +95,20 @@ export function createApp(deps: AppDeps): Express {
 
   // (2) P8 mounts the MCP router here, pre-auth.
 
+  // (3) Pre-auth: an unsubscribe link is clicked from an email client, which
+  //     carries no gateway headers and no session. The 24-byte token in the
+  //     URL is the credential, and the route is rate-limited. CAN-SPAM
+  //     requires the link to work for anyone who received the message.
+  if (deps.recipients) {
+    app.use(
+      '/unsubscribe',
+      createUnsubscribeRouter({
+        preferences: deps.recipients.preferences,
+        recipients: deps.recipients.recipients,
+      }),
+    );
+  }
+
   app.use(createAuthMiddleware({ config: config.auth, logger }));
 
   // P3 onward mount the business routers here.
@@ -97,6 +118,9 @@ export function createApp(deps: AppDeps): Express {
   }
   if (deps.content) {
     app.use('/v1', createContentRouter(deps.content));
+  }
+  if (deps.recipients) {
+    app.use('/v1', createRecipientRouter(deps.recipients));
   }
 
   app.use(notFoundHandler());

@@ -19,6 +19,7 @@ import type {
   ContactPoint,
   RenderedMessage,
 } from '../../ports/channel.js';
+import type { ComplianceGate } from '../compliance/gate.js';
 import type { CredentialResolver } from './credential-resolver.js';
 import type { NotificationQueue } from './notification-queue.js';
 
@@ -32,10 +33,15 @@ export interface OutboundMessage {
   recipientId?: string;
   senderId?: string;
   playbookId?: string;
+  /** Stable key, e.g. 'medspa.followup'. Drives per-playbook opt-out and cooldown. */
+  playbookKey?: string;
   templateId?: string;
   approvalId?: string;
   aiGenerated?: boolean;
   correlationId?: string;
+  /** A transactional message may bypass a global opt-out when URGENT. */
+  transactional?: boolean;
+  throttle?: { maxPerRecipientPerDay?: number; cooldownHours?: number };
 }
 
 export interface DispatchResult {
@@ -43,6 +49,9 @@ export interface DispatchResult {
   messageId?: string;
   jobId?: string;
   skipped?: string;
+  /** True when the caller should re-enqueue later rather than give up. */
+  deferrable?: boolean;
+  retryAt?: Date;
 }
 
 export interface DispatcherDeps {
@@ -51,10 +60,54 @@ export interface DispatcherDeps {
   credentials: CredentialResolver;
   queue: NotificationQueue;
   logger: Logger;
+  /** Present from P5. Absent means no gate — used only in delivery-plane tests. */
+  compliance?: ComplianceGate;
 }
 
 export class Dispatcher {
   constructor(private readonly deps: DispatcherDeps) {}
+
+  /** One place that writes a `messages` row, whatever its fate. */
+  private async persist(
+    msg: OutboundMessage,
+    correlationId: string,
+    options: {
+      status: string;
+      rendered?: RenderedMessage;
+      suppressionReason?: string;
+      extraMetadata?: Record<string, unknown>;
+    },
+  ): Promise<string> {
+    const rendered = options.rendered ?? msg.rendered;
+    const [row] = await this.deps.db
+      .insert(messages)
+      .values({
+        tenantId: msg.tenantId,
+        subTenantId: msg.subTenantId,
+        recipientId: msg.recipientId,
+        senderId: msg.senderId,
+        channel: msg.channel,
+        direction: 'outbound',
+        content: rendered.body,
+        status: options.status,
+        suppressionReason: options.suppressionReason,
+        playbookId: msg.playbookId,
+        templateId: msg.templateId,
+        approvalId: msg.approvalId,
+        aiGenerated: msg.aiGenerated ?? false,
+        metadata: {
+          correlationId,
+          subject: rendered.subject,
+          to: msg.to.value,
+          ...(msg.playbookKey ? { playbookKey: msg.playbookKey } : {}),
+          ...(options.extraMetadata ?? {}),
+        },
+      })
+      .returning({ id: messages.id });
+
+    if (!row) throw new Error('failed to persist message row');
+    return row.id;
+  }
 
   async dispatch(msg: OutboundMessage): Promise<DispatchResult> {
     const { registry, logger } = this.deps;
@@ -62,19 +115,6 @@ export class Dispatcher {
     const priority: Priority = msg.priority ?? 'MEDIUM';
 
     const channel = registry.get(msg.channel);
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // COMPLIANCE GATE (P5)
-    //
-    // P5 inserts the preference/quiet-hours/consent check HERE, before anything
-    // is written or queued, and returns `{ queued: false, skipped: <reason> }`
-    // when it blocks. It must run after credential resolution has proven the
-    // channel is usable but before the messages row exists, so a suppressed
-    // message leaves an audit trail without ever looking sent.
-    //
-    // Do not move this hook downstream into the worker: by then the row says
-    // QUEUED and a crash would leak a send.
-    // ─────────────────────────────────────────────────────────────────────────
 
     const validation = channel.validate(msg.rendered, msg.to);
     if (!validation.ok) {
@@ -94,46 +134,78 @@ export class Dispatcher {
       senderId: msg.senderId,
     });
 
-    const [row] = await this.deps.db
-      .insert(messages)
-      .values({
-        tenantId: msg.tenantId,
-        subTenantId: msg.subTenantId,
-        recipientId: msg.recipientId,
-        senderId: msg.senderId,
-        channel: msg.channel,
-        direction: 'outbound',
-        content: msg.rendered.body,
-        status: 'QUEUED',
-        playbookId: msg.playbookId,
-        templateId: msg.templateId,
-        approvalId: msg.approvalId,
-        aiGenerated: msg.aiGenerated ?? false,
-        metadata: {
-          correlationId,
-          subject: msg.rendered.subject,
-          to: msg.to.value,
-        },
-      })
-      .returning({ id: messages.id });
+    // ─────────────────────────────────────────────────────────────────────────
+    // COMPLIANCE GATE (P5)
+    //
+    // Runs after credential resolution has proven the channel is usable, and
+    // BEFORE the message row is written — so a suppressed message is recorded
+    // as suppressed and never passes through a state that looks sent.
+    //
+    // Do not move this into the worker: by then the row says QUEUED, and a
+    // crash between the two would leak a send the recipient opted out of.
+    // ─────────────────────────────────────────────────────────────────────────
+    let rendered = msg.rendered;
+    let shadowed: string | undefined;
 
-    if (!row) {
-      throw new Error('failed to persist message row');
+    if (this.deps.compliance) {
+      const verdict = await this.deps.compliance.check({
+        scope: { tenantId: msg.tenantId, subTenantId: msg.subTenantId },
+        channel: msg.channel,
+        priority,
+        recipientId: msg.recipientId,
+        playbookKey: msg.playbookKey,
+        transactional: msg.transactional,
+        throttle: msg.throttle,
+        rendered: msg.rendered,
+      });
+
+      if (!verdict.allow) {
+        // Recorded, not dropped. A SUPPRESSED row is the audit trail the source
+        // never had — today a preference failure leaves no evidence at all.
+        const suppressed = await this.persist(msg, correlationId, {
+          status: 'SUPPRESSED',
+          suppressionReason: verdict.reason,
+          extraMetadata: { deferrable: verdict.deferrable, retryAt: verdict.retryAt },
+        });
+        logger.info('message suppressed by compliance gate', {
+          messageId: suppressed,
+          reason: verdict.reason,
+          deferrable: verdict.deferrable,
+          correlationId,
+        });
+        return {
+          queued: false,
+          messageId: suppressed,
+          skipped: verdict.reason,
+          deferrable: verdict.deferrable,
+          retryAt: verdict.retryAt,
+        };
+      }
+
+      if (verdict.mutations) rendered = { ...rendered, ...verdict.mutations };
+      shadowed = verdict.shadowed;
     }
 
+    const messageId = await this.persist(msg, correlationId, {
+      status: 'QUEUED',
+      rendered,
+      extraMetadata: shadowed ? { shadowSuppressionReason: shadowed } : undefined,
+    });
+
     const enqueued = await this.deps.queue.enqueue({
-      messageId: row.id,
+      messageId,
       tenantId: msg.tenantId,
       subTenantId: msg.subTenantId,
       channel: msg.channel,
       recipientId: msg.recipientId,
       senderId: msg.senderId,
       to: msg.to,
-      rendered: msg.rendered,
+      rendered,
       priority,
       playbookId: msg.playbookId,
       correlationId,
     });
+    const row = { id: messageId };
 
     if (!enqueued.queued) {
       // The row stays QUEUED but nothing will pick it up. Say so plainly.

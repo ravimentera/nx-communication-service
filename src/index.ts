@@ -5,10 +5,19 @@
  */
 import { join } from 'node:path';
 
+import { and, eq } from 'drizzle-orm';
+
 import { createCredentialMappers } from './adapters/channels/credentials.js';
 import { createChannelRegistry } from './adapters/channels/index.js';
+import { InlineContextProvider } from './adapters/context/inline.provider.js';
+import { MenteraContextProvider } from './adapters/context/mentera.provider.js';
 import { BedrockProvider } from './adapters/llm/bedrock.provider.js';
 import { RecordingLlmProvider } from './adapters/llm/recording.provider.js';
+import { tenantPacks } from './db/schema.js';
+import { ComplianceGate } from './engine/compliance/gate.js';
+import { PreferenceService } from './engine/compliance/preference.service.js';
+import { CORE_PACK, ContextRegistry } from './engine/context/registry.js';
+import { RecipientService } from './engine/recipients/recipient.service.js';
 import { ContentGenerator } from './engine/content/generator.js';
 import { PromptAssembler } from './engine/content/prompt-assembler.js';
 import { Renderer } from './engine/content/renderer.js';
@@ -119,7 +128,59 @@ async function main(): Promise<void> {
         process: createStubEventProcessor(logger),
       });
 
-  const dispatcher = new Dispatcher({ db, registry, credentials, queue, logger });
+  // ── compliance plane ──────────────────────────────────────────────────────
+  const preferences = new PreferenceService({
+    db,
+    logger,
+    defaultTimezone: config.compliance.defaultTimezone,
+    unsubscribeBaseUrl: config.compliance.unsubscribeBaseUrl,
+  });
+  const complianceGate = new ComplianceGate({
+    db,
+    logger,
+    preferences,
+    // Defaults to true. See gate.ts — today's effective gate is an in-memory
+    // Map that is empty after every restart, so enforcing on day one is the
+    // change most likely to silently stop messages that currently ship.
+    shadowMode: config.compliance.shadowMode,
+    unsubscribeUrl: (scope, recipientId) => preferences.unsubscribeUrl(scope, recipientId),
+  });
+
+  const dispatcher = new Dispatcher({
+    db,
+    registry,
+    credentials,
+    queue,
+    logger,
+    compliance: complianceGate,
+  });
+
+  // ── context plane ─────────────────────────────────────────────────────────
+  const contextRegistry = new ContextRegistry({
+    installedPacks: async (tenantId) => {
+      const rows = await db
+        .select({ packId: tenantPacks.packId })
+        .from(tenantPacks)
+        .where(and(eq(tenantPacks.tenantId, tenantId), eq(tenantPacks.isActive, true)));
+      return rows.map((r) => r.packId);
+    },
+  });
+  // Available to every tenant: the caller supplied the data themselves.
+  contextRegistry.register(new InlineContextProvider(), CORE_PACK);
+  // Pack-gated: reaching patient-service requires the medspa pack. A tenant
+  // without it cannot resolve this kind even by crafting a ContextRef.
+  contextRegistry.register(
+    new MenteraContextProvider({
+      config: {
+        patientServiceUrl: config.context.patientServiceUrl,
+        providerServiceUrl: config.context.providerServiceUrl,
+      },
+      logger,
+    }),
+    'medspa',
+  );
+
+  const recipientService = new RecipientService({ db, logger, context: contextRegistry });
 
   // ── content plane ─────────────────────────────────────────────────────────
   const packs = loadPacks(join(process.cwd(), 'packs'), logger);
@@ -153,6 +214,11 @@ async function main(): Promise<void> {
     dispatcher,
     queue,
     content: { renderer, store: templateStore, generator, packs },
+    recipients: {
+      recipients: recipientService,
+      preferences,
+      gate: complianceGate,
+    },
   });
 
   const server = app.listen(config.server.port, config.server.host, () => {
