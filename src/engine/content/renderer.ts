@@ -163,6 +163,22 @@ export class Renderer {
 
     hbs.registerHelper('json', (value: unknown): string => JSON.stringify(value));
 
+    /**
+     * `{{join list ". "}}` — flatten an array into a sentence.
+     *
+     * Added in P7 for parity: `enhanced-event-handler.ts:345-347` sends
+     * `preparationSteps` as an array on email and `preparationSteps.join('. ')`
+     * on SMS. Without this the two channels would need different payload
+     * shapes, which is precisely the per-channel special-casing the playbook
+     * runtime exists to remove. A non-array value passes through unchanged, so
+     * a caller that already sent a string is unaffected.
+     */
+    hbs.registerHelper('join', (value: unknown, separator: unknown): string => {
+      const sep = typeof separator === 'string' ? separator : ', ';
+      if (Array.isArray(value)) return value.map((v) => String(v ?? '')).join(sep);
+      return value === null || value === undefined ? '' : String(value);
+    });
+
     hbs.registerHelper('substring', (text: unknown, start: unknown, length: unknown): string => {
       if (!text) return '';
       const s = Number(start) || 0;

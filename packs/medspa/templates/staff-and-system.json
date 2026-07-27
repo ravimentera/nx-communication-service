@@ -1,0 +1,93 @@
+[
+  {
+    "key": "medspa.staff-alert.email",
+    "name": "Staff alert (email)",
+    "description": "enhanced-event-handler.ts:460-475. Variables: message, urgency. The recipient is STAFF, not a patient — this is the case that requires messages.recipient_id to be nullable.",
+    "channel": "email",
+    "category": "operations",
+    "format": "TEXT",
+    "subject": "[{{context.urgency}}] Staff alert",
+    "content": "{{context.message}}\n\n— {{tenant.name}}"
+  },
+  {
+    "key": "medspa.staff-alert.slack",
+    "name": "Staff alert (Slack)",
+    "description": "enhanced-event-handler.ts:445-456. The source builds this inline as `[${urgency}] ${message}` and posts to the HARDCODED channel 'staff-alerts' (:448). The channel is now tenant_packs.config.slackChannels.staffAlerts.",
+    "channel": "slack",
+    "category": "operations",
+    "format": "TEXT",
+    "content": "[{{context.urgency}}] {{context.message}}"
+  },
+
+  {
+    "key": "medspa.shift-reminder.email",
+    "name": "Shift reminder (email)",
+    "description": "enhanced-event-handler.ts:486-502. Variables: shiftDate, shiftTime, location.",
+    "channel": "email",
+    "category": "operations",
+    "format": "TEXT",
+    "subject": "Your shift on {{context.shiftDate}}",
+    "content": "Your shift is on {{context.shiftDate}} at {{context.shiftTime}}{{#if context.location}}, {{context.location}}{{/if}}.\n\n— {{tenant.name}}"
+  },
+  {
+    "key": "medspa.shift-reminder.sms",
+    "name": "Shift reminder (SMS)",
+    "description": "enhanced-event-handler.ts:506-522. Identical variables to the email — the one case where the source does not narrow for SMS.",
+    "channel": "sms",
+    "category": "operations",
+    "format": "TEXT",
+    "content": "Shift reminder: {{context.shiftDate}} at {{context.shiftTime}}{{#if context.location}}, {{context.location}}{{/if}}."
+  },
+
+  {
+    "key": "medspa.emergency-alert.email",
+    "name": "Emergency alert (email)",
+    "description": "enhanced-event-handler.ts:546-560. The source hardcodes to: 'emergency-team@medspa.com' at :549 — now tenant_packs.config.emergencyContacts. Priority is forced to URGENT regardless of event.priority.",
+    "channel": "email",
+    "category": "operations",
+    "format": "TEXT",
+    "subject": "EMERGENCY: {{context.message}}",
+    "content": "{{context.message}}\n\n{{#if context.affectedAreas}}Affected areas: {{join context.affectedAreas \", \"}}\n{{/if}}\n— {{tenant.name}}"
+  },
+  {
+    "key": "medspa.emergency-alert.slack",
+    "name": "Emergency alert (Slack)",
+    "description": "enhanced-event-handler.ts:533-543. Posted UNCONDITIONALLY — outside any event.channels check — to the hardcoded 'emergency-alerts'. An emergency a caller could silence by omitting a channel would be a bad design, so this entry does not participate in the channel intersection.",
+    "channel": "slack",
+    "category": "operations",
+    "format": "TEXT",
+    "content": "🚨 EMERGENCY: {{context.message}} (Areas: {{join context.affectedAreas \", \"}})"
+  },
+
+  {
+    "key": "medspa.system-alert.slack",
+    "name": "System alert (Slack)",
+    "description": "enhanced-event-handler.ts:708-718. Built inline as `[${severity}] ${systemComponent}: ${message}`, posted to the hardcoded 'system-alerts'. Priority is URGENT when severity is CRITICAL, else the event's own (:716).",
+    "channel": "slack",
+    "category": "operations",
+    "format": "TEXT",
+    "content": "[{{context.severity}}] {{context.systemComponent}}: {{context.message}}"
+  },
+
+  {
+    "key": "medspa.general-notification.email",
+    "name": "General notification (email)",
+    "description": "enhanced-event-handler.ts:653-667. Variables: subject, message. Addressed to recipientEmail, not patientEmail.",
+    "channel": "email",
+    "category": "general",
+    "format": "TEXT",
+    "subject": "{{context.subject}}",
+    "content": "{{context.message}}\n\n— {{tenant.name}}"
+  },
+
+  {
+    "key": "system.approval-escalation.email",
+    "name": "Approval escalation (email)",
+    "description": "P6's SLA sweeper notifies the fallback approver through the engine itself. Not from the source — this playbook is the engine self-hosting.",
+    "channel": "email",
+    "category": "operations",
+    "format": "TEXT",
+    "subject": "An approval has been waiting for you",
+    "content": "An approval assigned to {{context.originalApproverRef}} was not actioned and has been escalated to you.\n\nApproval: {{context.approvalId}}\nWaiting: {{context.waitedHours}} hours\n\n— {{tenant.name}}"
+  }
+]

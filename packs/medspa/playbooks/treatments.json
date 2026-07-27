@@ -1,0 +1,138 @@
+[
+  {
+    "key": "medspa.treatment-followup",
+    "name": "Treatment follow-up",
+    "description": "enhanced-event-handler.ts:286-311. Email only. Three enum spellings reach it — see event-types.json.",
+    "priority": 20,
+    "approvalPolicyKey": "system.transactional",
+    "contentSource": { "kind": "template", "templateKey": "medspa.treatment-followup.email" },
+    "channelPlan": [{ "channel": "email" }],
+    "dataContract": {
+      "type": "object",
+      "required": ["treatmentName"],
+      "properties": {
+        "treatmentName": { "type": "string" },
+        "followupDate": { "type": "string" }
+      }
+    },
+    "throttle": { "cooldownHours": 24 },
+    "triggers": [
+      {
+        "type": "event",
+        "eventType": "TREATMENT_FOLLOWUP",
+        "eventTypeAliases": [
+          "TREATMENT_FEEDBACK_REQUEST",
+          "APPOINTMENT_FOLLOW_UP",
+          "TREATMENT_FOLLOWUP_CHECKIN"
+        ]
+      }
+    ]
+  },
+
+  {
+    "key": "medspa.treatment-followup-ai",
+    "name": "Treatment follow-up (AI-written)",
+    "description": "From treatment-follow-up.service.ts, which replaces the treatment_follow_up_rules table. The model writes the body, so a provider reviews it — the same path ai-message-generator takes today.",
+    "priority": 25,
+    "isActive": false,
+    "approvalPolicyKey": "medspa.provider-always",
+    "contentSource": {
+      "kind": "ai",
+      "promptPackKey": "medspa.followup",
+      "goal": "Check on the recipient after their treatment and invite a reply"
+    },
+    "channelPlan": [{ "channel": "sms" }, { "channel": "email" }],
+    "dataContract": {
+      "type": "object",
+      "required": ["treatmentName"],
+      "properties": {
+        "treatmentName": { "type": "string" },
+        "daysSinceTreatment": { "type": "integer" },
+        "lastVisitNotes": { "type": "string" }
+      }
+    },
+    "throttle": { "cooldownHours": 72, "maxPerRecipientPerDay": 1 },
+    "triggers": [{ "type": "event", "eventType": "TREATMENT_FOLLOWUP_AI" }],
+    "metadata": {
+      "$comment": "Ships INACTIVE. It is new capability, not a port — nothing in the source sends an AI follow-up on this trigger, and switching it on is a tenant's decision, not a deploy's."
+    }
+  },
+
+  {
+    "key": "medspa.treatment-preparation",
+    "name": "Treatment preparation",
+    "description": "enhanced-event-handler.ts:313-360. Not an EventType enum member at all — only reachable with a raw string today.",
+    "priority": 20,
+    "approvalPolicyKey": "system.transactional",
+    "contentSource": { "kind": "template", "templateKey": "medspa.treatment-preparation.email" },
+    "channelPlan": [
+      { "channel": "email", "templateKey": "medspa.treatment-preparation.email" },
+      { "channel": "sms", "templateKey": "medspa.treatment-preparation.sms" }
+    ],
+    "dataContract": {
+      "type": "object",
+      "required": ["treatmentName"],
+      "properties": {
+        "treatmentName": { "type": "string" },
+        "preparationSteps": {
+          "type": ["array", "string"],
+          "description": "Array on email, joined with '. ' on SMS by the `join` helper. Both shapes accepted, because the source accepted both."
+        }
+      }
+    },
+    "triggers": [{ "type": "event", "eventType": "TREATMENT_PREPARATION" }]
+  },
+
+  {
+    "key": "medspa.treatment-completion",
+    "name": "Treatment completion",
+    "description": "enhanced-event-handler.ts:362-387. Enum says TREATMENT_COMPLETED, the switch matches TREATMENT_COMPLETION.",
+    "priority": 20,
+    "approvalPolicyKey": "system.transactional",
+    "contentSource": { "kind": "template", "templateKey": "medspa.treatment-completion.email" },
+    "channelPlan": [{ "channel": "email" }],
+    "dataContract": {
+      "type": "object",
+      "required": ["treatmentName"],
+      "properties": {
+        "treatmentName": { "type": "string" },
+        "postCareInstructions": { "type": "string" }
+      }
+    },
+    "triggers": [
+      {
+        "type": "event",
+        "eventType": "TREATMENT_COMPLETION",
+        "eventTypeAliases": ["TREATMENT_COMPLETED"]
+      }
+    ]
+  },
+
+  {
+    "key": "medspa.treatment-instructions",
+    "name": "Treatment instructions",
+    "description": "enhanced-event-handler.ts:389-437. `instructions` is an object; the SMS path reads instructions.summary (:415) and THROWS when instructions is absent. Required here, so the failure is named rather than generic.",
+    "priority": 20,
+    "approvalPolicyKey": "system.transactional",
+    "contentSource": { "kind": "template", "templateKey": "medspa.treatment-instructions.email" },
+    "channelPlan": [
+      { "channel": "email", "templateKey": "medspa.treatment-instructions.email" },
+      { "channel": "sms", "templateKey": "medspa.treatment-instructions.sms" }
+    ],
+    "dataContract": {
+      "type": "object",
+      "required": ["treatmentName", "instructions"],
+      "properties": {
+        "treatmentName": { "type": "string" },
+        "instructions": { "type": "object" }
+      }
+    },
+    "triggers": [
+      {
+        "type": "event",
+        "eventType": "TREATMENT_INSTRUCTIONS",
+        "eventTypeAliases": ["POST_TREATMENT_CARE"]
+      }
+    ]
+  }
+]

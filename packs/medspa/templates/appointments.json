@@ -1,0 +1,72 @@
+[
+  {
+    "key": "medspa.appointment-reminder.email",
+    "name": "Appointment reminder (email)",
+    "description": "enhanced-event-handler.ts:126-141. Variables: appointmentDate, doctorName.",
+    "channel": "email",
+    "category": "appointment",
+    "format": "TEXT",
+    "subject": "Your appointment on {{context.appointmentDate}}",
+    "content": "Hi {{recipient.firstName}},\n\nThis is a reminder of your appointment on {{context.appointmentDate}} with {{context.doctorName}}.\n\nIf you need to reschedule, just reply to this message.\n\n{{tenant.name}}"
+  },
+  {
+    "key": "medspa.appointment-reminder.sms",
+    "name": "Appointment reminder (SMS)",
+    "description": "enhanced-event-handler.ts:145-160. Same two variables, shorter body.",
+    "channel": "sms",
+    "category": "appointment",
+    "format": "TEXT",
+    "content": "Reminder: your appointment with {{context.doctorName}} is on {{context.appointmentDate}}. Reply to reschedule. — {{tenant.name}}"
+  },
+
+  {
+    "key": "medspa.appointment-confirmation.email",
+    "name": "Appointment confirmation (email)",
+    "description": "enhanced-event-handler.ts:171-185. Spreads the whole appointmentDetails object.",
+    "channel": "email",
+    "category": "appointment",
+    "format": "TEXT",
+    "subject": "Your appointment is confirmed",
+    "content": "Hi {{recipient.firstName}},\n\nYour appointment is confirmed for {{context.appointmentDate}}{{#if context.appointmentTime}} at {{context.appointmentTime}}{{/if}}.\n\n{{#if context.location}}Location: {{context.location}}\n{{/if}}{{#if context.provider}}With: {{context.provider}}\n{{/if}}\nWe look forward to seeing you.\n\n{{tenant.name}}"
+  },
+
+  {
+    "key": "medspa.appointment-cancellation.email",
+    "name": "Appointment cancellation (email)",
+    "description": "enhanced-event-handler.ts:196-210. Spreads appointmentDetails.",
+    "channel": "email",
+    "category": "appointment",
+    "format": "TEXT",
+    "subject": "Your appointment has been cancelled",
+    "content": "Hi {{recipient.firstName}},\n\nYour appointment on {{context.appointmentDate}} has been cancelled.\n\n{{#if context.location}}Location was: {{context.location}}\n{{/if}}\nReply to this message and we will find you a new time.\n\n{{tenant.name}}"
+  },
+  {
+    "key": "medspa.appointment-cancellation.sms",
+    "name": "Appointment cancellation (SMS)",
+    "description": "enhanced-event-handler.ts:214-229. NARROWER than the email: the source passes only appointmentDate and location here, not the whole details object.",
+    "channel": "sms",
+    "category": "appointment",
+    "format": "TEXT",
+    "content": "Your appointment on {{context.appointmentDate}}{{#if context.location}} at {{context.location}}{{/if}} has been cancelled. Reply to rebook. — {{tenant.name}}"
+  },
+
+  {
+    "key": "medspa.appointment-rescheduling.email",
+    "name": "Appointment rescheduling (email)",
+    "description": "enhanced-event-handler.ts:240-259. Flattens oldAppointment/newAppointment into oldDate, oldTime, newDate, newTime, location, provider.",
+    "channel": "email",
+    "category": "appointment",
+    "format": "TEXT",
+    "subject": "Your appointment has moved to {{context.newDate}}",
+    "content": "Hi {{recipient.firstName}},\n\nYour appointment has been moved.\n\nWas: {{context.oldDate}}{{#if context.oldTime}} at {{context.oldTime}}{{/if}}\nNow: {{context.newDate}}{{#if context.newTime}} at {{context.newTime}}{{/if}}\n\n{{#if context.location}}Location: {{context.location}}\n{{/if}}{{#if context.provider}}With: {{context.provider}}\n{{/if}}\n{{tenant.name}}"
+  },
+  {
+    "key": "medspa.appointment-rescheduling.sms",
+    "name": "Appointment rescheduling (SMS)",
+    "description": "enhanced-event-handler.ts:263-279. Narrower again: oldDate, newDate, newTime only.",
+    "channel": "sms",
+    "category": "appointment",
+    "format": "TEXT",
+    "content": "Your appointment has moved from {{context.oldDate}} to {{context.newDate}}{{#if context.newTime}} at {{context.newTime}}{{/if}}. — {{tenant.name}}"
+  }
+]

@@ -1,0 +1,15 @@
+{
+  "id": "medspa",
+  "name": "MedSpa",
+  "version": "1.0.0",
+  "description": "The vertical this engine was extracted from. Reproduces the behaviour of communication-service's 17-case event handler and the five outreach service modules, as data.",
+
+  "contextProviders": ["mentera-patient"],
+
+  "requiredConfig": [
+    "emergencyContacts",
+    "slackChannels.staffAlerts",
+    "slackChannels.emergencyAlerts",
+    "slackChannels.systemAlerts"
+  ]
+}

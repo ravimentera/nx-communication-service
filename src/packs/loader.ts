@@ -262,8 +262,13 @@ function safeRead<T>(path: string, packId: string, errors: string[]): T | undefi
 /**
  * Every `*.json` in a directory, validated.
  *
- * One bad file does not discard its siblings — a typo in a single playbook
- * should cost that playbook, not the whole pack.
+ * A file may hold **one definition or an array of them**. A pack with 25
+ * playbooks is far more readable as six files grouped by subject than as 25
+ * files named after their keys, and forcing one-per-file would push authors
+ * toward exactly the sprawl that makes a pack hard to review.
+ *
+ * One bad definition does not discard its siblings — a typo in a single
+ * playbook should cost that playbook, not the file and not the pack.
  */
 function readDirectory<S extends z.ZodTypeAny>(
   dir: string,
@@ -274,10 +279,27 @@ function readDirectory<S extends z.ZodTypeAny>(
   if (!existsSync(dir)) return [];
 
   const items: z.output<S>[] = [];
+
   for (const file of readdirSync(dir).filter((f) => f.endsWith('.json')).sort()) {
-    const parsed = readValidated(join(dir, file), schema, packId, errors);
-    if (parsed !== undefined) items.push(parsed);
+    const path = join(dir, file);
+    const raw = safeRead<unknown>(path, packId, errors);
+    if (raw === undefined) continue;
+
+    const definitions = Array.isArray(raw) ? raw : [raw];
+
+    definitions.forEach((definition, index) => {
+      const parsed = schema.safeParse(definition);
+      if (!parsed.success) {
+        // Index the entry when the file holds several, so "which one?" is
+        // answerable without counting braces.
+        const where = Array.isArray(raw) ? `${path}[${index}]` : path;
+        errors.push(`${where}: ${describeIssues(parsed.error)}`);
+        return;
+      }
+      items.push(parsed.data);
+    });
   }
+
   return items;
 }
 

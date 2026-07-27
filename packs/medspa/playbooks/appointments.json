@@ -1,0 +1,98 @@
+[
+  {
+    "key": "medspa.appointment-reminder",
+    "name": "Appointment reminder",
+    "description": "enhanced-event-handler.ts:121-164. Two dispatches in the source, one per channel, both using template id 'appointment-reminder'.",
+    "priority": 10,
+    "approvalPolicyKey": "system.transactional",
+    "contentSource": { "kind": "template", "templateKey": "medspa.appointment-reminder.email" },
+    "channelPlan": [
+      { "channel": "email", "templateKey": "medspa.appointment-reminder.email" },
+      { "channel": "sms", "templateKey": "medspa.appointment-reminder.sms" }
+    ],
+    "dataContract": {
+      "type": "object",
+      "required": ["appointmentDate"],
+      "properties": {
+        "appointmentDate": { "type": "string", "description": "Rendered as supplied; the source never parses it." },
+        "doctorName": { "type": "string", "default": "your provider" }
+      }
+    },
+    "triggers": [{ "type": "event", "eventType": "APPOINTMENT_REMINDER" }]
+  },
+
+  {
+    "key": "medspa.appointment-confirmation",
+    "name": "Appointment confirmation",
+    "description": "enhanced-event-handler.ts:166-189. Email only. Spreads the whole appointmentDetails object into the variables.",
+    "priority": 10,
+    "approvalPolicyKey": "system.transactional",
+    "contentSource": { "kind": "template", "templateKey": "medspa.appointment-confirmation.email" },
+    "channelPlan": [{ "channel": "email" }],
+    "dataContract": {
+      "type": "object",
+      "required": ["appointmentDate"],
+      "properties": {
+        "appointmentDate": { "type": "string" },
+        "appointmentTime": { "type": "string" },
+        "location": { "type": "string" },
+        "provider": { "type": "string" }
+      }
+    },
+    "triggers": [{ "type": "event", "eventType": "APPOINTMENT_CONFIRMATION" }]
+  },
+
+  {
+    "key": "medspa.appointment-cancellation",
+    "name": "Appointment cancellation",
+    "description": "enhanced-event-handler.ts:191-233. The SMS is deliberately narrower than the email: the source passes only appointmentDate and location to it (:220-221).",
+    "priority": 10,
+    "approvalPolicyKey": "system.transactional",
+    "contentSource": { "kind": "template", "templateKey": "medspa.appointment-cancellation.email" },
+    "channelPlan": [
+      { "channel": "email", "templateKey": "medspa.appointment-cancellation.email" },
+      { "channel": "sms", "templateKey": "medspa.appointment-cancellation.sms" }
+    ],
+    "dataContract": {
+      "type": "object",
+      "required": ["appointmentDate"],
+      "properties": {
+        "appointmentDate": { "type": "string" },
+        "location": { "type": "string" }
+      }
+    },
+    "triggers": [{ "type": "event", "eventType": "APPOINTMENT_CANCELLATION" }]
+  },
+
+  {
+    "key": "medspa.appointment-rescheduling",
+    "name": "Appointment rescheduling",
+    "description": "enhanced-event-handler.ts:235-283. The source reads oldAppointment.date and newAppointment.date with NO guard (:246-251) — an event missing either throws and is logged as a generic failure. The contract below catches that case by name instead.",
+    "priority": 10,
+    "approvalPolicyKey": "system.transactional",
+    "contentSource": { "kind": "template", "templateKey": "medspa.appointment-rescheduling.email" },
+    "channelPlan": [
+      { "channel": "email", "templateKey": "medspa.appointment-rescheduling.email" },
+      { "channel": "sms", "templateKey": "medspa.appointment-rescheduling.sms" }
+    ],
+    "dataContract": {
+      "type": "object",
+      "required": ["oldDate", "newDate"],
+      "properties": {
+        "oldDate": { "type": "string" },
+        "oldTime": { "type": "string" },
+        "newDate": { "type": "string" },
+        "newTime": { "type": "string" },
+        "location": { "type": "string" },
+        "provider": { "type": "string" }
+      }
+    },
+    "triggers": [
+      {
+        "type": "event",
+        "eventType": "APPOINTMENT_RESCHEDULING",
+        "eventTypeAliases": ["APPOINTMENT_RESCHEDULED"]
+      }
+    ]
+  }
+]

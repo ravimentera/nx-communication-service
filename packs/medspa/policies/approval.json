@@ -1,0 +1,29 @@
+[
+  {
+    "key": "medspa.provider-always",
+    "name": "Provider approves everything",
+    "mode": "always",
+    "approverResolution": { "kind": "agent" },
+    "rights": {
+      "approve": true,
+      "edit": true,
+      "decline": true,
+      "reschedule": true,
+      "bulk": true
+    }
+  },
+
+  {
+    "key": "system.transactional",
+    "name": "Transactional — no approval",
+    "mode": "none",
+    "approverResolution": { "kind": "agent" },
+    "rights": {
+      "approve": false,
+      "edit": false,
+      "decline": false,
+      "reschedule": false,
+      "bulk": false
+    }
+  }
+]

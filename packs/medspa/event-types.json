@@ -1,0 +1,48 @@
+{
+  "$comment": "Accepted trigger names, and the alternate spellings that must keep working. This exists because models/communication.model.ts and enhanced-event-handler.ts DISAGREE: the enum declares APPOINTMENT_RESCHEDULED while the switch matches APPOINTMENT_RESCHEDULING, and eight handled event types are not enum members at all. Both spellings are in production callers, so both resolve to the same playbook. The engine's own trigger type is a plain string — it does not enumerate what events exist, which is exactly how the enum and the switch came to drift apart unnoticed.",
+
+  "aliases": {
+    "APPOINTMENT_RESCHEDULING": ["APPOINTMENT_RESCHEDULED"],
+    "TREATMENT_COMPLETION": ["TREATMENT_COMPLETED"],
+    "TREATMENT_FOLLOWUP": [
+      "TREATMENT_FEEDBACK_REQUEST",
+      "APPOINTMENT_FOLLOW_UP",
+      "TREATMENT_FOLLOWUP_CHECKIN"
+    ],
+    "PATIENT_REGISTRATION": ["PATIENT_WELCOME"],
+    "PATIENT_FEEDBACK_REQUEST": ["SURVEY_REQUEST", "REVIEW_REQUEST"],
+    "TREATMENT_INSTRUCTIONS": ["POST_TREATMENT_CARE"]
+  },
+
+  "known": [
+    "APPOINTMENT_REMINDER",
+    "APPOINTMENT_CONFIRMATION",
+    "APPOINTMENT_CANCELLATION",
+    "APPOINTMENT_RESCHEDULING",
+    "TREATMENT_FOLLOWUP",
+    "TREATMENT_PREPARATION",
+    "TREATMENT_COMPLETION",
+    "TREATMENT_INSTRUCTIONS",
+    "PATIENT_REGISTRATION",
+    "PATIENT_FEEDBACK_REQUEST",
+    "PATIENT_BIRTHDAY",
+    "STAFF_ALERT",
+    "SHIFT_REMINDER",
+    "EMERGENCY_NOTIFICATION",
+    "GENERAL_NOTIFICATION",
+    "MARKETING_CAMPAIGN",
+    "SYSTEM_ALERT",
+
+    "$comment: seeded from the service modules rather than the switch",
+    "PATIENT_ONBOARDING",
+    "PATIENT_FAREWELL",
+    "PROMOTION_ANNOUNCEMENT",
+    "GIFT_CARD_NOTIFICATION",
+    "FEEDBACK_ACKNOWLEDGEMENT",
+    "FEEDBACK_RESOLUTION",
+    "FEEDBACK_ESCALATION",
+
+    "$comment: the engine's own self-hosted playbook",
+    "APPROVAL_ESCALATION"
+  ]
+}

@@ -35,10 +35,14 @@ import { CredentialResolver } from './engine/delivery/credential-resolver.js';
 import { Dispatcher } from './engine/delivery/dispatcher.js';
 import {
   BullEventQueue,
-  createStubEventProcessor,
   DisabledEventQueue,
+  type EventProcessor,
   type EventQueue,
 } from './engine/delivery/event-processing-queue.js';
+import { createPlaybookEventProcessor } from './engine/playbooks/event-processor.js';
+import { PlaybookMatcher } from './engine/playbooks/matcher.js';
+import { PlaybookRegistry } from './engine/playbooks/registry.js';
+import { PlaybookRuntime } from './engine/playbooks/runtime.js';
 import {
   BullNotificationQueue,
   DisabledNotificationQueue,
@@ -132,6 +136,15 @@ async function main(): Promise<void> {
           }),
         });
 
+  // Same late-binding trick as the approvals service: the event queue's
+  // consumer is the playbook runtime, and the runtime needs the dispatcher,
+  // which needs the send queue.
+  const runtimeRef: { current?: PlaybookRuntime } = {};
+  const processEvent: EventProcessor = async (event) => {
+    if (!runtimeRef.current) throw new Error('playbook runtime is not ready yet');
+    await createPlaybookEventProcessor(runtimeRef.current, logger)(event);
+  };
+
   const eventQueue: EventQueue = queueDisabledReason
     ? new DisabledEventQueue(logger, queueDisabledReason)
     : new BullEventQueue({
@@ -141,8 +154,7 @@ async function main(): Promise<void> {
         attempts: config.queue.defaultAttempts,
         backoffDelayMs: 5_000,
         queueName: config.queue.eventQueueName,
-        // P7 replaces this stub with the playbook runtime.
-        process: createStubEventProcessor(logger),
+        process: processEvent,
       });
 
   // ── compliance plane ──────────────────────────────────────────────────────
@@ -193,8 +205,28 @@ async function main(): Promise<void> {
     approvals,
     policies,
     connection: redis.connection,
-    // P7 wires the `system.approval_escalation` playbook here. Until then an
-    // escalation reassigns and logs, but sends nothing.
+    // The engine notifies the fallback approver THROUGH ITSELF — a
+    // `system.approval-escalation` playbook, not a private side channel. If the
+    // abstraction did not hold for the engine's own notifications, it would not
+    // hold for anyone else's.
+    notify: async (notice) => {
+      await runtimeRef.current?.run({
+        type: 'event',
+        tenantId: notice.scope.tenantId,
+        subTenantId: notice.scope.subTenantId,
+        eventType: 'APPROVAL_ESCALATION',
+        correlationId: `sla-${notice.approvalId}`,
+        // One escalation per approval, however many times the sweeper runs.
+        idempotencyKey: `escalation:${notice.approvalId}`,
+        payload: {
+          context: {
+            approvalId: notice.approvalId,
+            originalApproverRef: notice.originalApproverRef ?? undefined,
+            waitedHours: Math.round(notice.waitedMs / 3_600_000),
+          },
+        },
+      });
+    },
   });
   await slaWorker.start();
 
@@ -255,6 +287,46 @@ async function main(): Promise<void> {
       lintContent({ content, channel, tenantId }, lintRules),
   });
 
+  // ── playbook plane ────────────────────────────────────────────────────────
+  // Last, because it consumes almost everything above it. This is the
+  // replacement for `enhanced-event-handler.ts`'s 17-case switch.
+  const playbookRegistry = new PlaybookRegistry({ db, logger, packs });
+
+  runtimeRef.current = new PlaybookRuntime({
+    db,
+    logger,
+    matcher: new PlaybookMatcher({ db, logger }),
+    recipients: recipientService,
+    context: contextRegistry,
+    templates: templateStore,
+    renderer,
+    generator,
+    approvals,
+    policies,
+    dispatcher,
+    preferences,
+    packs,
+    packConfig: async (scope, packId) => {
+      const [row] = await db
+        .select({ config: tenantPacks.config })
+        .from(tenantPacks)
+        .where(and(eq(tenantPacks.tenantId, scope.tenantId), eq(tenantPacks.packId, packId)))
+        .limit(1);
+      return (row?.config ?? {}) as Record<string, unknown>;
+    },
+  });
+
+  // A pack that failed validation means some playbook silently does not exist.
+  // Say so at boot, once, with the paths — not at 3am when a reminder does not
+  // arrive.
+  const packErrors = packs.errors();
+  if (packErrors.length > 0) {
+    logger.error('PACK CONTENT FAILED VALIDATION — the affected playbooks are not installed', {
+      count: packErrors.length,
+      errors: packErrors,
+    });
+  }
+
   const app = createApp({
     config,
     logger,
@@ -269,6 +341,7 @@ async function main(): Promise<void> {
       gate: complianceGate,
     },
     approvals: { approvals, policies },
+    playbooks: { runtime: runtimeRef.current, registry: playbookRegistry, packs },
   });
 
   const server = app.listen(config.server.port, config.server.host, () => {

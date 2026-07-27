@@ -1,0 +1,56 @@
+[
+  {
+    "key": "medspa.patient-registration.email",
+    "name": "Welcome (email)",
+    "description": "enhanced-event-handler.ts:572-587. Variables: patientName, welcomePackage.",
+    "channel": "email",
+    "category": "lifecycle",
+    "format": "TEXT",
+    "subject": "Welcome to {{tenant.name}}",
+    "content": "Hi {{context.patientName}},\n\nWelcome to {{tenant.name}}. We're glad you're here.\n\n{{#if context.welcomePackage}}{{context.welcomePackage}}\n\n{{/if}}Reply to this message any time with questions.\n\n{{tenant.name}}"
+  },
+
+  {
+    "key": "medspa.patient-feedback.email",
+    "name": "Feedback request (email)",
+    "description": "enhanced-event-handler.ts:598-615. Template id in the source is 'patient-feedback', not 'patient-feedback-request'.",
+    "channel": "email",
+    "category": "feedback",
+    "format": "TEXT",
+    "subject": "How was your {{context.treatmentName}}?",
+    "content": "Hi {{context.patientName}},\n\nWe'd love to hear how your {{context.treatmentName}} went.\n\n{{#if context.surveyLink}}It takes a minute: {{context.surveyLink}}\n\n{{/if}}Thank you,\n{{tenant.name}}"
+  },
+
+  {
+    "key": "medspa.patient-birthday.email",
+    "name": "Birthday (email)",
+    "description": "enhanced-event-handler.ts:626-641. Variables: patientName, specialOffer. Marketing, so the CAN-SPAM footer applies.",
+    "channel": "email",
+    "category": "marketing",
+    "format": "TEXT",
+    "subject": "Happy birthday, {{context.patientName}}",
+    "content": "Happy birthday, {{context.patientName}}!\n\n{{#if context.specialOffer}}{{context.specialOffer}}\n\n{{/if}}From everyone at {{tenant.name}}."
+  },
+
+  {
+    "key": "medspa.onboarding.email",
+    "name": "Onboarding step (email)",
+    "description": "From onboarding-service.ts, which replaces the outreach_rules table. `step` selects what this message covers.",
+    "channel": "email",
+    "category": "lifecycle",
+    "format": "TEXT",
+    "subject": "{{context.subject}}",
+    "content": "Hi {{recipient.firstName}},\n\n{{context.message}}\n\n{{tenant.name}}"
+  },
+
+  {
+    "key": "medspa.farewell.email",
+    "name": "Farewell (email)",
+    "description": "From farewell-message.service.ts, which replaces the farewell_messages table.",
+    "channel": "email",
+    "category": "lifecycle",
+    "format": "TEXT",
+    "subject": "Thank you, {{recipient.firstName}}",
+    "content": "Hi {{recipient.firstName}},\n\nThank you for being part of {{tenant.name}}. You're welcome back any time.\n\n{{#if context.message}}{{context.message}}\n\n{{/if}}{{tenant.name}}"
+  }
+]

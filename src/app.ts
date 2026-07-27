@@ -8,6 +8,7 @@ import { createHealthRouter } from './api/health.js';
 import { createInternalRouter } from './api/internal.js';
 import { createApprovalRouter, type ApprovalApiDeps } from './api/v1/approvals.js';
 import { createContentRouter, type ContentApiDeps } from './api/v1/content.js';
+import { createPlaybookRouter, type PlaybookApiDeps } from './api/v1/playbooks.js';
 import {
   createRecipientRouter,
   createUnsubscribeRouter,
@@ -38,6 +39,8 @@ export interface AppDeps {
   recipients?: RecipientApiDeps;
   /** Present from P6 onward. */
   approvals?: ApprovalApiDeps;
+  /** Present from P7 onward. */
+  playbooks?: PlaybookApiDeps;
 }
 
 /**
@@ -127,6 +130,9 @@ export function createApp(deps: AppDeps): Express {
   }
   if (deps.approvals) {
     app.use('/v1', createApprovalRouter(deps.approvals));
+  }
+  if (deps.playbooks) {
+    app.use('/v1', createPlaybookRouter(deps.playbooks));
   }
 
   app.use(notFoundHandler());

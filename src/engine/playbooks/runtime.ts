@@ -46,6 +46,7 @@ import { toChannelType } from '../../ports/channel.js';
 import type { ContextRef } from '../../ports/context-provider.js';
 import type { TemplateStore } from '../../ports/template-store.js';
 import type { ApprovalService } from '../approvals/approval.service.js';
+import type { PolicyService } from '../approvals/policy.service.js';
 import type { ContentGenerator } from '../content/generator.js';
 import { emptyContext, type RenderContext } from '../content/render-context.js';
 import type { Renderer } from '../content/renderer.js';
@@ -54,7 +55,7 @@ import type { Dispatcher } from '../delivery/dispatcher.js';
 import type { PreferenceService } from '../compliance/preference.service.js';
 import type { RecipientService } from '../recipients/recipient.service.js';
 import type { PackRegistry } from '../../packs/loader.js';
-import type { MatchedPlaybook, Playbook, PlaybookMatcher } from './matcher.js';
+import { readPath, type MatchedPlaybook, type Playbook, type PlaybookMatcher } from './matcher.js';
 import type { OutreachTrigger, PlaybookRunResult } from './trigger.js';
 import { validateContract, type DataContract } from './contract.js';
 
@@ -95,6 +96,7 @@ export interface RuntimeDeps {
   renderer: Renderer;
   generator: ContentGenerator;
   approvals: ApprovalService;
+  policies: PolicyService;
   dispatcher: Dispatcher;
   preferences: PreferenceService;
   packs: PackRegistry;
@@ -216,7 +218,7 @@ export class PlaybookRuntime {
 
       // ── 4. channels ───────────────────────────────────────────────────────
       const plan = (playbook.channelPlan ?? []) as ChannelPlanEntry[];
-      const targets = await this.resolveChannels(scope, plan, trigger, recipient);
+      const targets = await this.resolveChannels(scope, plan, trigger, recipient, playbook);
 
       if (targets.length === 0) {
         return finish({
@@ -319,13 +321,29 @@ export class PlaybookRuntime {
     plan: ChannelPlanEntry[],
     trigger: OutreachTrigger,
     recipient: Awaited<ReturnType<RecipientService['getById']>>,
+    playbook: Playbook,
   ): Promise<{ entry: ChannelPlanEntry; to: ContactPoint }[]> {
     const requested = trigger.channels?.length
       ? new Set(trigger.channels.map((c) => toChannelType(c) ?? c))
       : null;
 
+    // Channels the playbook sends regardless of what the caller asked for.
+    // `handleEmergencyNotification` posts its Slack alert outside any
+    // `event.channels` check (:533) — an emergency a caller could silence by
+    // omitting a channel would be a bad design, and preserving that is not the
+    // same as preserving a hardcoded channel name.
+    const metadata = (playbook.metadata ?? {}) as { alwaysSendChannels?: string[] };
+    const always = new Set(metadata.alwaysSendChannels ?? []);
+
     const contactPoints = (recipient?.contactPoints ?? []) as ContactPoint[];
     const targets: { entry: ChannelPlanEntry; to: ContactPoint }[] = [];
+
+    // Only read the tenant's config when the plan actually references it.
+    const needsConfig = plan.some((e) => e.fixedTarget?.startsWith('$config.'));
+    const config =
+      needsConfig && playbook.packId
+        ? await this.deps.packConfig(scope, playbook.packId)
+        : {};
 
     for (const entry of plan) {
       const channel = toChannelType(entry.channel);
@@ -335,14 +353,25 @@ export class PlaybookRuntime {
         });
         continue;
       }
-      if (requested && !requested.has(channel)) continue;
+      if (requested && !requested.has(channel) && !always.has(channel)) continue;
 
       // A fixed target is an address that is not a recipient's — a Slack
-      // channel, a webhook URL, an ops mailbox. This is where
-      // `to: 'emergency-team@medspa.com'` (:549) now comes from: pack config,
-      // resolved before this point, never a literal in code (D55).
+      // channel, an ops mailbox. This is where `to: 'emergency-team@medspa.com'`
+      // (:549) and the three hardcoded Slack channel names now come from: the
+      // tenant's own config, never a literal in code (D55).
       if (entry.fixedTarget) {
-        targets.push({ entry, to: { type: entry.contactPointType ?? channel, value: entry.fixedTarget } });
+        const values = this.resolveFixedTarget(entry.fixedTarget, config, playbook.key);
+        if (values.length === 0) {
+          this.deps.logger.error(
+            'playbook needs a fixed target the tenant has not configured — channel skipped',
+            { playbookKey: playbook.key, channel, target: entry.fixedTarget, tenantId: scope.tenantId },
+          );
+          continue;
+        }
+        // A config key may hold several addresses; each is its own message.
+        for (const value of values) {
+          targets.push({ entry, to: { type: entry.contactPointType ?? channel, value } });
+        }
         continue;
       }
 
@@ -364,8 +393,28 @@ export class PlaybookRuntime {
     // Opt-outs are the compliance gate's job, downstream of here — this filter
     // is only about reachability. Checking preferences twice would risk the two
     // answers diverging, and the gate is the one that writes the audit row.
-    void scope;
     return targets;
+  }
+
+  /**
+   * `$config.slackChannels.staffAlerts` → the tenant's own value. A literal
+   * that does not start with `$config.` is used as-is, which keeps a
+   * single-tenant pack readable without forcing indirection on everything.
+   */
+  private resolveFixedTarget(
+    target: string,
+    config: Record<string, unknown>,
+    playbookKey: string,
+  ): string[] {
+    if (!target.startsWith('$config.')) return [target];
+
+    const value = readPath(config, target.slice('$config.'.length));
+
+    if (Array.isArray(value)) return value.map(String).filter(Boolean);
+    if (typeof value === 'string' && value.trim()) return [value];
+
+    void playbookKey;
+    return [];
   }
 
   /** Content → approval → dispatch, for one channel. */
@@ -404,7 +453,19 @@ export class PlaybookRuntime {
     // AI-written one waits for a human. That split is carried by the playbook's
     // `approval_policy_id`, seeded by content source (D53) — the runtime does
     // not decide it, it just honours whatever policy the playbook names.
-    if (playbook.approvalPolicyId) {
+    //
+    // `mode: 'none'` is the exception, and it is skipped entirely rather than
+    // submitted-and-auto-approved. Going through `submit()` would write an
+    // `approvals` row per transactional message — an appointment-reminder-heavy
+    // tenant would grow the approvals table at the same rate as `messages`,
+    // every row AUTO_APPROVED, none of them actionable by anybody. `sample` and
+    // `threshold` still go through submit: there the auto-approval is a real
+    // decision about a specific message, and recording it is the point.
+    const policy = playbook.approvalPolicyId
+      ? await this.deps.policies.load(scope, { policyId: playbook.approvalPolicyId })
+      : null;
+
+    if (policy && policy.mode !== 'none') {
       const submitted = await this.deps.approvals.submit(
         scope,
         {
@@ -422,7 +483,7 @@ export class PlaybookRuntime {
           correlationId: trigger.correlationId,
           throttle,
         },
-        { policyId: playbook.approvalPolicyId },
+        { policyId: policy.id },
       );
 
       // `submit` dispatches by itself when the policy auto-approves, so there is

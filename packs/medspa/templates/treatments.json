@@ -1,0 +1,63 @@
+[
+  {
+    "key": "medspa.treatment-followup.email",
+    "name": "Treatment follow-up (email)",
+    "description": "enhanced-event-handler.ts:291-307. Variables: treatmentName, followupDate.",
+    "channel": "email",
+    "category": "treatment",
+    "format": "TEXT",
+    "subject": "Following up on your {{context.treatmentName}}",
+    "content": "Hi {{recipient.firstName}},\n\nWe wanted to check in after your {{context.treatmentName}}.\n\n{{#if context.followupDate}}Your next follow-up is on {{context.followupDate}}.\n{{/if}}\nIf anything feels off, or you have questions, reply to this message.\n\n{{tenant.name}}"
+  },
+
+  {
+    "key": "medspa.treatment-preparation.email",
+    "name": "Treatment preparation (email)",
+    "description": "enhanced-event-handler.ts:318-334. preparationSteps arrives as an ARRAY here.",
+    "channel": "email",
+    "category": "treatment",
+    "format": "TEXT",
+    "subject": "Preparing for your {{context.treatmentName}}",
+    "content": "Hi {{recipient.firstName}},\n\nA few things to do before your {{context.treatmentName}}:\n\n{{#each context.preparationSteps}}- {{this}}\n{{/each}}\nReply if anything is unclear.\n\n{{tenant.name}}"
+  },
+  {
+    "key": "medspa.treatment-preparation.sms",
+    "name": "Treatment preparation (SMS)",
+    "description": "enhanced-event-handler.ts:338-356. The source JOINS the array with '. ' for SMS (:345-347); the template does the same with a helper so the payload shape stays identical on both channels.",
+    "channel": "sms",
+    "category": "treatment",
+    "format": "TEXT",
+    "content": "Before your {{context.treatmentName}}: {{join context.preparationSteps \". \"}} — {{tenant.name}}"
+  },
+
+  {
+    "key": "medspa.treatment-completion.email",
+    "name": "Treatment completion (email)",
+    "description": "enhanced-event-handler.ts:367-383. Variables: treatmentName, postCareInstructions.",
+    "channel": "email",
+    "category": "treatment",
+    "format": "TEXT",
+    "subject": "After your {{context.treatmentName}}",
+    "content": "Hi {{recipient.firstName}},\n\nThank you for coming in for your {{context.treatmentName}}.\n\n{{#if context.postCareInstructions}}Post-care:\n{{context.postCareInstructions}}\n\n{{/if}}Reply to this message if you have any questions.\n\n{{tenant.name}}"
+  },
+
+  {
+    "key": "medspa.treatment-instructions.email",
+    "name": "Treatment instructions (email)",
+    "description": "enhanced-event-handler.ts:394-410. `instructions` is an OBJECT here.",
+    "channel": "email",
+    "category": "treatment",
+    "format": "TEXT",
+    "subject": "Instructions for your {{context.treatmentName}}",
+    "content": "Hi {{recipient.firstName}},\n\nInstructions for your {{context.treatmentName}}:\n\n{{#if context.instructions.summary}}{{context.instructions.summary}}\n\n{{/if}}{{#if context.instructions.detail}}{{context.instructions.detail}}\n{{/if}}\n{{tenant.name}}"
+  },
+  {
+    "key": "medspa.treatment-instructions.sms",
+    "name": "Treatment instructions (SMS)",
+    "description": "enhanced-event-handler.ts:413-433. The source reads instructions.summary and falls back to the literal 'Treatment instructions' (:415). Note it THROWS today when `instructions` is absent entirely — the data contract catches that case before this template is reached.",
+    "channel": "sms",
+    "category": "treatment",
+    "format": "TEXT",
+    "content": "{{context.treatmentName}}: {{#if context.instructions.summary}}{{context.instructions.summary}}{{else}}Treatment instructions{{/if}} — {{tenant.name}}"
+  }
+]
