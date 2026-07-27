@@ -11,6 +11,7 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0002_approvals.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0003_playbooks.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0005_compliance.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0006_approval_policies.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0007_playbook_runs.sql
 ```
 
 Each file is idempotent (`IF NOT EXISTS` / guarded `DO` blocks) and wrapped in a
@@ -23,6 +24,7 @@ transaction.
 | `0003_playbooks.sql` | `packs`, `tenant_packs`, `playbooks`, `playbook_triggers`; links everything that points at a playbook |
 | `0005_compliance.sql` | `messages.suppression_reason` and the gate's three indexes |
 | `0006_approval_policies.sql` | the two baseline approval policies, and their uniqueness indexes |
+| `0007_playbook_runs.sql` | `playbook_runs` and the partial idempotency index that stops a redelivered event sending twice |
 
 **There is no `0004`.** Everything it was scheduled to create already exists in
 `0001`, so the content plane shipped no migration. The number is left unused

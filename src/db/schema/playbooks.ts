@@ -94,6 +94,54 @@ export const playbooks = pgTable(
   ],
 );
 
+/**
+ * One execution of one playbook against one trigger. Added in P7 (`0007`).
+ *
+ * The source has no equivalent: `enhanced-event-handler.ts` returns a bare
+ * `boolean` and logs. When a message does not arrive, there is no row anywhere
+ * saying which handler ran, what it decided, or why it stopped — the only
+ * evidence is a log line that has since rotated away.
+ *
+ * `idempotency_key` is the redelivery guard. BullMQ retries a failed job up to
+ * five times, so a job that threw *after* dispatching would otherwise send five
+ * times; the unique index turns the second attempt into a no-op.
+ */
+export const playbookRuns = pgTable(
+  'playbook_runs',
+  {
+    id: id(),
+    tenantId: tenantId(),
+    subTenantId: subTenantId(),
+    playbookId: uuid('playbook_id')
+      .notNull()
+      .references(() => playbooks.id, { onDelete: 'cascade' }),
+    /** The whole OutreachTrigger, so a run can be replayed exactly. */
+    trigger: jsonb('trigger').notNull().default(sql`'{}'::jsonb`),
+    status: text('status').notNull(),
+    /** Populated on FAILED/SKIPPED/SUPPRESSED. Never null on those. */
+    error: text('error'),
+    /** Every message this run produced — a playbook may fan out per channel. */
+    messageIds: uuid('message_ids').array().notNull().default(sql`'{}'::uuid[]`),
+    correlationId: text('correlation_id'),
+    idempotencyKey: text('idempotency_key'),
+    startedAt: ts('started_at').notNull().defaultNow(),
+    finishedAt: ts('finished_at'),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    check(
+      'playbook_runs_status_check',
+      sql`${t.status} IN ('SENT','QUEUED','PENDING_APPROVAL','SUPPRESSED','SKIPPED','FAILED')`,
+    ),
+    index('idx_playbook_runs_tenant_playbook').on(t.tenantId, t.playbookId, t.startedAt.desc()),
+    index('idx_playbook_runs_correlation').on(t.correlationId),
+    // The idempotency guard is a PARTIAL unique index (WHERE idempotency_key IS
+    // NOT NULL) declared in 0007 — a trigger without a key must not collide
+    // with every other keyless run. Drizzle cannot express the WHERE clause.
+  ],
+);
+
 export const TRIGGER_TYPES = ['event', 'schedule', 'manual', 'campaign', 'webhook'] as const;
 
 export const playbookTriggers = pgTable(
