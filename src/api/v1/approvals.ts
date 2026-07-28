@@ -104,7 +104,7 @@ function handle(
 }
 
 /** The acting identity, carried into the service so authorization is per row. */
-function actorOf(req: Request): Actor {
+export function actorOf(req: Request): Actor {
   const identity = req.identity;
   if (!identity) throw new AuthError();
   return {

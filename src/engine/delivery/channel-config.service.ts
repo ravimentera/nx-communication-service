@@ -4,15 +4,17 @@
  * `provider-config.service.ts` (464L) onto `tenant_channel_configs` /
  * `agent_channel_configs`.
  *
- * Only the read surface the credential resolver needs is ported here. The CRUD
- * surface those services also carried belongs with the config API in P8.
+ * P3 ported only the read surface the credential resolver needs; P8 adds the
+ * writes behind `/v1/channels/configs`, because providers-service calls
+ * `GET|POST|PUT /config/medspa/:medspaId` and that is one of the five call sites
+ * the P10 cutover repoints.
  *
  * Divergence: the source keeps two in-process `Map` caches with a 5-minute TTL
  * (`medspa-config.service.ts:135-137`), which means N service instances hold N
  * divergent views and a config write only invalidates the instance that served
  * it. Caching moves to Redis, shared, with explicit invalidation.
  */
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import type { Logger } from 'winston';
 
 import type { Db } from '../../db/index.js';
@@ -22,7 +24,22 @@ import type { Cache } from '../../platform/redis/index.js';
 export type TenantChannelConfig = typeof tenantChannelConfigs.$inferSelect;
 export type AgentChannelConfig = typeof agentChannelConfigs.$inferSelect;
 
+/** Writable columns. `tenantId`/`senderId` come from the scope, never the body. */
+export type TenantChannelConfigInput = Omit<
+  typeof tenantChannelConfigs.$inferInsert,
+  'id' | 'tenantId' | 'createdAt' | 'updatedAt' | 'createdBy' | 'updatedBy'
+>;
+export type AgentChannelConfigInput = Omit<
+  typeof agentChannelConfigs.$inferInsert,
+  'id' | 'tenantId' | 'senderId' | 'createdAt' | 'updatedAt' | 'createdBy' | 'updatedBy'
+>;
+
 const CACHE_TTL_SECONDS = 300;
+
+/** Drop `undefined` so a partial update leaves untouched columns alone. */
+function definedOnly<T extends Record<string, unknown>>(values: T): Partial<T> {
+  return Object.fromEntries(Object.entries(values).filter(([, v]) => v !== undefined)) as Partial<T>;
+}
 
 export class ChannelConfigService {
   constructor(
@@ -123,6 +140,68 @@ export class ChannelConfigService {
           name: a.name,
         })),
     };
+  }
+
+  /**
+   * Create or replace a tenant's channel config.
+   *
+   * `tenant_channel_configs` has UNIQUE(tenant_id), matching
+   * `medspa_configurations`' own constraint, so this is an upsert rather than
+   * the source's separate create/update pair — which returns 409 on a second
+   * POST and 404 on a PUT before the first one. Callers get one idempotent
+   * verb and the compat router maps both legacy methods onto it.
+   */
+  async upsertTenantConfig(
+    tenantId: string,
+    values: Partial<TenantChannelConfigInput>,
+    actor?: string,
+  ): Promise<TenantChannelConfig> {
+    const [row] = await this.db
+      .insert(tenantChannelConfigs)
+      .values({
+        tenantId,
+        name: values.name ?? tenantId,
+        ...values,
+        createdBy: actor,
+        updatedBy: actor,
+      })
+      .onConflictDoUpdate({
+        target: tenantChannelConfigs.tenantId,
+        // Only what the caller supplied. A PUT that names two SendGrid fields
+        // must not null out the Twilio credentials it did not mention.
+        set: { ...definedOnly(values), updatedBy: actor, updatedAt: sql`now()` },
+      })
+      .returning();
+
+    await this.invalidate(tenantId);
+    return row!;
+  }
+
+  /** Same shape, per agent. UNIQUE(tenant_id, sender_id) backs the conflict target. */
+  async upsertAgentConfig(
+    tenantId: string,
+    senderId: string,
+    values: Partial<AgentChannelConfigInput>,
+    actor?: string,
+  ): Promise<AgentChannelConfig> {
+    const [row] = await this.db
+      .insert(agentChannelConfigs)
+      .values({
+        tenantId,
+        senderId,
+        name: values.name ?? senderId,
+        ...values,
+        createdBy: actor,
+        updatedBy: actor,
+      })
+      .onConflictDoUpdate({
+        target: [agentChannelConfigs.tenantId, agentChannelConfigs.senderId],
+        set: { ...definedOnly(values), updatedBy: actor, updatedAt: sql`now()` },
+      })
+      .returning();
+
+    await this.invalidate(tenantId, senderId);
+    return row!;
   }
 
   /**

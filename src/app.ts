@@ -5,9 +5,11 @@ import type pg from 'pg';
 import type { Logger } from 'winston';
 
 import { createHealthRouter } from './api/health.js';
-import { createInternalRouter } from './api/internal.js';
+import { createCompatMounts, type CompatDeps } from './api/compat/index.js';
 import { createApprovalRouter, type ApprovalApiDeps } from './api/v1/approvals.js';
+import { createChannelRouter, type ChannelApiDeps } from './api/v1/channels.js';
 import { createContentRouter, type ContentApiDeps } from './api/v1/content.js';
+import { createMessagingRouter, type MessagingApiDeps } from './api/v1/messaging.js';
 import { createPlaybookRouter, type PlaybookApiDeps } from './api/v1/playbooks.js';
 import {
   createRecipientRouter,
@@ -41,6 +43,11 @@ export interface AppDeps {
   approvals?: ApprovalApiDeps;
   /** Present from P7 onward. */
   playbooks?: PlaybookApiDeps;
+  /** Present from P8 onward. */
+  messaging?: MessagingApiDeps;
+  channels?: ChannelApiDeps;
+  /** The legacy surface (D60: 110 endpoints, not 77). Absent in /v1-only tests. */
+  compat?: CompatDeps;
 }
 
 /**
@@ -118,10 +125,6 @@ export function createApp(deps: AppDeps): Express {
   app.use(createAuthMiddleware({ config: config.auth, logger }));
 
   // P3 onward mount the business routers here.
-  if (deps.dispatcher) {
-    // Temporary — deleted in P8 when the real v1 surface lands.
-    app.use('/internal', createInternalRouter(deps.dispatcher));
-  }
   if (deps.content) {
     app.use('/v1', createContentRouter(deps.content));
   }
@@ -133,6 +136,21 @@ export function createApp(deps: AppDeps): Express {
   }
   if (deps.playbooks) {
     app.use('/v1', createPlaybookRouter(deps.playbooks));
+  }
+  if (deps.messaging) {
+    app.use('/v1', createMessagingRouter(deps.messaging));
+  }
+  if (deps.channels) {
+    app.use('/v1', createChannelRouter(deps.channels));
+  }
+
+  // (4) The legacy surface, LAST — so a `/v1` path can never be shadowed by a
+  //     root-mounted legacy router, and so `notFoundHandler` still sees
+  //     anything neither surface claims. Deleted in P12.
+  if (deps.compat) {
+    for (const { path, router } of createCompatMounts(deps.compat)) {
+      app.use(path, router);
+    }
   }
 
   app.use(notFoundHandler());

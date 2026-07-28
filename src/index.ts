@@ -21,6 +21,9 @@ import { ComplianceGate } from './engine/compliance/gate.js';
 import { lintContent, mergeRules } from './engine/compliance/lint.js';
 import { PreferenceService } from './engine/compliance/preference.service.js';
 import { CORE_PACK, ContextRegistry } from './engine/context/registry.js';
+import { AnalyticsService } from './engine/messaging/analytics.service.js';
+import { ConversationService } from './engine/messaging/conversation.service.js';
+import { MessageService } from './engine/messaging/message.service.js';
 import { RecipientService } from './engine/recipients/recipient.service.js';
 import { ContentGenerator } from './engine/content/generator.js';
 import { PromptAssembler } from './engine/content/prompt-assembler.js';
@@ -257,6 +260,11 @@ async function main(): Promise<void> {
 
   const recipientService = new RecipientService({ db, logger, context: contextRegistry });
 
+  // ── messaging plane ───────────────────────────────────────────────────────
+  const messageService = new MessageService({ db, logger });
+  const conversationService = new ConversationService({ db, logger });
+  const analyticsService = new AnalyticsService({ db, logger });
+
   // ── content plane ─────────────────────────────────────────────────────────
   const packs = loadPacks(join(process.cwd(), 'packs'), logger);
   const renderer = new Renderer({ logger, aliases: packs.aliasMaps() });
@@ -342,6 +350,28 @@ async function main(): Promise<void> {
     },
     approvals: { approvals, policies },
     playbooks: { runtime: runtimeRef.current, registry: playbookRegistry, packs },
+    messaging: {
+      messages: messageService,
+      conversations: conversationService,
+      analytics: analyticsService,
+      recipients: recipientService,
+      dispatcher,
+    },
+    channels: { configs: channelConfigs, dispatcher, queue },
+    compat: {
+      messaging: {
+        messages: messageService,
+        conversations: conversationService,
+        analytics: analyticsService,
+        recipients: recipientService,
+        dispatcher,
+      },
+      channels: { configs: channelConfigs, dispatcher, queue },
+      approvals: { approvals, policies },
+      playbooks: { runtime: runtimeRef.current, registry: playbookRegistry, packs },
+      recipients: { recipients: recipientService, preferences, gate: complianceGate },
+      content: { renderer, store: templateStore, generator, packs },
+    },
   });
 
   const server = app.listen(config.server.port, config.server.host, () => {

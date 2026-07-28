@@ -33,14 +33,14 @@
  *    attempt. `(tenant_id, playbook_id, idempotency_key)` is unique now.
  * ─────────────────────────────────────────────────────────────────────────────
  */
-import { and, eq } from 'drizzle-orm';
+import { and, desc, eq } from 'drizzle-orm';
 import type { Logger } from 'winston';
 
 import type { Db } from '../../db/index.js';
 import { outreachEvents, playbookRuns } from '../../db/schema.js';
 import type { Priority } from '../../domain/index.js';
 import { metricsRegistry, promClient } from '../../platform/observability/metrics.js';
-import type { TenantScope } from '../../platform/db/tenant-scope.js';
+import { tenantWhere, type TenantScope } from '../../platform/db/tenant-scope.js';
 import type { ChannelType, ContactPoint, RenderedMessage } from '../../ports/channel.js';
 import { toChannelType } from '../../ports/channel.js';
 import type { ContextRef } from '../../ports/context-provider.js';
@@ -651,6 +651,46 @@ export class PlaybookRuntime {
   }
 
   // ── bookkeeping ───────────────────────────────────────────────────────────
+
+  /**
+   * Every run a caller's event produced, newest first.
+   *
+   * Backs `GET /events/:eventId/status` (P8) and `GET
+   * /v1/outreach/events/:id`. The lookup is by **correlation id**, which is
+   * the caller's own event id — the legacy endpoint's `:eventId` is that, not
+   * an id this service minted. A trigger can match several playbooks, so this
+   * is a list; the compat route reports the first.
+   */
+  async findRuns(
+    scope: TenantScope,
+    correlationId: string,
+  ): Promise<
+    Array<{
+      id: string;
+      playbookId: string;
+      status: string;
+      error: string | null;
+      messageIds: string[];
+      startedAt: Date;
+      finishedAt: Date | null;
+    }>
+  > {
+    return this.deps.db
+      .select({
+        id: playbookRuns.id,
+        playbookId: playbookRuns.playbookId,
+        status: playbookRuns.status,
+        error: playbookRuns.error,
+        messageIds: playbookRuns.messageIds,
+        startedAt: playbookRuns.startedAt,
+        finishedAt: playbookRuns.finishedAt,
+      })
+      .from(playbookRuns)
+      .where(
+        and(tenantWhere(playbookRuns, scope), eq(playbookRuns.correlationId, correlationId)),
+      )
+      .orderBy(desc(playbookRuns.startedAt));
+  }
 
   private async priorRun(
     scope: TenantScope,
