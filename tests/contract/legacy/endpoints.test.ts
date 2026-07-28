@@ -578,6 +578,59 @@ describe('/communications — 16', () => {
   });
 });
 
+describe('/messages — 3, and they are not provider webhooks', () => {
+  it('POST /messages/webhook/sms records a reply', async () => {
+    const res = await post('/messages/webhook/sms', {
+      patientId: PATIENT,
+      providerId: PROVIDER,
+      fromNumber: '+15550000001',
+      toNumber: '+15550000000',
+      messageContent: 'Yes please',
+      channel: 'SMS',
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.data).toMatchObject({ patientId: PATIENT, medspaId: TENANT });
+    expect(res.body.data.replyId).toBeTruthy();
+  });
+
+  it('POST /messages/webhook/sms records a reply from a patient we have never messaged', async () => {
+    // The source 404s here: it requires a prior OUTBOUND message on the same
+    // channel before it will store anything, so a recipient's first contact is
+    // dropped.
+    const res = await post('/messages/webhook/sms', {
+      patientId: 'never-messaged',
+      messageContent: 'Hello?',
+      channel: 'SMS',
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it('POST /messages/webhook/email records a reply', async () => {
+    const res = await post('/messages/webhook/email', {
+      patientId: PATIENT,
+      providerId: PROVIDER,
+      messageContent: 'Thanks',
+      channel: 'EMAIL',
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it('POST /messages/generate-reply 404s a message from another tenant', async () => {
+    const res = await post(
+      '/messages/generate-reply',
+      { messageId, patientReply: 'ok' },
+      gatewayHeaders({ 'x-medspa-id': OTHER_TENANT }),
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it('POST /messages/generate-reply runs the reply playbook', async () => {
+    const res = await post('/messages/generate-reply', { messageId, patientReply: 'ok' });
+    expect(res.status).toBe(200);
+    expect(res.body.data).toMatchObject({ patientId: PATIENT, providerId: PROVIDER });
+  });
+});
+
 describe('/queue — 2', () => {
   it('GET /queue/stats keeps the {stats:{notification,event}} shape', async () => {
     const res = await get('/queue/stats');

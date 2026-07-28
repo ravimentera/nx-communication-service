@@ -6,6 +6,7 @@ import type { Logger } from 'winston';
 
 import { createHealthRouter } from './api/health.js';
 import { createCompatMounts, type CompatDeps } from './api/compat/index.js';
+import { createWebhookRouter, type WebhookDeps } from './api/webhooks/index.js';
 import { createApprovalRouter, type ApprovalApiDeps } from './api/v1/approvals.js';
 import { createChannelRouter, type ChannelApiDeps } from './api/v1/channels.js';
 import { createContentRouter, type ContentApiDeps } from './api/v1/content.js';
@@ -48,17 +49,24 @@ export interface AppDeps {
   channels?: ChannelApiDeps;
   /** The legacy surface (D60: 110 endpoints, not 77). Absent in /v1-only tests. */
   compat?: CompatDeps;
+  /** Provider callbacks. Mounted pre-auth and pre-body-parser (P8b). */
+  webhooks?: WebhookDeps;
 }
 
 /**
- * Wire the HTTP surface. TWO ORDERING SUBTLETIES ARE LOAD-BEARING, both
- * inherited from the source service — do not "tidy" them:
+ * Wire the HTTP surface. FOUR ORDERING SUBTLETIES ARE LOAD-BEARING — do not
+ * "tidy" them:
  *
  *   1. `/metrics` is mounted BEFORE auth. Prometheus scrapes with no gateway
  *      headers; behind auth every scrape would 403.
- *   2. `/mcp` is mounted BEFORE auth (P8). tera-orchestrator hits GET /mcp/tools
- *      at its own startup with no per-user headers. Discovery is schema-only;
+ *   2. `/v1/webhooks` is mounted BEFORE auth **and before the JSON parser**.
+ *      Twilio and SendGrid carry no gateway headers, and signature verification
+ *      needs the raw bytes a shared parser would have discarded.
+ *   3. `/mcp` is mounted BEFORE auth. tera-orchestrator hits GET /mcp/tools at
+ *      its own startup with no per-user headers. Discovery is schema-only;
  *      individual tool executions still validate their input.
+ *   4. The legacy compat surface is mounted LAST, so a root-mounted legacy
+ *      router can never shadow a `/v1` path.
  */
 export function createApp(deps: AppDeps): Express {
   const { config, logger } = deps;
@@ -81,6 +89,16 @@ export function createApp(deps: AppDeps): Express {
 
   app.use(helmet());
   app.use(cors());
+
+  // (2) Pre-auth AND pre-body-parser: a provider callback carries no gateway
+  //     headers — the signature is the credential — and verifying it needs the
+  //     exact bytes, which a shared JSON parser has already thrown away. Each
+  //     webhook route installs its own parser. Mounted before `express.json`
+  //     for that reason, not by accident.
+  if (deps.webhooks) {
+    app.use('/v1/webhooks', createWebhookRouter(deps.webhooks));
+  }
+
   app.use(express.json({ limit: '5mb' }));
   app.use(express.urlencoded({ extended: true, limit: '5mb' }));
 
@@ -106,9 +124,9 @@ export function createApp(deps: AppDeps): Express {
     }),
   );
 
-  // (2) P8 mounts the MCP router here, pre-auth.
+  // (3) P8b mounts the MCP router here, pre-auth.
 
-  // (3) Pre-auth: an unsubscribe link is clicked from an email client, which
+  // (4) Pre-auth: an unsubscribe link is clicked from an email client, which
   //     carries no gateway headers and no session. The 24-byte token in the
   //     URL is the credential, and the route is rate-limited. CAN-SPAM
   //     requires the link to work for anyone who received the message.
@@ -144,7 +162,7 @@ export function createApp(deps: AppDeps): Express {
     app.use('/v1', createChannelRouter(deps.channels));
   }
 
-  // (4) The legacy surface, LAST — so a `/v1` path can never be shadowed by a
+  // (5) The legacy surface, LAST — so a `/v1` path can never be shadowed by a
   //     root-mounted legacy router, and so `notFoundHandler` still sees
   //     anything neither surface claims. Deleted in P12.
   if (deps.compat) {

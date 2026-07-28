@@ -103,6 +103,22 @@ const envSchema = z.object({
   SLACK_BOT_TOKEN: optionalString,
   SLACK_DEFAULT_CHANNEL: optionalString,
 
+  // Inbound webhook verification (P8b). Distinct from the sending credentials
+  // above: a provider signs its callbacks with a different secret than the one
+  // it accepts sends on, and SendGrid's is a public key, not a shared secret.
+  SENDGRID_WEBHOOK_PUBLIC_KEY: optionalString,
+  SLACK_SIGNING_SECRET: optionalString,
+  /**
+   * The public origin the providers call back on, e.g.
+   * `https://api.example.com/api/communication`. Twilio signs the **full URL**
+   * it requested, so the value reconstructed behind a gateway and a load
+   * balancer will not match unless it is stated. Leave unset to build it from
+   * the request, which works only when nothing rewrites the path.
+   */
+  WEBHOOK_PUBLIC_URL: optionalString,
+  /** Reject an unsigned callback. Default true — see webhooks/signature.ts. */
+  WEBHOOK_REQUIRE_SIGNATURE: bool(true),
+
   // --- context (read only by adapters/context/mentera.provider.ts, P5) ---
   PATIENT_SERVICE_URL: optionalString,
   PROVIDER_SERVICE_URL: optionalString,
@@ -203,6 +219,12 @@ function shape(env: Env) {
         botToken: env.SLACK_BOT_TOKEN,
         defaultChannel: env.SLACK_DEFAULT_CHANNEL,
       },
+    },
+    webhooks: {
+      requireSignature: env.WEBHOOK_REQUIRE_SIGNATURE,
+      publicUrl: env.WEBHOOK_PUBLIC_URL,
+      sendgridPublicKey: env.SENDGRID_WEBHOOK_PUBLIC_KEY,
+      slackSigningSecret: env.SLACK_SIGNING_SECRET,
     },
     context: {
       patientServiceUrl: env.PATIENT_SERVICE_URL,

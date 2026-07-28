@@ -24,6 +24,7 @@ import { CORE_PACK, ContextRegistry } from './engine/context/registry.js';
 import { AnalyticsService } from './engine/messaging/analytics.service.js';
 import { ConversationService } from './engine/messaging/conversation.service.js';
 import { MessageService } from './engine/messaging/message.service.js';
+import { ReceiptService } from './engine/messaging/receipt.service.js';
 import { RecipientService } from './engine/recipients/recipient.service.js';
 import { ContentGenerator } from './engine/content/generator.js';
 import { PromptAssembler } from './engine/content/prompt-assembler.js';
@@ -264,6 +265,9 @@ async function main(): Promise<void> {
   const messageService = new MessageService({ db, logger });
   const conversationService = new ConversationService({ db, logger });
   const analyticsService = new AnalyticsService({ db, logger });
+  // Provider callbacks. Nothing in the source consumes a delivery receipt at
+  // all, so `provider_message_id` (P2/P3, D22) gets its first reader here.
+  const receiptService = new ReceiptService({ db, logger });
 
   // ── content plane ─────────────────────────────────────────────────────────
   const packs = loadPacks(join(process.cwd(), 'packs'), logger);
@@ -358,6 +362,13 @@ async function main(): Promise<void> {
       dispatcher,
     },
     channels: { configs: channelConfigs, dispatcher, queue },
+    webhooks: {
+      receipts: receiptService,
+      configs: channelConfigs,
+      logger,
+      config: config.webhooks,
+      twilioAuthToken: config.channels.twilio.authToken,
+    },
     compat: {
       messaging: {
         messages: messageService,
@@ -371,6 +382,7 @@ async function main(): Promise<void> {
       playbooks: { runtime: runtimeRef.current, registry: playbookRegistry, packs },
       recipients: { recipients: recipientService, preferences, gate: complianceGate },
       content: { renderer, store: templateStore, generator, packs },
+      receipts: receiptService,
     },
   });
 

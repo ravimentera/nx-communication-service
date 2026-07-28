@@ -27,6 +27,7 @@ import { metricsRegistry, promClient } from '../../platform/observability/metric
 import type { ApprovalApiDeps } from '../v1/approvals.js';
 import type { ChannelApiDeps } from '../v1/channels.js';
 import type { ContentApiDeps } from '../v1/content.js';
+import type { ReceiptService } from '../../engine/messaging/receipt.service.js';
 import type { MessagingApiDeps } from '../v1/messaging.js';
 import type { PlaybookApiDeps } from '../v1/playbooks.js';
 import type { RecipientApiDeps } from '../v1/recipients.js';
@@ -34,6 +35,7 @@ import { createLegacyApprovalRouter } from './approvals.js';
 import { createLegacyCommunicationsRouter } from './communications.js';
 import { createLegacyConfigRouter } from './config.js';
 import { createLegacyEventRouter } from './events.js';
+import { createLegacyMessagesRouter } from './messages.js';
 import { createLegacyPreferenceRouter } from './preferences.js';
 import { createLegacyQueueRouter } from './queue.js';
 import { createLegacySendRouters } from './send.js';
@@ -70,6 +72,7 @@ export interface CompatDeps {
   playbooks: PlaybookApiDeps;
   recipients: RecipientApiDeps;
   content: ContentApiDeps;
+  receipts: ReceiptService;
 }
 
 /**
@@ -114,6 +117,15 @@ export function createCompatMounts(deps: CompatDeps): Array<{ path: string; rout
     {
       path: '/communications',
       router: createLegacyCommunicationsRouter({ ...deps.messaging, identity }),
+    },
+    {
+      path: '/messages',
+      router: createLegacyMessagesRouter({
+        receipts: deps.receipts,
+        messages: deps.messaging.messages,
+        playbooks: deps.playbooks,
+        identity,
+      }),
     },
     { path: '/queue', router: createLegacyQueueRouter(deps.channels) },
   ];

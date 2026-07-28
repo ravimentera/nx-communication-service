@@ -104,6 +104,28 @@ export class ChannelConfigService {
     return row;
   }
 
+  /**
+   * Reverse lookup for an inbound Twilio callback (P8b).
+   *
+   * A webhook carries no tenant — only the account sid Twilio signed it with,
+   * which is what identifies whose auth token verifies the signature. Not
+   * cached: it runs once per callback and a stale hit here would reject real
+   * traffic after a credential rotation.
+   */
+  async getTenantConfigByTwilioAccount(accountSid: string): Promise<TenantChannelConfig | null> {
+    const [row] = await this.db
+      .select()
+      .from(tenantChannelConfigs)
+      .where(
+        and(
+          eq(tenantChannelConfigs.twilioAccountSid, accountSid),
+          eq(tenantChannelConfigs.isActive, true),
+        ),
+      )
+      .limit(1);
+    return row ?? null;
+  }
+
   /** ← `provider-config.service.ts:333 getProvidersByMedspa`. */
   async getAgentsByTenant(tenantId: string): Promise<AgentChannelConfig[]> {
     return this.db

@@ -39,6 +39,7 @@ import {
 import { AnalyticsService } from '../../../src/engine/messaging/analytics.service.js';
 import { ConversationService } from '../../../src/engine/messaging/conversation.service.js';
 import { MessageService } from '../../../src/engine/messaging/message.service.js';
+import { ReceiptService } from '../../../src/engine/messaging/receipt.service.js';
 import { PlaybookMatcher } from '../../../src/engine/playbooks/matcher.js';
 import { PlaybookRegistry } from '../../../src/engine/playbooks/registry.js';
 import { PlaybookRuntime } from '../../../src/engine/playbooks/runtime.js';
@@ -81,6 +82,7 @@ export function gatewayHeaders(
 export interface Harness {
   app: Express;
   db: Db;
+  receipts: ReceiptService;
   queue: NotificationQueue;
   stop: () => Promise<void>;
 }
@@ -122,6 +124,11 @@ export async function startHarness(): Promise<Harness> {
     TWILIO_AUTH_TOKEN: 'contract-test',
     TWILIO_PHONE_NUMBER: '+15550000000',
     SLACK_BOT_TOKEN: 'xoxb-contract-test',
+    // Provider callbacks are signature-verified with these (P8b). The URL is
+    // stated rather than reconstructed, because supertest's ephemeral port
+    // would otherwise be part of what Twilio signed.
+    WEBHOOK_PUBLIC_URL: 'https://webhooks.example.test',
+    SLACK_SIGNING_SECRET: 'slack-signing-secret',
   });
 
   const { db, pool } = createDb(config.db, logger);
@@ -207,6 +214,7 @@ export async function startHarness(): Promise<Harness> {
     packConfig: async () => ({}),
   });
 
+  const receipts = new ReceiptService({ db, logger });
   const messaging = {
     messages: new MessageService({ db, logger }),
     conversations: new ConversationService({ db, logger }),
@@ -232,6 +240,13 @@ export async function startHarness(): Promise<Harness> {
     playbooks: playbookDeps,
     messaging,
     channels,
+    webhooks: {
+      receipts,
+      configs: channelConfigs,
+      logger,
+      config: config.webhooks,
+      twilioAuthToken: config.channels.twilio.authToken,
+    },
     compat: {
       messaging,
       channels,
@@ -239,12 +254,14 @@ export async function startHarness(): Promise<Harness> {
       playbooks: playbookDeps,
       recipients: recipientDeps,
       content: contentDeps,
+      receipts,
     },
   });
 
   return {
     app,
     db,
+    receipts,
     queue,
     stop: async () => {
       await redis.close().catch(() => {});
