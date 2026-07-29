@@ -75,17 +75,29 @@ function handle(
   };
 }
 
-export function createLegacySendRouters(deps: SendCompatDeps): {
-  email: Router;
-  sms: Router;
-  slack: Router;
-} {
-  /**
-   * Resolve the body to something sendable. Either a template key/id plus
-   * variables, or a literal message — the same either/or the SMS route
-   * validates at `sms.routes.ts:47-58`, applied to email too.
-   */
-  async function resolveBody(
+/**
+ * Resolve a legacy body to something sendable: either a template key/id plus
+ * variables, or a literal message — the same either/or the SMS route validates
+ * at `sms.routes.ts:47-58`, applied to email too.
+ *
+ * Exported because the MCP tools take the same shape (`templateId` +
+ * `variables` or a bare `message`) and must render identically; two copies of
+ * this would drift the moment one grew a helper.
+ */
+export function createBodyResolver(deps: {
+  templates: TemplateStore;
+  renderer: Renderer;
+}): (
+  tenantId: string,
+  input: {
+    templateId?: string;
+    variables?: Record<string, unknown>;
+    message?: string;
+    subject?: string;
+    html?: string;
+  },
+) => Promise<{ subject?: string; body: string; html?: string; templateId?: string }> {
+  return async function resolveBody(
     tenantId: string,
     input: {
       templateId?: string;
@@ -127,7 +139,15 @@ export function createLegacySendRouters(deps: SendCompatDeps): {
       html: template.format === 'TEXT' ? undefined : rendered.output,
       templateId: template.id,
     };
-  }
+  };
+}
+
+export function createLegacySendRouters(deps: SendCompatDeps): {
+  email: Router;
+  sms: Router;
+  slack: Router;
+} {
+  const resolveBody = createBodyResolver(deps);
 
   // ── /email ────────────────────────────────────────────────────────────────
   const email = Router();

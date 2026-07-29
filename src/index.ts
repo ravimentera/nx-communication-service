@@ -30,6 +30,7 @@ import { ContentGenerator } from './engine/content/generator.js';
 import { PromptAssembler } from './engine/content/prompt-assembler.js';
 import { Renderer } from './engine/content/renderer.js';
 import { DrizzleTemplateStore } from './engine/content/store.js';
+import { createBodyResolver } from './api/compat/send.js';
 import { loadPacks } from './packs/loader.js';
 import { createApp } from './app.js';
 import { loadConfig } from './config/index.js';
@@ -53,6 +54,7 @@ import {
   type NotificationQueue,
 } from './engine/delivery/notification-queue.js';
 import { createResultRecorder } from './engine/delivery/record-result.js';
+import { createAuthMiddleware } from './platform/http/auth.middleware.js';
 import { closeDb } from './platform/db/client.js';
 import { createServiceLogger } from './platform/observability/logger.js';
 import { initMetrics } from './platform/observability/metrics.js';
@@ -362,6 +364,13 @@ async function main(): Promise<void> {
       dispatcher,
     },
     channels: { configs: channelConfigs, dispatcher, queue },
+    mcp: {
+      dispatcher,
+      queue,
+      logger,
+      authenticate: createAuthMiddleware({ config: config.auth, logger }),
+      render: createBodyResolver({ templates: templateStore, renderer }),
+    },
     webhooks: {
       receipts: receiptService,
       configs: channelConfigs,

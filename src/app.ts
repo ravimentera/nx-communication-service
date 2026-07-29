@@ -7,6 +7,7 @@ import type { Logger } from 'winston';
 import { createHealthRouter } from './api/health.js';
 import { createCompatMounts, type CompatDeps } from './api/compat/index.js';
 import { createWebhookRouter, type WebhookDeps } from './api/webhooks/index.js';
+import { createMcpRouter, type McpDeps } from './mcp/index.js';
 import { createApprovalRouter, type ApprovalApiDeps } from './api/v1/approvals.js';
 import { createChannelRouter, type ChannelApiDeps } from './api/v1/channels.js';
 import { createContentRouter, type ContentApiDeps } from './api/v1/content.js';
@@ -51,6 +52,8 @@ export interface AppDeps {
   compat?: CompatDeps;
   /** Provider callbacks. Mounted pre-auth and pre-body-parser (P8b). */
   webhooks?: WebhookDeps;
+  /** MCP. Discovery is pre-auth; execution is not (P8b). */
+  mcp?: McpDeps;
 }
 
 /**
@@ -124,7 +127,13 @@ export function createApp(deps: AppDeps): Express {
     }),
   );
 
-  // (3) P8b mounts the MCP router here, pre-auth.
+  // (3) Pre-auth: tera-orchestrator calls GET /mcp/tools at its own startup,
+  //     before any user exists, to build its tool registry. Discovery is
+  //     schema-only. Every tool that touches data calls `requireTenant`, so
+  //     execution is still authenticated — see mcp/index.ts.
+  if (deps.mcp) {
+    app.use('/mcp', createMcpRouter(deps.mcp));
+  }
 
   // (4) Pre-auth: an unsubscribe link is clicked from an email client, which
   //     carries no gateway headers and no session. The 24-byte token in the

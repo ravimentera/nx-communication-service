@@ -47,7 +47,9 @@ import { RecipientService } from '../../../src/engine/recipients/recipient.servi
 import { createChannelRegistry } from '../../../src/adapters/channels/index.js';
 import { createCredentialMappers } from '../../../src/adapters/channels/credentials.js';
 import { InlineContextProvider } from '../../../src/adapters/context/inline.provider.js';
+import { createBodyResolver } from '../../../src/api/compat/send.js';
 import { loadPacks } from '../../../src/packs/loader.js';
+import { createAuthMiddleware } from '../../../src/platform/http/auth.middleware.js';
 import { Cache, createRedis } from '../../../src/platform/redis/index.js';
 
 export const TENANT = '00000000-0000-4000-8000-00000000c001';
@@ -240,6 +242,13 @@ export async function startHarness(): Promise<Harness> {
     playbooks: playbookDeps,
     messaging,
     channels,
+    mcp: {
+      dispatcher,
+      queue,
+      logger,
+      authenticate: createAuthMiddleware({ config: config.auth, logger }),
+      render: createBodyResolver({ templates: templateStore, renderer }),
+    },
     webhooks: {
       receipts,
       configs: channelConfigs,
