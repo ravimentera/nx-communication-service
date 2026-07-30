@@ -1,0 +1,169 @@
+{
+  "$comment": [
+    "EHR event -> outreach event, lifted verbatim from services/event-mapper.service.ts:61-200.",
+    "",
+    "Exact rules are matched first, in declared order; then `contains` rules, also in",
+    "declared order. An event matching nothing is UNMAPPED — the source guessed here",
+    "(getContextualMapping) and would send a patient a message chosen by heuristic.",
+    "",
+    "`eventType` values are the pack's own trigger names; packs/medspa/event-types.json",
+    "is the catalogue and aliases.json carries the enum/switch mismatches (D56).",
+    "",
+    "Adding a vendor means adding rules to this file. It is data, not a release."
+  ],
+  "rules": [
+    {
+      "event": "appointment_missed",
+      "eventType": "APPOINTMENT_MISSED",
+      "priority": "HIGH",
+      "channels": ["sms"],
+      "metadata": { "urgency": "missed_appointment" },
+      "reason": "Patient missed appointment - follow-up required"
+    },
+    {
+      "event": "appointment_no_show",
+      "eventType": "APPOINTMENT_MISSED",
+      "priority": "HIGH",
+      "channels": ["sms"],
+      "metadata": { "urgency": "no_show" },
+      "reason": "Patient no-show - immediate follow-up needed"
+    },
+    {
+      "event": "appointment_scheduled",
+      "eventType": "APPOINTMENT_CONFIRMATION",
+      "priority": "MEDIUM",
+      "channels": ["sms"],
+      "metadata": { "timing": "confirmation" },
+      "reason": "New appointment scheduled - confirmation needed"
+    },
+    {
+      "event": "treatment_completed",
+      "eventType": "TREATMENT_COMPLETION",
+      "priority": "MEDIUM",
+      "channels": ["sms"],
+      "metadata": { "timing": "post_treatment" },
+      "reason": "Treatment completed - post-care follow-up"
+    },
+    {
+      "event": "patient_created",
+      "eventType": "PATIENT_REGISTRATION",
+      "priority": "MEDIUM",
+      "channels": ["email"],
+      "metadata": { "onboarding": true },
+      "reason": "New patient - welcome sequence"
+    },
+    {
+      "event": "consultation_completed",
+      "eventType": "TREATMENT_FOLLOWUP",
+      "priority": "MEDIUM",
+      "channels": ["email"],
+      "metadata": { "consultationType": "general" },
+      "reason": "Consultation completed - follow-up opportunity"
+    },
+    {
+      "event": "athena_appointment_cancelled",
+      "eventType": "APPOINTMENT_CANCELLATION",
+      "priority": "HIGH",
+      "channels": ["sms"],
+      "metadata": { "followUpNeeded": true },
+      "reason": "Appointment cancelled - reschedule opportunity"
+    },
+    {
+      "event": "athena_treatment_note_added",
+      "eventType": "TREATMENT_INSTRUCTIONS",
+      "priority": "LOW",
+      "channels": ["email"],
+      "metadata": { "educational": true },
+      "reason": "Treatment note added - educational follow-up"
+    },
+    {
+      "event": "epic_visit_completed",
+      "eventType": "TREATMENT_FOLLOWUP",
+      "priority": "MEDIUM",
+      "channels": ["sms"],
+      "metadata": { "resultsFollowUp": true },
+      "reason": "Visit completed - results check needed"
+    },
+
+    {
+      "contains": ["appointment", "missed"],
+      "eventType": "APPOINTMENT_MISSED",
+      "priority": "HIGH",
+      "channels": ["sms"],
+      "metadata": { "patternMatched": "missed_appointment" },
+      "reason": "Pattern match: missed appointment event"
+    },
+    {
+      "contains": ["appointment", "no_show"],
+      "eventType": "APPOINTMENT_MISSED",
+      "priority": "HIGH",
+      "channels": ["sms"],
+      "metadata": { "patternMatched": "missed_appointment" },
+      "reason": "Pattern match: no-show event"
+    },
+    {
+      "contains": ["appointment", "reminder"],
+      "eventType": "APPOINTMENT_REMINDER",
+      "priority": "MEDIUM",
+      "channels": ["sms"],
+      "metadata": { "patternMatched": "appointment_reminder" },
+      "reason": "Pattern match: appointment reminder needed"
+    },
+    {
+      "contains": ["appointment", "upcoming"],
+      "eventType": "APPOINTMENT_REMINDER",
+      "priority": "MEDIUM",
+      "channels": ["sms"],
+      "metadata": { "patternMatched": "appointment_reminder" },
+      "reason": "Pattern match: upcoming appointment"
+    },
+    {
+      "contains": ["treatment", "completed"],
+      "eventType": "TREATMENT_COMPLETION",
+      "priority": "MEDIUM",
+      "channels": ["sms"],
+      "metadata": { "patternMatched": "treatment_completed" },
+      "reason": "Pattern match: treatment completion follow-up"
+    },
+    {
+      "contains": ["treatment", "finished"],
+      "eventType": "TREATMENT_COMPLETION",
+      "priority": "MEDIUM",
+      "channels": ["sms"],
+      "metadata": { "patternMatched": "treatment_completed" },
+      "reason": "Pattern match: treatment finished"
+    },
+    {
+      "contains": ["procedure", "completed"],
+      "eventType": "TREATMENT_COMPLETION",
+      "priority": "MEDIUM",
+      "channels": ["sms"],
+      "metadata": { "patternMatched": "treatment_completed" },
+      "reason": "Pattern match: procedure completion follow-up"
+    },
+    {
+      "contains": ["patient", "new"],
+      "eventType": "PATIENT_REGISTRATION",
+      "priority": "MEDIUM",
+      "channels": ["email"],
+      "metadata": { "patternMatched": "new_patient" },
+      "reason": "Pattern match: new patient welcome"
+    },
+    {
+      "contains": ["patient", "created"],
+      "eventType": "PATIENT_REGISTRATION",
+      "priority": "MEDIUM",
+      "channels": ["email"],
+      "metadata": { "patternMatched": "new_patient" },
+      "reason": "Pattern match: patient created"
+    },
+    {
+      "contains": ["patient", "registered"],
+      "eventType": "PATIENT_REGISTRATION",
+      "priority": "MEDIUM",
+      "channels": ["email"],
+      "metadata": { "patternMatched": "new_patient" },
+      "reason": "Pattern match: patient registered"
+    }
+  ]
+}

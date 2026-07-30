@@ -1,0 +1,9 @@
+{
+  "id": "core",
+  "name": "Core content prompts",
+  "version": "1.0.0",
+  "description": "Generic writing tasks the engine's own content endpoints need — generate, enhance, personalize, analyze, follow-up, promotional, educational. No vertical vocabulary: these are the prompts behind /v1/content/generate and the legacy /ai router, and a gym or a law firm would use them unchanged.",
+
+  "contextProviders": [],
+  "requiredConfig": []
+}

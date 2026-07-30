@@ -13,22 +13,18 @@
  *  - the inbox's `latestMessage.content` is truncated to 100 characters with a
  *    trailing `...` (`:1327`).
  *
- * Four of the sixteen are not ported here and answer 501 until P8b: the two AI
- * generation endpoints (`/generate-message`, `/patient/:id/conversation/summary`)
- * and `/response`, `/patient/:patientId/info`. They need the content plane's
- * generation surface and the context preview, which land with the rest of the
- * AI routers. A 501 naming the successor is honest; a silent 404 is not.
+ * Four of the sixteen needed the content plane and landed in P8b:
+ * `/response` records an inbound reply, `/generate-message` drafts one through
+ * the same path `/ai-enhanced` takes, `/patient/:id/conversation/summary`
+ * returns counted facts rather than model prose, and `/patient/:id/info` reads
+ * through the pack-gated context registry instead of `SELECT … FROM patients`.
  */
 import { Router, type NextFunction, type Request, type Response } from 'express';
 
 import type { MessagingApiDeps } from '../v1/messaging.js';
 import { Permission, requirePermissions, requireTenant } from '../../platform/http/auth.middleware.js';
-import {
-  ForbiddenError,
-  NotFoundError,
-  NotImplementedError,
-  ValidationError,
-} from '../../platform/http/errors.js';
+import type { ReceiptService } from '../../engine/messaging/receipt.service.js';
+import { ForbiddenError, NotFoundError, ValidationError } from '../../platform/http/errors.js';
 import { deprecate } from './index.js';
 import {
   fromLegacyChannel,
@@ -41,6 +37,19 @@ import type { CompatIdentity } from './translate.js';
 
 export interface CommunicationsCompatDeps extends MessagingApiDeps {
   identity: CompatIdentity;
+  receipts: ReceiptService;
+  /** Shared with `/ai-enhanced` — one drafting path, two URLs. */
+  draft: (
+    req: Request,
+    input: {
+      patientId: string;
+      providerId?: string;
+      channel: string;
+      communicationType?: string;
+      context?: Record<string, unknown>;
+      priority: 'LOW' | 'MEDIUM' | 'HIGH' | 'URGENT';
+    },
+  ) => Promise<{ approvalId?: string; messageId?: string; content: string; subject?: string; status: string }>;
 }
 
 function handle(
@@ -380,19 +389,112 @@ export function createLegacyCommunicationsRouter(deps: CommunicationsCompatDeps)
     }),
   );
 
-  // ── deferred to P8b ───────────────────────────────────────────────────────
+  // ── the four that waited for the content plane ────────────────────────────
 
-  const deferred = (successor: string) =>
-    handle(async () => {
-      throw new NotImplementedError(
-        `Not yet ported. This endpoint lands with the content plane's API; use ${successor}.`,
-      );
-    });
+  /**
+   * Record an inbound reply. Same shape as `/messages/webhook/*`, reached from
+   * the FE rather than from an integration.
+   */
+  router.post(
+    '/response',
+    requirePermissions(Permission.SEND),
+    handle(async (req, res) => {
+      const scope = requireTenant(req);
+      const { patientId, providerId, content, channel } = (req.body ?? {}) as Record<
+        string,
+        string | undefined
+      >;
+      if (!patientId || !content) throw new ValidationError('patientId and content are required');
 
-  router.post('/response', deferred('POST /v1/content/generate'));
-  router.post('/generate-message', deferred('POST /v1/outreach/generate'));
-  router.get('/patient/:patientId/conversation/summary', deferred('GET /v1/conversations'));
-  router.get('/patient/:patientId/info', deferred('GET /v1/recipients/:id'));
+      const recipientId = await deps.identity.ensure(scope, patientId);
+      const result = await deps.receipts.recordInboundFor({
+        tenantId: scope.tenantId,
+        subTenantId: scope.subTenantId,
+        recipientId,
+        senderId: providerId ?? req.identity?.senderId,
+        channel: channel ?? 'EMAIL',
+        content,
+        at: new Date(),
+      });
+      res.status(201).json({ success: true, data: { id: result.messageId, patientId } });
+    }),
+  );
+
+  /** Draft a message for a recipient. The same path `/ai-enhanced` takes. */
+  router.post(
+    '/generate-message',
+    requirePermissions(Permission.SEND),
+    handle(async (req, res) => {
+      const draft = await deps.draft(req, {
+        patientId: (req.body?.patientId as string) ?? '',
+        providerId: req.body?.providerId as string | undefined,
+        channel: (req.body?.channel as string) ?? 'EMAIL',
+        communicationType: req.body?.messageType as string | undefined,
+        context: (req.body?.context ?? {}) as Record<string, unknown>,
+        priority: 'MEDIUM',
+      });
+      res.status(201).json({ success: true, data: draft });
+    }),
+  );
+
+  /**
+   * The conversation roll-up. The source asks a model to summarise the thread
+   * (`getConversationSummary`, :1922-2175, including a `analyzeSentiment` call);
+   * this returns the counted facts and leaves the prose to
+   * `POST /v1/content/generate` with the thread as context. A summary that is
+   * generated on every page load costs a model call per render and cannot be
+   * cited — the numbers can.
+   */
+  router.get(
+    '/patient/:patientId/conversation/summary',
+    handle(async (req, res) => {
+      const scope = requireTenant(req);
+      const senderId = (req.query.providerId as string) ?? req.identity?.senderId;
+      if (!senderId) throw new ValidationError('providerId is required');
+
+      const recipientId = await deps.identity.lookup(scope, req.params.patientId as string);
+      if (!recipientId) throw new NotFoundError('Patient not found');
+
+      const thread = await deps.conversations.thread(scope, senderId, recipientId, { limit: 1 });
+      res.json({
+        success: true,
+        data: {
+          patientId: req.params.patientId,
+          providerId: senderId,
+          patientName: thread.displayName ?? 'Unknown Patient',
+          summary: { ...thread.summary, conversationStarted: thread.summary.firstMessage },
+        },
+      });
+    }),
+  );
+
+  router.get(
+    '/patient/:patientId/info',
+    handle(async (req, res) => {
+      const scope = requireTenant(req);
+      // Read-through the pack-gated context registry, replacing the raw
+      // `SELECT ... FROM patients` at :1669 (Seam C).
+      const recipient = await deps.recipients.getOrResolve(scope, {
+        kind: 'mentera-patient',
+        id: req.params.patientId as string,
+      });
+      if (!recipient) throw new NotFoundError('Patient not found');
+
+      res.json({
+        success: true,
+        data: {
+          patientId: req.params.patientId,
+          patientName: recipient.displayName ?? 'Unknown Patient',
+          firstName: recipient.firstName,
+          lastName: recipient.lastName,
+          timezone: recipient.timezone,
+          locale: recipient.locale,
+          contactPoints: recipient.contactPoints,
+          status: recipient.status,
+        },
+      });
+    }),
+  );
 
   // Declared last: `/:id` would otherwise swallow every path above it.
   router.get(

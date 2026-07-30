@@ -30,6 +30,7 @@ import { z } from 'zod';
 import type { Logger } from 'winston';
 
 import type { LintRules } from '../engine/compliance/lint.js';
+import type { EhrMapping } from '../engine/playbooks/ehr-mapper.js';
 import type { AliasMap } from '../engine/content/render-context.js';
 import type { PromptPack } from '../engine/content/prompt-assembler.js';
 import {
@@ -62,6 +63,8 @@ export interface LoadedPack {
   templates?: TemplateDefinition[];
   playbooks?: PlaybookDefinition[];
   eventTypes?: EventTypeCatalogue;
+  /** From `packs/<id>/ehr-mapping.json` — EHR event names, per vendor (P8b). */
+  ehrMapping?: EhrMapping;
   /** Files that failed validation, with the reason. Surfaced at boot. */
   errors: string[];
 }
@@ -72,6 +75,8 @@ export interface PackRegistry {
   aliasMaps(): Record<string, AliasMap>;
   /** Lint rules for one pack, or every pack's rules when no id is given. */
   compliance(packId?: string): LintRules[];
+  /** EHR event mapping for one pack. Absent when the pack ships none. */
+  ehrMapping(packId: string): EhrMapping | undefined;
   list(): string[];
   /** Every validation failure across every pack. Empty means all packs are clean. */
   errors(): string[];
@@ -166,6 +171,22 @@ export function loadPacks(packsDir: string, logger: Logger): PackRegistry {
       packId,
       errors,
     );
+    // EHR mapping. Same `$comment` convention, same tolerance as the lint
+    // rules: a malformed file costs the mapping, not the pack.
+    let ehrMapping: EhrMapping | undefined;
+    const ehrPath = join(packPath, 'ehr-mapping.json');
+    if (existsSync(ehrPath)) {
+      try {
+        const raw = readJson<Record<string, unknown>>(ehrPath);
+        ehrMapping = { rules: (raw.rules as EhrMapping['rules']) ?? [] };
+      } catch (error) {
+        logger.error('failed to load pack EHR mapping', {
+          packId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
     const eventTypes = existsSync(join(packPath, 'event-types.json'))
       ? safeRead<EventTypeCatalogue>(join(packPath, 'event-types.json'), packId, errors)
       : undefined;
@@ -194,6 +215,7 @@ export function loadPacks(packsDir: string, logger: Logger): PackRegistry {
       templates: templateDefs,
       playbooks: playbookDefs,
       eventTypes,
+      ehrMapping,
       errors,
     });
 
@@ -319,6 +341,7 @@ function registry(
       (packId ? [packs.get(packId)] : [...packs.values()])
         .map((pack) => pack?.compliance)
         .filter((rules): rules is LintRules => Boolean(rules)),
+    ehrMapping: (packId) => packs.get(packId)?.ehrMapping,
     list: () => [...packs.keys()].sort(),
     errors: () => [...packs.values()].flatMap((pack) => pack.errors),
   };

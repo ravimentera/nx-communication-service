@@ -75,6 +75,7 @@ export function gatewayHeaders(
       'outreach:approve',
       'outreach:approve:bulk',
       'outreach:config:write',
+      'outreach:templates:write',
       'outreach:playbooks:write',
     ]),
     ...over,
@@ -178,20 +179,31 @@ export async function startHarness(): Promise<Harness> {
   const packs = loadPacks(join(process.cwd(), 'packs'), logger);
   const renderer = new Renderer({ logger, aliases: packs.aliasMaps() });
   const templateStore = new DrizzleTemplateStore(db, logger);
+  /**
+   * A stand-in model. It returns the shape `generator.draftSchema` requires —
+   * a `content` string and an optional `subject` — because the generator
+   * validates the model's JSON and a contract test asserting a 200 must not be
+   * asserting that validation failed.
+   *
+   * Token counts are non-zero so the `/ai` contract test can assert they are
+   * reported at all (D31: the source estimated them by word count).
+   */
   const generator = new ContentGenerator({
     llm: {
+      name: 'stub',
+      listModels: () => ['stub-model'],
       generate: async () => ({
-        content: 'generated',
-        model: 'test',
-        tokensIn: 0,
-        tokensOut: 0,
+        content: 'generated body',
+        model: 'stub-model',
+        tokensIn: 12,
+        tokensOut: 7,
         latencyMs: 1,
       }),
       generateJson: async () => ({
-        value: {},
-        model: 'test',
-        tokensIn: 0,
-        tokensOut: 0,
+        content: { content: 'generated body', subject: 'Generated subject' },
+        model: 'stub-model',
+        tokensIn: 12,
+        tokensOut: 7,
         latencyMs: 1,
       }),
     } as never,
@@ -264,6 +276,7 @@ export async function startHarness(): Promise<Harness> {
       recipients: recipientDeps,
       content: contentDeps,
       receipts,
+      context: contextRegistry,
     },
   });
 

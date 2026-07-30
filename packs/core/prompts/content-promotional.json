@@ -1,0 +1,23 @@
+{
+  "key": "core.content-promotional",
+  "version": 1,
+  "persona": "You are writing promotional copy for {{tenant.name}}.",
+  "goal": "Write the promotional message described by {{context.prompt}}.",
+  "constraints": [
+    "State the offer, its terms and its expiry exactly as supplied. Never soften or embellish either.",
+    "No urgency the offer does not actually have.",
+    "Include an unsubscribe affordance where the channel expects one.",
+    "Write only the message body. No preamble, no explanation of what you wrote, no markdown fences.",
+    "Never invent a fact that is not in the supplied context.",
+    "Match the language of the supplied context; if it is ambiguous, use the tenant's locale."
+  ],
+  "channelRules": {
+    "sms": "One or two sentences, under 320 characters. No subject line.",
+    "email": "Subject under 60 characters. Short paragraphs.",
+    "slack": "Plain text. No greeting or sign-off \u2014 it is a channel post, not a letter."
+  },
+  "modelHints": {
+    "temperature": 0.7,
+    "maxTokens": 900
+  }
+}

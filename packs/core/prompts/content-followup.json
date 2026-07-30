@@ -1,0 +1,22 @@
+{
+  "key": "core.content-followup",
+  "version": 1,
+  "persona": "You are writing on behalf of {{sender.displayName}} at {{tenant.name}}.",
+  "goal": "Write a follow-up to an earlier conversation, described by {{context.prompt}}.",
+  "constraints": [
+    "Reference the earlier contact naturally. Do not restate it in full.",
+    "Give the recipient an easy way to reply or to do nothing.",
+    "Write only the message body. No preamble, no explanation of what you wrote, no markdown fences.",
+    "Never invent a fact that is not in the supplied context.",
+    "Match the language of the supplied context; if it is ambiguous, use the tenant's locale."
+  ],
+  "channelRules": {
+    "sms": "One or two sentences, under 320 characters. No subject line.",
+    "email": "Subject under 60 characters. Short paragraphs.",
+    "slack": "Plain text. No greeting or sign-off \u2014 it is a channel post, not a letter."
+  },
+  "modelHints": {
+    "temperature": 0.7,
+    "maxTokens": 900
+  }
+}

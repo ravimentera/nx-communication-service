@@ -28,17 +28,22 @@ import type { ApprovalApiDeps } from '../v1/approvals.js';
 import type { ChannelApiDeps } from '../v1/channels.js';
 import type { ContentApiDeps } from '../v1/content.js';
 import type { ReceiptService } from '../../engine/messaging/receipt.service.js';
+import type { ContextRegistry } from '../../engine/context/registry.js';
 import type { MessagingApiDeps } from '../v1/messaging.js';
 import type { PlaybookApiDeps } from '../v1/playbooks.js';
 import type { RecipientApiDeps } from '../v1/recipients.js';
+import { createLegacyAiRouter } from './ai.js';
 import { createLegacyApprovalRouter } from './approvals.js';
 import { createLegacyCommunicationsRouter } from './communications.js';
 import { createLegacyConfigRouter } from './config.js';
 import { createLegacyEventRouter } from './events.js';
+import { createLegacyGenerationRouters } from './generation.js';
 import { createLegacyMessagesRouter } from './messages.js';
 import { createLegacyPreferenceRouter } from './preferences.js';
+import { createLegacyPackRouters } from './packs.js';
 import { createLegacyQueueRouter } from './queue.js';
 import { createLegacySendRouters } from './send.js';
+import { createLegacyTemplateRouter } from './templates.js';
 import { CompatIdentity } from './translate.js';
 
 export const compatHitsTotal = new promClient.Counter({
@@ -73,6 +78,7 @@ export interface CompatDeps {
   recipients: RecipientApiDeps;
   content: ContentApiDeps;
   receipts: ReceiptService;
+  context: ContextRegistry;
 }
 
 /**
@@ -86,6 +92,21 @@ export function createCompatMounts(deps: CompatDeps): Array<{ path: string; rout
     identity,
     templates: deps.content.store,
     renderer: deps.content.renderer,
+  });
+
+  const generation = createLegacyGenerationRouters({
+    content: deps.content,
+    approvals: deps.approvals,
+    messaging: deps.messaging,
+    playbooks: deps.playbooks,
+    context: deps.context,
+    identity,
+  });
+  const packRouters = createLegacyPackRouters({
+    playbooks: deps.playbooks,
+    messaging: deps.messaging,
+    packs: deps.content.packs,
+    identity,
   });
 
   return [
@@ -116,7 +137,14 @@ export function createCompatMounts(deps: CompatDeps): Array<{ path: string; rout
     { path: '/approvals', router: createLegacyApprovalRouter(deps.approvals) },
     {
       path: '/communications',
-      router: createLegacyCommunicationsRouter({ ...deps.messaging, identity }),
+      router: createLegacyCommunicationsRouter({
+        ...deps.messaging,
+        identity,
+        receipts: deps.receipts,
+        // One drafting path, two URLs: `/communications/generate-message` and
+        // `/ai-enhanced/generate-communication` produce the same approval row.
+        draft: generation.draft,
+      }),
     },
     {
       path: '/messages',
@@ -128,5 +156,18 @@ export function createCompatMounts(deps: CompatDeps): Array<{ path: string; rout
       }),
     },
     { path: '/queue', router: createLegacyQueueRouter(deps.channels) },
+    { path: '/templates', router: createLegacyTemplateRouter(deps.content) },
+    { path: '/ai', router: createLegacyAiRouter(deps.content) },
+    { path: '/ai-enhanced', router: generation.aiEnhanced },
+    { path: '/automated-messages', router: generation.automated },
+    { path: '/ehr-webhook', router: packRouters.ehrWebhook },
+    { path: '/leads', router: packRouters.leads },
+    { path: '/treatments', router: packRouters.treatments },
+    { path: '/patients', router: packRouters.patients },
+    { path: '/providers', router: packRouters.providers },
+    { path: '/promotions', router: packRouters.promotions },
+    // `routes/index.ts:96` mounts the promotion router twice and something
+    // depends on the alias. Same router, same instance.
+    { path: '/gift-cards', router: packRouters.promotions },
   ];
 }

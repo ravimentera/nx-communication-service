@@ -392,6 +392,7 @@ async function main(): Promise<void> {
       recipients: { recipients: recipientService, preferences, gate: complianceGate },
       content: { renderer, store: templateStore, generator, packs },
       receipts: receiptService,
+      context: contextRegistry,
     },
   });
 

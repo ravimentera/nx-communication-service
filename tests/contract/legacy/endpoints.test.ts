@@ -566,15 +566,33 @@ describe('/communications — 16', () => {
     },
   );
 
-  it.each([
-    ['post', '/communications/response'],
-    ['post', '/communications/generate-message'],
-    ['get', `/communications/patient/${PATIENT}/conversation/summary`],
-    ['get', `/communications/patient/${PATIENT}/info`],
-  ])('%s %s answers 501 until P8b, naming its successor', async (method, path) => {
-    const res = method === 'get' ? await get(path) : await post(path, {});
-    expect(res.status).toBe(501);
-    expect(res.body.error.message).toMatch(/v1\//);
+  it('POST /communications/response records an inbound reply', async () => {
+    const res = await post('/communications/response', {
+      patientId: PATIENT,
+      providerId: PROVIDER,
+      channel: 'EMAIL',
+      content: 'Thanks, see you then',
+    });
+    expect(res.status).toBe(201);
+    expect(res.body.data).toMatchObject({ patientId: PATIENT });
+  });
+
+  it('GET /communications/patient/:id/conversation/summary returns counted facts', async () => {
+    // The source asks a model to summarise on every page load. Counts can be
+    // cited; generated prose cannot, and costs a model call per render.
+    const res = await get(`/communications/patient/${PATIENT}/conversation/summary`);
+    expect(res.status).toBe(200);
+    expect(res.body.data.summary).toMatchObject({ totalMessages: expect.any(Number) });
+  });
+
+  it('GET /communications/patient/:id/info reads through the context registry', async () => {
+    const res = await get(`/communications/patient/${PATIENT}/info`);
+    expect(res.status).toBe(200);
+    expect(res.body.data).toMatchObject({ patientId: PATIENT, patientName: 'Ada Lovelace' });
+  });
+
+  it('GET /communications/patient/:id/info 404s a patient this tenant has never seen', async () => {
+    expect((await get('/communications/patient/stranger/info')).status).toBe(404);
   });
 });
 
