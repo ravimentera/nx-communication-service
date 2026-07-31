@@ -1,0 +1,1805 @@
+openapi: 3.1.0
+
+info:
+  title: Outreach Server
+  version: 0.1.0
+  description: |
+    The `/v1` surface of the outreach engine — the real API.
+
+    **This document covers `/v1` only.** The 110 legacy endpoints served
+    alongside it are a compatibility shim (`src/api/compat/`), deleted in P12,
+    and are inventoried in the extraction plan's Appendix A rather than here.
+    Documenting them would give them a life they are not meant to have. Every
+    compat response carries `Deprecation: true` and a `Link` header naming its
+    successor below.
+
+    ## Tenancy
+
+    Every request is tenant-scoped, and **the tenant is never read from the body
+    or the query string** — it comes from the gateway-forwarded identity headers.
+    A body field named `tenantId` or `medspaId` is ignored, and the MCP router
+    logs a warning when it sees one.
+
+    ## Authentication
+
+    The gateway terminates user auth and forwards identity headers. Three
+    surfaces are deliberately reachable without them, each for a stated reason:
+
+    | Path | Why |
+    |---|---|
+    | `GET /metrics` | Prometheus scrapes with no headers |
+    | `GET /mcp/tools`, `GET /mcp/health` | tera-orchestrator builds its tool registry at its own startup. Discovery is schema-only; every tool that touches data is authenticated. |
+    | `POST /v1/webhooks/*` | a provider callback has no headers. The signature is the credential. |
+    | `GET|POST /unsubscribe/:token` | a recipient clicking a link in an email has no session. CAN-SPAM requires the link to work. |
+
+  license:
+    name: Proprietary
+
+servers:
+  - url: https://{host}/api/communication
+    description: Behind the gateway, which strips this prefix before forwarding.
+    variables:
+      host:
+        default: api.example.com
+  - url: http://localhost:5007
+    description: Direct, for local development.
+
+tags:
+  - name: messages
+    description: Sending, reading and marking messages.
+  - name: conversations
+    description: The inbox and the thread.
+  - name: recipients
+    description: Who messages are sent to, and what they have consented to.
+  - name: approvals
+    description: Human review of drafts before they send.
+  - name: content
+    description: Templates, rendering and model-written drafts.
+  - name: playbooks
+    description: What fires on which event, as data.
+  - name: channels
+    description: Per-tenant and per-agent credentials, and the send queue.
+  - name: webhooks
+    description: Provider callbacks. Unauthenticated, signature-verified.
+  - name: mcp
+    description: The tool surface for AI agents.
+
+security:
+  - gatewayIdentity: []
+
+paths:
+  # ── messages ───────────────────────────────────────────────────────────────
+  /v1/messages:
+    get:
+      operationId: getMessages
+      tags: [messages]
+      summary: List messages
+      parameters:
+        - { name: channel, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string } }
+        - { name: dateFrom, in: query, schema: { type: string, format: date } }
+        - { name: dateTo, in: query, schema: { type: string, format: date } }
+        - { name: eventType, in: query, schema: { type: string } }
+        - { name: senderId, in: query, schema: { type: string } }
+        - { name: recipientId, in: query, schema: { type: string, format: uuid } }
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/Limit' }
+        - name: sort
+          in: query
+          description: '`field:direction`. Sortable: sentAt, createdAt, status, channel.'
+          schema: { type: string, default: 'sentAt:desc' }
+      responses:
+        '200':
+          description: A page of messages.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessagePage' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      operationId: postMessages
+      tags: [messages]
+      summary: Send a message
+      description: |
+        The single send entry point. Replaces the legacy `/email/send`,
+        `/sms/send`, `/slack/message` and `/communications/message`.
+
+        A message the compliance gate suppresses is a **200** with
+        `queued: false` and a reason — the caller asked correctly and the engine
+        decided not to send. Only a malformed request is a 4xx.
+      security:
+        - gatewayIdentity: [outreach:send]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SendRequest' }
+      responses:
+        '202':
+          description: Queued for delivery.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DispatchResult' }
+        '200':
+          description: Accepted but not queued — see `skipped`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DispatchResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '503':
+          description: The channel has no credentials for this tenant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/messages/{id}:
+    get:
+      operationId: getMessagesById
+      tags: [messages]
+      summary: Get one message
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: The message.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Message' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/messages/{id}/read:
+    put:
+      operationId: putMessagesByIdRead
+      tags: [messages]
+      summary: Mark read or unread
+      description: |
+        Marking an already-read message read is a **success**, not a 404 — two
+        tabs open on the same inbox is normal.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                isRead: { type: boolean, default: true }
+      responses:
+        '200':
+          description: The resulting read state.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, isRead]
+                properties:
+                  id: { type: string, format: uuid }
+                  readAt: { type: [string, 'null'], format: date-time }
+                  isRead: { type: boolean }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── conversations ──────────────────────────────────────────────────────────
+  /v1/conversations:
+    get:
+      operationId: getConversations
+      tags: [conversations]
+      summary: The inbox — one conversation per recipient
+      description: |
+        Most recently active first.
+
+        One page costs **two SQL statements** regardless of how many
+        conversations it returns — a page of 200 costs the same two as a page of
+        one.
+
+        `senderId` is a query parameter rather than a path segment because a
+        tenant with no per-agent concept still has an inbox; it defaults to the
+        `x-sender-id` header when omitted.
+
+        `summary` is computed over **the current page**, not the whole result
+        set — preserved from the handler this replaces.
+      parameters:
+        - { name: senderId, in: query, schema: { type: string } }
+        - { name: search, in: query, description: Matches the recipient name or the message body., schema: { type: string } }
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses:
+        '200':
+          description: A page of conversations.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InboxPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /v1/conversations/{senderId}/{recipientId}:
+    get:
+      operationId: getConversationsBySenderIdByRecipientId
+      tags: [conversations]
+      summary: The full thread between one sender and one recipient
+      parameters:
+        - { name: senderId, in: path, required: true, schema: { type: string } }
+        - { name: recipientId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses:
+        '200':
+          description: The thread, most recent first.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Thread' }
+
+  /v1/conversations/{senderId}/{recipientId}/read-all:
+    put:
+      operationId: putConversationsBySenderIdByRecipientIdReadAll
+      tags: [conversations]
+      summary: Mark a conversation read
+      description: |
+        Inbound only. An outbound message's `readAt` is the recipient's read
+        receipt and is not ours to write.
+      parameters:
+        - { name: senderId, in: path, required: true, schema: { type: string } }
+        - { name: recipientId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: How many were marked.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  messagesMarkedRead: { type: integer }
+                  markedAt: { type: string, format: date-time }
+
+  /v1/analytics/messages:
+    get:
+      operationId: getAnalyticsMessages
+      tags: [messages]
+      summary: Engagement roll-up
+      description: Both bounds are optional; omitting them covers all time.
+      parameters:
+        - { name: dateFrom, in: query, schema: { type: string, format: date } }
+        - { name: dateTo, in: query, schema: { type: string, format: date } }
+      responses:
+        '200':
+          description: The roll-up.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AnalyticsSummary' }
+
+  # ── recipients ─────────────────────────────────────────────────────────────
+  /v1/recipients:
+    get:
+      operationId: getRecipients
+      tags: [recipients]
+      summary: Search recipients
+      parameters:
+        - { name: q, in: query, schema: { type: string } }
+        - { $ref: '#/components/parameters/Page' }
+        - { name: pageSize, in: query, schema: { type: integer, default: 25 } }
+      responses:
+        '200':
+          description: A page of recipients.
+          content: { application/json: { schema: { $ref: '#/components/schemas/RecipientPage' } } }
+    post:
+      operationId: postRecipients
+      tags: [recipients]
+      summary: Create or update a recipient by external reference
+      description: |
+        Idempotent on `externalRef`. Every field is COALESCEd, so a partial
+        refresh never blanks something already known.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/RecipientInput' } } }
+      responses:
+        '201':
+          description: The recipient.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Recipient' } } }
+
+  /v1/recipients/{id}:
+    get:
+      operationId: getRecipientsById
+      tags: [recipients]
+      summary: Get one recipient
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: The recipient.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Recipient' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/recipients/{id}/preferences:
+    get:
+      operationId: getRecipientsByIdPreferences
+      tags: [recipients]
+      summary: Get communication preferences
+      description: An absent row means "nothing expressed", which is allowed — not a 404.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: The preferences.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Preferences' } } }
+    put:
+      operationId: putRecipientsByIdPreferences
+      tags: [recipients]
+      summary: Set communication preferences
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/Preferences' } } }
+      responses:
+        '200':
+          description: The stored preferences.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Preferences' } } }
+
+  /v1/recipients/{id}/unsubscribe-url:
+    get:
+      operationId: getRecipientsByIdUnsubscribeUrl
+      tags: [recipients]
+      summary: Mint an unsubscribe URL for this recipient
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: The URL.
+          content:
+            application/json:
+              schema: { type: object, properties: { url: { type: string, format: uri } } }
+
+  /v1/recipients/{id}/unsubscribe:
+    post:
+      operationId: postRecipientsByIdUnsubscribe
+      tags: [recipients]
+      summary: Unsubscribe a recipient
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '204': { description: Unsubscribed. }
+
+  /v1/preferences/check:
+    post:
+      operationId: postPreferencesCheck
+      tags: [recipients]
+      summary: Dry-run the compliance gate
+      description: |
+        Find out **why** a message would be suppressed before sending it. The
+        source offered no way to ask.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [recipientId, channel]
+              properties:
+                recipientId: { type: string, format: uuid }
+                channel: { $ref: '#/components/schemas/Channel' }
+                priority: { $ref: '#/components/schemas/Priority' }
+                playbookKey: { type: string }
+                transactional: { type: boolean }
+      responses:
+        '200':
+          description: The verdict.
+          content: { application/json: { schema: { $ref: '#/components/schemas/GateVerdict' } } }
+
+  /unsubscribe/{token}:
+    get:
+      operationId: getUnsubscribeByToken
+      tags: [recipients]
+      summary: Check an unsubscribe token
+      description: |
+        **Unauthenticated and non-mutating.** Mail clients and browsers prefetch
+        links; a GET that unsubscribed would fire on preview. Rate-limited to 30
+        per 15 minutes.
+      security: []
+      parameters: [{ name: token, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: The token is accepted. Send POST to confirm. }
+    post:
+      operationId: postUnsubscribeByToken
+      tags: [recipients]
+      summary: Confirm an unsubscribe
+      description: |
+        **Unauthenticated by design.** A recipient clicking a link in an email
+        has no gateway headers and no session; the 24-byte token is the whole
+        credential, which is why it is random rather than derived.
+      security: []
+      parameters: [{ name: token, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200':
+          description: Unsubscribed.
+          content:
+            application/json:
+              schema: { type: object, properties: { unsubscribed: { type: boolean } } }
+
+  # ── approvals ──────────────────────────────────────────────────────────────
+  /v1/approvals:
+    get:
+      operationId: getApprovals
+      tags: [approvals]
+      summary: The approval queue
+      description: No `status` filter means the inbox — what is waiting on someone.
+      parameters:
+        - { name: approverRef, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/ApprovalStatus' } }
+        - { name: priority, in: query, schema: { $ref: '#/components/schemas/Priority' } }
+        - { name: channel, in: query, schema: { $ref: '#/components/schemas/Channel' } }
+        - { name: playbook, in: query, schema: { type: string } }
+        - { $ref: '#/components/parameters/Page' }
+      responses:
+        '200':
+          description: A page of approvals.
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalPage' } } }
+
+  /v1/approvals/dashboard:
+    get:
+      operationId: getApprovalsDashboard
+      tags: [approvals]
+      summary: Queue counts for one approver
+      parameters: [{ name: approverRef, in: query, schema: { type: string } }]
+      responses:
+        '200':
+          description: Counts, including `overdue`.
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+
+  /v1/approvals/history:
+    get:
+      operationId: getApprovalsHistory
+      tags: [approvals]
+      summary: Closed approvals
+      parameters: [{ name: approverRef, in: query, schema: { type: string } }]
+      responses:
+        '200':
+          description: A page of closed approvals.
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApprovalPage' } } }
+
+  /v1/approvals/{id}:
+    get:
+      operationId: getApprovalsById
+      tags: [approvals]
+      summary: Get one approval, with its audit trail
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: The approval.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Approval' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/approvals/bulk:
+    post:
+      operationId: postApprovalsBulk
+      tags: [approvals]
+      summary: Act on several approvals
+      description: |
+        Requires the `outreach:approve:bulk` permission **and** the policy's
+        `bulk` right. They are not redundant: a permission is granted per user,
+        the right is authored per policy by the tenant.
+
+        Per-row outcomes; one failure does not abort the batch.
+      security: [{ gatewayIdentity: [outreach:approve:bulk] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids, action]
+              properties:
+                ids: { type: array, items: { type: string, format: uuid } }
+                action: { type: string, enum: [approve, decline, cancel] }
+                reason: { type: string }
+      responses:
+        '200':
+          description: Per-row outcomes.
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+
+  /v1/approvals/{id}/approve:
+    post:
+      operationId: postApprovalsByIdApprove
+      tags: [approvals]
+      summary: Approve, and dispatch
+      description: |
+        **Approving sends.** In the service this replaces, approval flipped two
+        status columns that nothing read back.
+
+        A repeated approve is a 200 no-op, not an error.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: The approval and the dispatch result.
+          content: { application/json: { schema: { $ref: '#/components/schemas/ActionResult' } } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/approvals/{id}/edit-approve:
+    post:
+      operationId: postApprovalsByIdEditApprove
+      tags: [approvals]
+      summary: Edit the content, then approve
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ContentEdit' } } }
+      responses:
+        '200':
+          description: The approval and the dispatch result.
+          content: { application/json: { schema: { $ref: '#/components/schemas/ActionResult' } } }
+
+  /v1/approvals/{id}/content:
+    put:
+      operationId: putApprovalsByIdContent
+      tags: [approvals]
+      summary: Save an edit without deciding
+      description: The approval stays `PENDING_APPROVAL`.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ContentEdit' } } }
+      responses:
+        '200':
+          description: The approval.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Approval' } } }
+
+  /v1/approvals/{id}/decline:
+    post:
+      operationId: postApprovalsByIdDecline
+      tags: [approvals]
+      summary: Decline
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { reason: { type: string } } }
+      responses:
+        '200':
+          description: The approval.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Approval' } } }
+
+  /v1/approvals/{id}/schedule:
+    post:
+      operationId: postApprovalsByIdSchedule
+      tags: [approvals]
+      summary: Approve and send later
+      description: |
+        Becomes a delayed queue job, so the wait survives a restart. The
+        approval rests at `SCHEDULED` until delivery writes `SENT`.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sendAt]
+              properties: { sendAt: { type: string, format: date-time } }
+      responses:
+        '200':
+          description: The approval.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Approval' } } }
+
+  /v1/approvals/{id}/cancel:
+    post:
+      operationId: postApprovalsByIdCancel
+      tags: [approvals]
+      summary: Cancel
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { reason: { type: string } } }
+      responses:
+        '200':
+          description: The approval.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Approval' } } }
+
+  /v1/approval-policies:
+    get:
+      operationId: getApprovalPolicies
+      tags: [approvals]
+      summary: List approval policies
+      responses:
+        '200':
+          description: The policies, including pack-provided defaults.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { policies: { type: array, items: { type: object, additionalProperties: true } } }
+    post:
+      operationId: postApprovalPolicies
+      tags: [approvals]
+      summary: Create an approval policy
+      security: [{ gatewayIdentity: [outreach:config:write] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, additionalProperties: true } } }
+      responses:
+        '201':
+          description: The policy.
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+
+  /v1/approval-policies/{id}:
+    put:
+      operationId: putApprovalPoliciesById
+      tags: [approvals]
+      summary: Update an approval policy
+      security: [{ gatewayIdentity: [outreach:config:write] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, additionalProperties: true } } }
+      responses:
+        '200':
+          description: The policy.
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+
+  # ── content ────────────────────────────────────────────────────────────────
+  /v1/content/render:
+    post:
+      operationId: postContentRender
+      tags: [content]
+      summary: Render a template or a raw body
+      description: Supply either `templateId` or `content`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                templateId: { type: string }
+                content: { type: string }
+                format: { $ref: '#/components/schemas/TemplateFormat' }
+                packId: { type: string }
+                data: { $ref: '#/components/schemas/RenderContext' }
+      responses:
+        '200':
+          description: The rendered output.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [output, format]
+                properties:
+                  output: { type: string }
+                  format: { $ref: '#/components/schemas/TemplateFormat' }
+                  warnings: { type: array, items: { type: string } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /v1/content/generate:
+    post:
+      operationId: postContentGenerate
+      tags: [content]
+      summary: Generate a draft from a prompt pack
+      description: |
+        `aiConfidence` is a **deterministic composite** of things the engine can
+        observe — context completeness, less a penalty per lint warning — not
+        the model's self-assessment. It is a heuristic, not a probability, and
+        the approval `threshold` mode that consumes it ships disabled.
+      security: [{ gatewayIdentity: [outreach:send] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [promptPackKey, channel]
+              properties:
+                promptPackKey: { type: string }
+                channel: { $ref: '#/components/schemas/Channel' }
+                playbookKey: { type: string }
+                playbookGoal: { type: string }
+                data: { $ref: '#/components/schemas/RenderContext' }
+                overrides:
+                  type: object
+                  properties:
+                    tone: { type: string }
+                    language: { type: string }
+                    model: { type: string }
+      responses:
+        '200':
+          description: The draft.
+          content: { application/json: { schema: { $ref: '#/components/schemas/GeneratedDraft' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/templates:
+    get:
+      operationId: getTemplates
+      tags: [content]
+      summary: List templates
+      parameters:
+        - { name: channel, in: query, schema: { type: string } }
+        - { name: category, in: query, schema: { type: string } }
+        - { name: templateType, in: query, schema: { type: string } }
+        - { $ref: '#/components/parameters/Limit' }
+        - { name: offset, in: query, schema: { type: integer } }
+      responses:
+        '200':
+          description: The templates.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  templates: { type: array, items: { $ref: '#/components/schemas/Template' } }
+                  count: { type: integer }
+    post:
+      operationId: postTemplates
+      tags: [content]
+      summary: Create a template
+      security: [{ gatewayIdentity: [outreach:templates:write] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/TemplateInput' } } }
+      responses:
+        '201':
+          description: The template.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Template' } } }
+
+  /v1/templates/{id}:
+    get:
+      operationId: getTemplatesById
+      tags: [content]
+      summary: Get one template
+      description: Accepts a UUID or a pack key such as `medspa.reminder.sms`.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: The template.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Template' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      operationId: putTemplatesById
+      tags: [content]
+      summary: Update a template
+      security: [{ gatewayIdentity: [outreach:templates:write] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/TemplateInput' } } }
+      responses:
+        '200':
+          description: The template.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Template' } } }
+    delete:
+      operationId: deleteTemplatesById
+      tags: [content]
+      summary: Delete a template
+      security: [{ gatewayIdentity: [outreach:templates:write] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '204': { description: Deleted. }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/templates/{id}/default:
+    post:
+      operationId: postTemplatesByIdDefault
+      tags: [content]
+      summary: Make this the default for its channel and category
+      description: Clears the flag on its siblings, including where category is NULL.
+      security: [{ gatewayIdentity: [outreach:templates:write] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: The template.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Template' } } }
+
+  /v1/templates/{id}/versions:
+    get:
+      operationId: getTemplatesByIdVersions
+      tags: [content]
+      summary: Version history
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: The versions, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  versions: { type: array, items: { type: object, additionalProperties: true } }
+
+  /v1/templates/{id}/render:
+    post:
+      operationId: postTemplatesByIdRender
+      tags: [content]
+      summary: Render this template
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { data: { $ref: '#/components/schemas/RenderContext' } }
+      responses:
+        '200':
+          description: The rendered output.
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+
+  # ── playbooks ──────────────────────────────────────────────────────────────
+  /v1/outreach/trigger:
+    post:
+      operationId: postOutreachTrigger
+      tags: [playbooks]
+      summary: Fire whatever playbooks want this event
+      description: |
+        The engine's front door. `eventType` is a **string** — the engine does
+        not enumerate what events exist; a pack does.
+
+        No playbook matching is a **200 with `matched: 0`**, not a 404: it is a
+        legitimate outcome, and the caller may not know the tenant's config.
+
+        `idempotencyKey` is the redelivery guard. `(tenant, playbook, key)` is
+        unique, so the same event arriving twice produces one run and one send.
+      security: [{ gatewayIdentity: [outreach:send] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/OutreachTrigger' } } }
+      responses:
+        '200':
+          description: One result per matched playbook.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [matched, results]
+                properties:
+                  matched: { type: integer }
+                  results: { type: array, items: { $ref: '#/components/schemas/PlaybookRunResult' } }
+
+  /v1/playbooks:
+    get:
+      operationId: getPlaybooks
+      tags: [playbooks]
+      summary: List this tenant's playbooks
+      parameters:
+        - { name: packId, in: query, schema: { type: string } }
+        - { name: active, in: query, schema: { type: boolean } }
+      responses:
+        '200':
+          description: The playbooks.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  playbooks: { type: array, items: { type: object, additionalProperties: true } }
+                  count: { type: integer }
+
+  /v1/playbooks/{key}:
+    put:
+      operationId: putPlaybooksByKey
+      tags: [playbooks]
+      summary: Create or replace a playbook
+      security: [{ gatewayIdentity: [outreach:playbooks:write] }]
+      parameters: [{ name: key, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, additionalProperties: true } } }
+      responses:
+        '200':
+          description: The playbook.
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+
+  /v1/playbooks/{key}/activate:
+    post:
+      operationId: postPlaybooksByKeyActivate
+      tags: [playbooks]
+      summary: Activate a playbook
+      description: |
+        Model-written playbooks ship **inactive**. Installing a pack must not be
+        the moment a tenant starts sending a class of message it has never sent.
+      security: [{ gatewayIdentity: [outreach:playbooks:write] }]
+      parameters: [{ name: key, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200':
+          description: The playbook.
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+
+  /v1/playbooks/{key}/deactivate:
+    post:
+      operationId: postPlaybooksByKeyDeactivate
+      tags: [playbooks]
+      summary: Deactivate a playbook
+      security: [{ gatewayIdentity: [outreach:playbooks:write] }]
+      parameters: [{ name: key, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200':
+          description: The playbook.
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+
+  /v1/packs:
+    get:
+      operationId: getPacks
+      tags: [playbooks]
+      summary: Available packs, and any that failed validation
+      description: |
+        `errors` is non-empty when a pack file failed its schema. Those
+        playbooks are not installed, and an operator asking "why is this missing?"
+        should be able to find out from the API rather than the boot log.
+      responses:
+        '200':
+          description: Packs and load errors.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  packs: { type: array, items: { type: string } }
+                  errors: { type: array, items: { type: string } }
+
+  /v1/packs/{packId}/install:
+    post:
+      operationId: postPacksByPackIdInstall
+      tags: [playbooks]
+      summary: Install a pack for this tenant
+      security: [{ gatewayIdentity: [outreach:config:write] }]
+      parameters: [{ name: packId, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                config:
+                  type: object
+                  description: |
+                    Values the pack's `manifest.requiredConfig` demands — Slack
+                    channels, emergency contacts. A playbook whose `$config.`
+                    reference is unset produces a SKIPPED run and an error log,
+                    never a send to the wrong place.
+                  additionalProperties: true
+      responses:
+        '200':
+          description: The installation.
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+
+  /v1/packs/{packId}/uninstall:
+    post:
+      operationId: postPacksByPackIdUninstall
+      tags: [playbooks]
+      summary: Uninstall a pack for this tenant
+      security: [{ gatewayIdentity: [outreach:config:write] }]
+      parameters: [{ name: packId, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200':
+          description: The result.
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+
+  # ── channels ───────────────────────────────────────────────────────────────
+  /v1/channels/configs:
+    get:
+      operationId: getChannelsConfigs
+      tags: [channels]
+      summary: This tenant's channel credentials
+      description: |
+        **Secrets are masked.** The Twilio account SID keeps its last four
+        characters so two accounts can be told apart; everything else is `***`.
+      responses:
+        '200':
+          description: The config, masked.
+          content: { application/json: { schema: { $ref: '#/components/schemas/TenantChannelConfig' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      operationId: putChannelsConfigs
+      tags: [channels]
+      summary: Create or update this tenant's channel credentials
+      description: |
+        An upsert: `tenant_channel_configs` has `UNIQUE(tenant_id)`, so create
+        and update address the same row. Fields not supplied are left alone.
+      security: [{ gatewayIdentity: [outreach:config:write] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/TenantChannelConfig' } } }
+      responses:
+        '200':
+          description: The config, masked.
+          content: { application/json: { schema: { $ref: '#/components/schemas/TenantChannelConfig' } } }
+
+  /v1/channels/configs/agents:
+    get:
+      operationId: getChannelsConfigsAgents
+      tags: [channels]
+      summary: Per-agent channel configs
+      responses:
+        '200':
+          description: The agents.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agents: { type: array, items: { type: object, additionalProperties: true } }
+                  count: { type: integer }
+
+  /v1/channels/configs/agents/{senderId}:
+    get:
+      operationId: getChannelsConfigsAgentsBySenderId
+      tags: [channels]
+      summary: One agent's channel config
+      description: Agent configs hold no secrets — a `from` address is not a credential.
+      parameters: [{ name: senderId, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200':
+          description: The config.
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      operationId: putChannelsConfigsAgentsBySenderId
+      tags: [channels]
+      summary: Create or update one agent's channel config
+      security: [{ gatewayIdentity: [outreach:config:write] }]
+      parameters: [{ name: senderId, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, additionalProperties: true } } }
+      responses:
+        '200':
+          description: The config.
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+
+  /v1/channels/numbers:
+    get:
+      operationId: getChannelsNumbers
+      tags: [channels]
+      summary: Every sending number available to this tenant
+      responses:
+        '200':
+          description: Tenant and agent numbers.
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+
+  /v1/channels/test:
+    post:
+      operationId: postChannelsTest
+      tags: [channels]
+      summary: Send a test message
+      description: |
+        Goes through the normal dispatcher, so it exercises the real credential
+        chain. `CHANNEL_DRY_RUN` still applies — a test on a dry-run deploy
+        reports queued and delivers nothing, which is the honest answer about
+        what that deploy would do.
+      security: [{ gatewayIdentity: [outreach:send] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to]
+              properties:
+                channel: { $ref: '#/components/schemas/Channel' }
+                to: { type: string }
+                message: { type: string }
+                senderId: { type: string }
+      responses:
+        '200':
+          description: The dispatch result.
+          content: { application/json: { schema: { $ref: '#/components/schemas/DispatchResult' } } }
+
+  /v1/queue/stats:
+    get:
+      operationId: getQueueStats
+      tags: [channels]
+      summary: Queue depth by state
+      responses:
+        '200':
+          description: Counts.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: { type: integer } }
+
+  /v1/queue/maintenance:
+    post:
+      operationId: postQueueMaintenance
+      tags: [channels]
+      summary: Queue maintenance
+      description: |
+        Reports what it did, which is nothing: completed and failed jobs expire
+        on the queue's own retention policy (24h / 7d).
+      security: [{ gatewayIdentity: [outreach:admin] }]
+      responses:
+        '200':
+          description: What was performed, and the current stats.
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+
+  # ── webhooks ───────────────────────────────────────────────────────────────
+  /v1/webhooks/twilio:
+    post:
+      operationId: postWebhooksTwilio
+      tags: [webhooks]
+      summary: Twilio status callbacks and inbound SMS
+      description: |
+        **Unauthenticated; the signature is the credential.** Verified as
+        HMAC-SHA1 over the full request URL plus every POST parameter sorted by
+        key. The URL is part of what is signed, so `WEBHOOK_PUBLIC_URL` must
+        state the public origin — a URL reconstructed behind a gateway that
+        rewrites the path will not match.
+
+        A callback carrying `Body` is an inbound message; otherwise it is a
+        status update, joined to a message through `provider_message_id`.
+
+        A receipt for an unknown message is **204**, not 404: providers retry a
+        non-2xx, and during a parallel run some receipts belong elsewhere.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                MessageSid: { type: string }
+                AccountSid: { type: string }
+                MessageStatus: { type: string }
+                From: { type: string }
+                To: { type: string }
+                Body: { type: string }
+      responses:
+        '200':
+          description: An inbound message was handled. Body is empty TwiML.
+          content: { text/xml: { schema: { type: string } } }
+        '204': { description: A status receipt was handled. }
+        '401': { $ref: '#/components/responses/BadSignature' }
+
+  /v1/webhooks/sendgrid:
+    post:
+      operationId: postWebhooksSendgrid
+      tags: [webhooks]
+      summary: SendGrid event webhook
+      description: |
+        **Unauthenticated; ECDSA-verified** over `timestamp + rawBody`, with a
+        five-minute replay window. A batch of events; one bad event does not
+        drop the batch, because a non-2xx replays all of them.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { type: object, additionalProperties: true }
+      responses:
+        '200':
+          description: How many were received and applied.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  received: { type: integer }
+                  applied: { type: integer }
+        '401': { $ref: '#/components/responses/BadSignature' }
+
+  /v1/webhooks/slack:
+    post:
+      operationId: postWebhooksSlack
+      tags: [webhooks]
+      summary: Slack events
+      description: |
+        **Unauthenticated; HMAC-SHA256 verified** over `v0:{timestamp}:{body}`,
+        with a replay window. Echoes the `url_verification` challenge so the
+        subscription can be enabled.
+
+        Message events are acknowledged and dropped: Slack is an outbound
+        staff-notification channel here, not a conversation surface, and
+        recording them would put staff chatter into a recipient's history.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '200':
+          description: The challenge response.
+          content:
+            application/json:
+              schema: { type: object, properties: { challenge: { type: string } } }
+        '204': { description: Acknowledged. }
+        '401': { $ref: '#/components/responses/BadSignature' }
+
+  # ── mcp ────────────────────────────────────────────────────────────────────
+  /mcp/tools:
+    get:
+      operationId: getMcpTools
+      tags: [mcp]
+      summary: Tool discovery
+      description: |
+        **Reachable without gateway headers.** An agent orchestrator calls this
+        at its own startup, before any user is involved. Discovery is
+        schema-only: it names the tools and their inputs and touches no tenant
+        data.
+
+        No tool declares a tenant parameter. The tenant always comes from the
+        request identity.
+      security: []
+      responses:
+        '200':
+          description: The tools.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tools: { type: array, items: { type: object, additionalProperties: true } }
+                  count: { type: integer }
+
+  /mcp/health:
+    get:
+      operationId: getMcpHealth
+      tags: [mcp]
+      summary: MCP health
+      security: []
+      responses:
+        '200':
+          description: Status and tool count.
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+
+  /mcp/tools/{toolName}:
+    post:
+      operationId: postMcpToolsByToolName
+      tags: [mcp]
+      summary: Execute a tool
+      description: |
+        **Authenticated**, unlike discovery. A body-supplied `medspaId` or
+        `tenantId` is discarded and logged; the header always wins.
+      parameters: [{ name: toolName, in: path, required: true, schema: { type: string } }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, additionalProperties: true } } }
+      responses:
+        '200':
+          description: The tool result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  toolName: { type: string }
+                  result: { type: object, additionalProperties: true }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /mcp/bedrock:
+    post:
+      operationId: postMcpBedrock
+      tags: [mcp]
+      summary: Bedrock Agent shim
+      description: |
+        Legacy and dormant — no Bedrock Agents are in the current invocation
+        path — but routable, so it carries the same tenant guarantee as its
+        sibling rather than being left as an open twin.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                actionGroup: { type: string }
+                function: { type: string }
+                parameters: { type: object, additionalProperties: true }
+      responses:
+        '200':
+          description: The Bedrock-shaped response.
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+
+  # ── health ─────────────────────────────────────────────────────────────────
+  /health:
+    get:
+      operationId: getHealth
+      summary: Liveness
+      security: []
+      responses:
+        '200':
+          description: Serving.
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+
+  /health/detailed:
+    get:
+      operationId: getHealthDetailed
+      summary: Dependency health
+      description: |
+        **Only the database gates readiness.** Redis reports `degraded` and the
+        endpoint still returns 200 when it is unreachable, because the platform
+        falls back to an in-memory store and HTTP keeps serving. Returning 503
+        there would have Kubernetes pull a pod that is functionally fine.
+      security: []
+      responses:
+        '200':
+          description: Healthy, possibly degraded.
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+        '503':
+          description: The database is unreachable.
+          content: { application/json: { schema: { type: object, additionalProperties: true } } }
+
+components:
+  securitySchemes:
+    gatewayIdentity:
+      type: apiKey
+      in: header
+      name: x-gateway-request
+      description: |
+        The gateway forwards `x-gateway-request: true` plus `x-user-id`,
+        `x-user-role`, `x-user-permissions` (a JSON array), `x-tenant-id` (or
+        the legacy `x-medspa-id`), `x-sub-tenant-id` (or `x-location-id`) and
+        `x-sender-id` (or `x-provider-id`).
+
+        A request without `x-gateway-request` is **403**. A request with it but
+        no user context is **401**. Scopes listed on an operation are the
+        permissions it requires from `x-user-permissions`; the `admin` role and
+        the `outreach:admin` permission bypass the check.
+
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+
+  responses:
+    BadRequest:
+      description: The request did not validate.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Forbidden:
+      description: Authenticated, but not entitled.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    NotFound:
+      description: No such resource in this tenant.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    BadSignature:
+      description: The provider signature did not verify. Nothing was written.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  schemas:
+    Error:
+      type: object
+      required: [success, error]
+      properties:
+        success: { type: boolean, enum: [false] }
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details: { type: object, additionalProperties: true }
+        requestId: { type: string, format: uuid }
+
+    Channel:
+      type: string
+      enum: [email, sms, slack, push, webhook, in_app, voice, letter]
+
+    Priority:
+      type: string
+      enum: [LOW, MEDIUM, HIGH, URGENT]
+      default: MEDIUM
+
+    TemplateFormat:
+      type: string
+      enum: [TEXT, HTML, MARKDOWN, MJML]
+
+    ApprovalStatus:
+      type: string
+      enum:
+        [
+          DRAFT,
+          PENDING_APPROVAL,
+          APPROVED,
+          EDITED_APPROVED,
+          AUTO_APPROVED,
+          SCHEDULED,
+          DECLINED,
+          EXPIRED,
+          CANCELLED,
+          SENT,
+        ]
+
+    ContactPoint:
+      type: object
+      required: [type, value]
+      properties:
+        type: { type: string, description: 'email | phone | slack | push | …' }
+        value: { type: string }
+        verified: { type: boolean }
+        primary: { type: boolean }
+
+    Pagination:
+      type: object
+      required: [page, limit, total, totalPages]
+      properties:
+        page: { type: integer }
+        limit: { type: integer }
+        total: { type: integer }
+        totalPages: { type: integer }
+        hasNext: { type: boolean }
+        hasPrev: { type: boolean }
+
+    SendRequest:
+      type: object
+      required: [channel, to, body]
+      properties:
+        channel: { $ref: '#/components/schemas/Channel' }
+        to: { $ref: '#/components/schemas/ContactPoint' }
+        subject: { type: string }
+        body: { type: string }
+        html: { type: string }
+        recipientId: { type: string, format: uuid }
+        senderId: { type: string }
+        priority: { $ref: '#/components/schemas/Priority' }
+        playbookKey: { type: string }
+        templateId: { type: string, format: uuid }
+        correlationId: { type: string }
+        transactional:
+          type: boolean
+          description: |
+            A transactional message may bypass a global opt-out when URGENT.
+            Verification and password-reset mail is transactional; marketing is
+            not, and mislabelling it is a compliance problem.
+        sendAt:
+          type: string
+          format: date-time
+          description: Becomes a delayed queue job, so the wait survives a restart.
+
+    DispatchResult:
+      type: object
+      required: [queued]
+      properties:
+        queued: { type: boolean }
+        messageId: { type: string, format: uuid }
+        jobId: { type: string }
+        skipped: { type: string, description: Why nothing was queued. }
+        deferrable:
+          type: boolean
+          description: |
+            True when the caller should retry later rather than give up. Quiet
+            hours and rate limits defer; permission decisions block.
+        retryAt: { type: string, format: date-time }
+
+    Message:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        recipientId: { type: [string, 'null'], format: uuid }
+        senderId: { type: [string, 'null'] }
+        tenantId: { type: string, format: uuid }
+        subTenantId: { type: [string, 'null'], format: uuid }
+        channel: { type: string }
+        direction: { type: string, enum: [outbound, inbound] }
+        content: { type: string }
+        status: { type: string }
+        sentAt: { type: [string, 'null'], format: date-time }
+        deliveredAt: { type: [string, 'null'], format: date-time }
+        readAt: { type: [string, 'null'], format: date-time }
+        eventId: { type: [string, 'null'], format: uuid }
+        eventType: { type: [string, 'null'] }
+        aiGenerated: { type: boolean }
+        metadata: { type: [object, 'null'], additionalProperties: true }
+        createdAt: { type: string, format: date-time }
+        engagementScore: { type: [integer, 'null'] }
+        openedAt: { type: [string, 'null'], format: date-time }
+        clickedAt: { type: [string, 'null'], format: date-time }
+        repliedAt: { type: [string, 'null'], format: date-time }
+
+    MessagePage:
+      type: object
+      required: [data, page, limit, total, totalPages]
+      properties:
+        data: { type: array, items: { $ref: '#/components/schemas/Message' } }
+        page: { type: integer }
+        limit: { type: integer }
+        total: { type: integer }
+        totalPages: { type: integer }
+
+    Conversation:
+      type: object
+      properties:
+        recipientId: { type: [string, 'null'], format: uuid }
+        displayName: { type: [string, 'null'] }
+        latestMessage:
+          type: [object, 'null']
+          properties:
+            id: { type: string, format: uuid }
+            content: { type: string }
+            sentAt: { type: [string, 'null'], format: date-time }
+            channel: { type: string }
+            status: { type: string }
+            direction: { type: string }
+            messageType: { type: string }
+            isAiGenerated: { type: boolean }
+        messageStats:
+          type: object
+          properties:
+            totalMessages: { type: integer }
+            unreadCount: { type: integer }
+            lastActivity: { type: [string, 'null'], format: date-time }
+        hasUnread: { type: boolean }
+        alerts:
+          type: object
+          description: Read from `message_analytics.metadata` over the last seven days.
+          properties:
+            hasAdverse: { type: boolean }
+            requiresFollowup: { type: boolean }
+
+    InboxPage:
+      type: object
+      required: [data, pagination, summary]
+      properties:
+        data: { type: array, items: { $ref: '#/components/schemas/Conversation' } }
+        pagination: { $ref: '#/components/schemas/Pagination' }
+        summary:
+          type: object
+          description: Computed over the current page, not the whole result set.
+          properties:
+            totalConversations: { type: integer }
+            totalUnread: { type: integer }
+            adverseAlerts: { type: integer }
+            followupRequired: { type: integer }
+
+    Thread:
+      type: object
+      properties:
+        senderId: { type: string }
+        recipientId: { type: string, format: uuid }
+        displayName: { type: [string, 'null'] }
+        messages: { type: array, items: { type: object, additionalProperties: true } }
+        page: { type: integer }
+        limit: { type: integer }
+        total: { type: integer }
+        totalPages: { type: integer }
+        summary: { type: object, additionalProperties: true }
+
+    AnalyticsSummary:
+      type: object
+      properties:
+        totalCommunications: { type: integer }
+        byChannel: { type: object, additionalProperties: { type: integer } }
+        byStatus: { type: object, additionalProperties: { type: integer } }
+        byEventType: { type: object, additionalProperties: { type: integer } }
+        engagementStats:
+          type: object
+          properties:
+            totalSent: { type: integer }
+            totalDelivered: { type: integer }
+            totalRead: { type: integer }
+            deliveryRate: { type: number }
+            readRate: { type: number }
+            avgEngagementScore: { type: number }
+        recentActivity:
+          type: array
+          description: The last 30 days, regardless of the requested range.
+          items:
+            type: object
+            properties:
+              date: { type: string, format: date }
+              count: { type: integer }
+              delivered: { type: integer }
+              read: { type: integer }
+
+    RecipientInput:
+      type: object
+      required: [externalRef]
+      properties:
+        externalRef:
+          type: object
+          required: [system, id]
+          description: The identity in the source system. Unique per tenant.
+          properties:
+            system: { type: string }
+            id: { type: string }
+        displayName: { type: string }
+        firstName: { type: string }
+        lastName: { type: string }
+        timezone: { type: string }
+        locale: { type: string }
+        contactPoints: { type: array, items: { $ref: '#/components/schemas/ContactPoint' } }
+
+    Recipient:
+      allOf:
+        - $ref: '#/components/schemas/RecipientInput'
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+            status: { type: string, enum: [active, unsubscribed, bounced, deleted] }
+            attributes: { type: object, additionalProperties: true }
+
+    RecipientPage:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Recipient' } }
+        total: { type: integer }
+        page: { type: integer }
+        pageSize: { type: integer }
+
+    Preferences:
+      type: object
+      properties:
+        recipientId: { type: string, format: uuid }
+        allowCommunications: { type: boolean }
+        preferredChannels: { type: array, items: { type: string } }
+        preferredLanguage: { type: string }
+        preferredFrequency: { type: string }
+        preferredTimeOfDay: { type: string }
+        quietHoursStart: { type: [string, 'null'], pattern: '^([01]?\d|2[0-3]):[0-5]\d$' }
+        quietHoursEnd: { type: [string, 'null'], pattern: '^([01]?\d|2[0-3]):[0-5]\d$' }
+        quietHoursTimezone: { type: [string, 'null'] }
+        eventOptOuts: { type: array, items: { type: string } }
+
+    GateVerdict:
+      oneOf:
+        - type: object
+          required: [allow]
+          properties:
+            allow: { type: boolean, enum: [true] }
+            shadowed:
+              type: string
+              description: |
+                What the gate *would* have suppressed, while shadow mode is on.
+                Present means this message ships today and would not once the
+                gate enforces.
+        - type: object
+          required: [allow, reason, deferrable]
+          properties:
+            allow: { type: boolean, enum: [false] }
+            reason: { type: string }
+            deferrable: { type: boolean }
+            retryAt: { type: string, format: date-time }
+
+    RenderContext:
+      type: object
+      description: |
+        Namespaced deliberately. `recipient`, `sender` and `tenant` are resolved
+        by the engine; `context` is whatever the caller supplied, validated
+        against the playbook's data contract.
+      properties:
+        recipient: { type: object, additionalProperties: true }
+        sender: { type: object, additionalProperties: true }
+        tenant: { type: object, additionalProperties: true }
+        context: { type: object, additionalProperties: true }
+        message: { type: object, additionalProperties: true }
+
+    GeneratedDraft:
+      type: object
+      required: [draftId, content, channel, aiConfidence]
+      properties:
+        draftId: { type: string, format: uuid }
+        content: { type: string }
+        subject: { type: string }
+        channel: { $ref: '#/components/schemas/Channel' }
+        aiConfidence:
+          type: number
+          description: |
+            Deterministic composite: context completeness, less 0.15 per lint
+            warning. **Not** the model's self-assessment, and a heuristic rather
+            than a probability.
+        promptPackKey: { type: string }
+        model: { type: string }
+        tokensIn: { type: integer }
+        tokensOut: { type: integer }
+        costUsd: { type: number }
+        lintWarnings: { type: array, items: { type: string } }
+
+    TemplateInput:
+      type: object
+      required: [name, channel, content]
+      properties:
+        key: { type: string }
+        name: { type: string }
+        description: { type: string }
+        channel: { type: string }
+        subject: { type: string }
+        content: { type: string }
+        format: { $ref: '#/components/schemas/TemplateFormat' }
+        category: { type: string }
+        tags: { type: array, items: { type: string } }
+
+    Template:
+      allOf:
+        - $ref: '#/components/schemas/TemplateInput'
+        - type: object
+          properties:
+            id: { type: string, format: uuid }
+            packId: { type: [string, 'null'] }
+            variables: { type: array, items: { type: string } }
+            status: { type: string }
+            isDefault: { type: boolean }
+            version: { type: integer }
+            usageCount: { type: integer }
+
+    OutreachTrigger:
+      type: object
+      required: [payload]
+      properties:
+        type: { type: string, enum: [event, schedule, manual, campaign, webhook], default: event }
+        eventType: { type: string }
+        payload: { type: object, additionalProperties: true }
+        correlationId: { type: string }
+        idempotencyKey: { type: string }
+        channels:
+          type: array
+          items: { $ref: '#/components/schemas/Channel' }
+          description: |
+            Intersected with the playbook's channel plan. Absent means "whatever
+            the playbook plans".
+        priority: { $ref: '#/components/schemas/Priority' }
+        recipientId: { type: string, format: uuid }
+        senderId: { type: string }
+
+    PlaybookRunResult:
+      type: object
+      required: [playbookId, playbookKey, status, messageIds, approvalIds]
+      properties:
+        playbookId: { type: string, format: uuid }
+        playbookKey: { type: string }
+        status:
+          type: string
+          enum: [SENT, QUEUED, PENDING_APPROVAL, SUPPRESSED, SKIPPED, FAILED]
+        runId: { type: string, format: uuid }
+        messageIds: { type: array, items: { type: string, format: uuid } }
+        approvalIds: { type: array, items: { type: string, format: uuid } }
+        reason: { type: string, description: 'Never absent on SKIPPED, SUPPRESSED or FAILED.' }
+        contractErrors: { type: array, items: { type: string } }
+
+    Approval:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        messageId: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/ApprovalStatus' }
+        approverRef: { type: [string, 'null'] }
+        policyId: { type: [string, 'null'], format: uuid }
+        requestedAt: { type: string, format: date-time }
+        slaDeadline: { type: [string, 'null'], format: date-time }
+        auditTrail:
+          type: array
+          description: Append-only. Every transition, with its actor and reason.
+          items: { type: object, additionalProperties: true }
+
+    ApprovalPage:
+      type: object
+      properties:
+        approvals: { type: array, items: { $ref: '#/components/schemas/Approval' } }
+        total: { type: integer }
+        page: { type: integer }
+        pageSize: { type: integer }
+
+    ActionResult:
+      type: object
+      properties:
+        approval: { $ref: '#/components/schemas/Approval' }
+        dispatch: { $ref: '#/components/schemas/DispatchResult' }
+        idempotent:
+          type: boolean
+          description: True when the approval was already in the requested state.
+
+    ContentEdit:
+      type: object
+      required: [content]
+      properties:
+        content: { type: string }
+        subject: { type: string }
+
+    TenantChannelConfig:
+      type: object
+      description: Secrets are masked on read and accepted in the clear on write.
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        twilioAccountSid: { type: [string, 'null'] }
+        twilioAuthToken: { type: [string, 'null'] }
+        twilioPhoneNumber: { type: [string, 'null'] }
+        twilioEnabled: { type: boolean }
+        sendgridApiKey: { type: [string, 'null'] }
+        sendgridFromEmail: { type: [string, 'null'], format: email }
+        sendgridFromName: { type: [string, 'null'] }
+        sendgridEnabled: { type: boolean }
+        slackBotToken: { type: [string, 'null'] }
+        slackDefaultChannel: { type: [string, 'null'] }
+        slackEnabled: { type: boolean }
+        timezone: { type: string }
+        defaultLanguage: { type: string }
+        requireOptIn: { type: boolean }
+        retentionDays: { type: integer }
+        isActive: { type: boolean }
