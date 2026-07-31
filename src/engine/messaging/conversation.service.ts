@@ -2,16 +2,19 @@
  * The inbox and the conversation thread — the FE's main screen, and the
  * highest-risk single handler in the extraction.
  *
- * `communications.controller.ts:getProviderInbox` (:1181-1390) issues **3 + 3N**
- * queries per page, not the 3 + 2N the plan estimated: on top of the latest
- * message and the stats roll-up it runs a third per-conversation query against
- * `patient_feedback` (:1306). At the default page size of 50 that is 153 round
- * trips to render one screen.
+ * `communications.controller.ts:getProviderInbox` (:1181-1390) issues **3 + 3N
+ * SQL statements** to render one page — not rows, statements — where N is the
+ * number of conversations on that page. The plan estimated 3 + 2N; on top of
+ * the latest message and the stats roll-up there is a third per-conversation
+ * query against `patient_feedback` (:1306). At the default page size of 50
+ * that is **153 round trips to the database for one screen**.
  *
- * This is two queries, whatever the page size: one grouped page with a lateral
- * for the latest message and a lateral for the alerts, and one count. Step 2 of
- * the source — the raw `SELECT ... FROM patients` at :1238 — disappears entirely,
- * because after P5 `recipients.display_name` holds the name (Seam C).
+ * This issues **two SQL statements**, whatever the page size — a page of 200
+ * conversations costs the same two as a page of one: a grouped CTE with a
+ * lateral for the latest message and a lateral for the alerts, plus one count.
+ * Step 2 of the source — the raw `SELECT ... FROM patients` at :1238 —
+ * disappears entirely, because after P5 `recipients.display_name` holds the
+ * name (Seam C).
  *
  * Behaviour preserved exactly, including the parts that look like accidents:
  *  - `status NOT IN ('QUEUED','DECLINED')` (:1197-1201) — queued and declined
@@ -134,7 +137,10 @@ export class ConversationService {
 
   /**
    * One conversation per recipient for a given sender, most recently active
-   * first. Two queries, independent of page size.
+   * first.
+   *
+   * **Two SQL statements, independent of page size** — the page and the count.
+   * Not two conversations: a page returns up to `limit` of them.
    */
   async inbox(
     scope: TenantScope,
@@ -275,8 +281,10 @@ export class ConversationService {
   }
 
   /**
-   * The full thread between one sender and one recipient. Three queries: the
-   * message page, the roll-up, and the recipient's name.
+   * The full thread between one sender and one recipient.
+   *
+   * **Three SQL statements**, independent of how many messages the thread
+   * holds: the message page, the roll-up, and the recipient's name.
    *
    * `queuedCount` and `pendingApprovalCount` are in the source's summary
    * (:1526-1527) and are structurally always zero, because the same query

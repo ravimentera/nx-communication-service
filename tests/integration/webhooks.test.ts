@@ -19,12 +19,17 @@ import { createHmac } from 'node:crypto';
 import { eq } from 'drizzle-orm';
 import request from 'supertest';
 
-import { messages, recipients, tenantChannelConfigs } from '../../src/db/schema.js';
+import winston from 'winston';
+
+import { messageAnalytics, messages, recipients, tenantChannelConfigs } from '../../src/db/schema.js';
+import { MessageService } from '../../src/engine/messaging/message.service.js';
 import { startHarness, TENANT, PROVIDER, type Harness } from '../contract/legacy/harness.js';
 
 let h: Harness;
 let recipientId: string;
 let messageId: string;
+
+const logger = winston.createLogger({ silent: true });
 
 const TWILIO_TOKEN = 'contract-test'; // matches TWILIO_AUTH_TOKEN in the harness
 const PUBLIC_URL = 'https://webhooks.example.test';
@@ -173,6 +178,66 @@ describe('delivery receipts', () => {
       playbookKey: 'medspa.appointment-reminder',
       lastReceipt: 'delivered',
     });
+  });
+
+  it('keeps ONE analytics row per message, however many receipts arrive', async () => {
+    // Three read paths LEFT JOIN message_analytics. A second row per message
+    // makes that message appear twice in a list while `total` counts it once,
+    // so `data.length !== total` and the legacy pagination envelope stops being
+    // coherent. Before 0008 this produced 2 rows and a 2-row page for 1 message.
+    await postTwilio({
+      MessageSid: 'SMtest0001',
+      MessageStatus: 'read',
+      AccountSid: 'ACcontracttest',
+    });
+    await h.receipts.apply({
+      providerMessageId: 'SMtest0001',
+      event: 'clicked',
+      at: new Date(),
+      clickedLink: 'https://example.test/book',
+    });
+
+    const analytics = await h.db
+      .select({ id: messageAnalytics.id, openedAt: messageAnalytics.openedAt })
+      .from(messageAnalytics)
+      .where(eq(messageAnalytics.messageId, messageId));
+    expect(analytics).toHaveLength(1);
+
+    const page = await new MessageService({ db: h.db, logger }).list(
+      { tenantId: TENANT },
+      { recipientId },
+    );
+    expect(page.data.filter((m) => m.id === messageId)).toHaveLength(1);
+    expect(page.data.length).toBe(page.total);
+  });
+
+  it('keeps the FIRST open, not the most recent', async () => {
+    // `opened_at` answers "how long did it take them to open it". Last-write
+    // -wins would quietly turn that into "when did they last look at it".
+    const [msg] = await h.db
+      .insert(messages)
+      .values({
+        tenantId: TENANT,
+        senderId: PROVIDER,
+        recipientId,
+        channel: 'EMAIL',
+        content: 'opened twice',
+        status: 'SENT',
+        sentAt: new Date(),
+        providerMessageId: 'sg-open-order',
+      })
+      .returning({ id: messages.id });
+
+    const first = new Date('2026-01-01T10:00:00Z');
+    const later = new Date('2026-01-05T10:00:00Z');
+    await h.receipts.apply({ providerMessageId: 'sg-open-order', event: 'opened', at: first });
+    await h.receipts.apply({ providerMessageId: 'sg-open-order', event: 'opened', at: later });
+
+    const [row] = await h.db
+      .select({ openedAt: messageAnalytics.openedAt })
+      .from(messageAnalytics)
+      .where(eq(messageAnalytics.messageId, msg!.id));
+    expect(row!.openedAt?.toISOString()).toBe(first.toISOString());
   });
 
   it('answers 204 for a receipt about a message it never sent', async () => {

@@ -1,11 +1,15 @@
 /**
  * The inbox, against a real Postgres.
  *
- * The point of this suite is the query *count*. The handler it replaces issues
- * `3 + 3N` queries per page — at the default page size of 50 that is 153 round
- * trips for one screen — and the shape of the replacement (a grouped CTE with
- * two laterals) is only worth its complexity if it holds at two. A statement
- * counter on the pool is the only way to assert that, and it is also what stops
+ * The point of this suite is the number of **SQL statements** one page costs —
+ * not the number of conversations it returns. The handler this replaces issues
+ * `3 + 3N` statements for a page of N conversations, so the default page size
+ * of 50 costs 153 round trips to render one screen. The replacement is a
+ * grouped CTE with two laterals plus one count: **2 statements, whether the
+ * page holds one conversation or two hundred.**
+ *
+ * That shape is only worth its complexity if it actually holds, and a statement
+ * counter on the pool is the only way to assert it. It is also what stops
  * someone reintroducing a per-row lookup later without noticing.
  *
  * It doubles as the syntax check on the raw SQL: none of it is expressible in
@@ -116,7 +120,7 @@ afterAll(async () => {
 });
 
 describe('inbox', () => {
-  it('issues two queries regardless of page size', async () => {
+  it('costs two SQL statements for a page of twelve conversations', async () => {
     for (let i = 0; i < 12; i += 1) {
       const recipientId = await makeRecipient(`Person ${i}`);
       await makeMessage({ recipientId, sentAt: new Date(Date.now() - i * 60_000) });
@@ -128,7 +132,8 @@ describe('inbox', () => {
 
     expect(page.conversations).toHaveLength(12);
     expect(page.total).toBe(12);
-    // Two, not 3 + 3×12 = 39.
+    // Two SQL statements for twelve conversations and 24 messages. The handler
+    // this replaces would have issued 3 + 3×12 = 39 for the same page.
     expect(statements).toHaveLength(2);
   });
 
@@ -241,7 +246,7 @@ describe('inbox', () => {
 });
 
 describe('thread', () => {
-  it('returns the messages, the roll-up and the display name in three queries', async () => {
+  it('costs three SQL statements: the message page, the roll-up and the name', async () => {
     const recipientId = await makeRecipient('Ada Lovelace');
     await makeMessage({ recipientId, content: 'first', sentAt: new Date('2026-01-01T00:00:00Z') });
     await makeMessage({
@@ -255,6 +260,8 @@ describe('thread', () => {
 
     const thread = await conversations.thread(scope, SENDER, recipientId);
 
+    // Three statements, and three regardless of how many messages the thread
+    // holds — the source issues four and then one more per conversation.
     expect(statements).toHaveLength(3);
     expect(thread.displayName).toBe('Ada Lovelace');
     // Most recent first, for the chat UI.

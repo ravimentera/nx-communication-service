@@ -193,7 +193,14 @@ export const messageAnalytics = pgTable(
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
-  (t) => [index('idx_message_analytics_message').on(t.messageId)],
+  (t) => [
+    index('idx_message_analytics_message').on(t.messageId),
+    // message_analytics_message_unique — PARTIAL UNIQUE (message_id) WHERE
+    // message_id IS NOT NULL — lives in 0008 only. Drizzle cannot express a
+    // partial index, so this is one of the constraints D15 flags as needing
+    // human eyes. It is load-bearing: three read paths LEFT JOIN this table,
+    // and a second row per message duplicates that message in every list.
+  ],
 );
 
 /** ← `scheduled_communications`. */

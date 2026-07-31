@@ -276,6 +276,9 @@ describe('indexes carried forward from the source', () => {
     'idx_recipient_prefs_recipient',
     'idx_approvals_tenant_status_deadline',
     'idx_approvals_tenant_approver',
+    // 0008 — both load-bearing, neither expressible in the Drizzle model.
+    'message_analytics_message_unique',
+    'idx_messages_provider_message_id_lookup',
   ])('%s exists', async (indexName) => {
     const { rows } = await client.query(
       `SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1`,
@@ -290,6 +293,31 @@ describe('indexes carried forward from the source', () => {
        WHERE schemaname = 'public' AND indexname = 'idx_messages_unread'`,
     );
     expect(rows[0]!.indexdef).toContain('WHERE (read_at IS NULL)');
+  });
+
+  it('lets a receipt look a message up without a tenant', async () => {
+    // A provider callback carries no tenant, so ReceiptService queries
+    // `provider_message_id` alone and reads the tenant off the row. A btree
+    // cannot serve a predicate that skips its leading column, so the
+    // (tenant_id, provider_message_id) index from 0001 is useless here — every
+    // receipt would sequentially scan the largest table in the service.
+    const { rows } = await client.query<{ indexdef: string }>(
+      `SELECT indexdef FROM pg_indexes
+       WHERE schemaname = 'public' AND indexname = 'idx_messages_provider_message_id_lookup'`,
+    );
+    expect(rows[0]!.indexdef).toMatch(/\(provider_message_id\)/);
+    expect(rows[0]!.indexdef).toContain('WHERE (provider_message_id IS NOT NULL)');
+  });
+
+  it('allows only one analytics row per message', async () => {
+    // Three read paths LEFT JOIN message_analytics. A second row per message
+    // duplicates that message in every list while `total` counts it once.
+    const { rows } = await client.query<{ indexdef: string }>(
+      `SELECT indexdef FROM pg_indexes
+       WHERE schemaname = 'public' AND indexname = 'message_analytics_message_unique'`,
+    );
+    expect(rows[0]!.indexdef).toContain('CREATE UNIQUE INDEX');
+    expect(rows[0]!.indexdef).toContain('WHERE (message_id IS NOT NULL)');
   });
 
   it('does not carry over the queued_message approval index', async () => {

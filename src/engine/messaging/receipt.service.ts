@@ -130,17 +130,21 @@ export class ReceiptService {
     }
 
     if (Object.keys(engagement).length > 0 || receipt.reason) {
-      await this.deps.db
-        .insert(messageAnalytics)
-        .values({
+      await this.upsertAnalytics(
+        {
           tenantId: row.tenantId,
           subTenantId: row.subTenantId,
           messageId: row.id,
           recipientId: row.recipientId,
+        },
+        {
           ...engagement,
-          metadata: { lastEvent: receipt.event, ...(receipt.reason ? { reason: receipt.reason } : {}) },
-        } as typeof messageAnalytics.$inferInsert)
-        .onConflictDoNothing();
+          metadata: {
+            lastEvent: receipt.event,
+            ...(receipt.reason ? { reason: receipt.reason } : {}),
+          },
+        },
+      );
     }
 
     // A bounce or a spam report is a statement about the address, and the
@@ -254,17 +258,15 @@ export class ReceiptService {
         .limit(1);
 
       if (original) {
-        await this.deps.db
-          .insert(messageAnalytics)
-          .values({
+        await this.upsertAnalytics(
+          {
             tenantId: input.tenantId,
             subTenantId: original.subTenantId,
             messageId: original.id,
             recipientId: input.recipientId,
-            repliedAt: input.at,
-            replyContent: input.content.slice(0, 2000),
-          })
-          .onConflictDoNothing();
+          },
+          { repliedAt: input.at, replyContent: input.content.slice(0, 2000) },
+        );
       }
     }
 
@@ -281,6 +283,66 @@ export class ReceiptService {
       tenantId: input.tenantId,
       recipientId: input.recipientId,
     };
+  }
+
+  /**
+   * One analytics row per message, updated in place.
+   *
+   * **This must never plain-INSERT.** `message_analytics` is LEFT JOINed by
+   * `MessageService.list`, `.getById` and `ConversationService.thread`, so a
+   * second row for the same message makes that message appear twice in a list
+   * while `total` still counts it once — `data.length !== total`, and the
+   * legacy pagination envelope the FE reads stops being coherent.
+   *
+   * The first version used `onConflictDoNothing()` with no target, which does
+   * nothing at all without a unique constraint to conflict on. `0008` adds the
+   * partial unique index this targets.
+   *
+   * **First event wins** on each timestamp: `opened_at` is when it was *first*
+   * opened, which is the number "time to open" needs. A provider sends one
+   * callback per open, so last-write-wins would quietly turn that into "most
+   * recently opened".
+   */
+  private async upsertAnalytics(
+    key: {
+      tenantId: string;
+      subTenantId: string | null;
+      messageId: string;
+      recipientId: string | null | undefined;
+    },
+    fields: {
+      openedAt?: Date;
+      clickedAt?: Date;
+      clickedLink?: string;
+      repliedAt?: Date;
+      replyContent?: string;
+      metadata?: Record<string, unknown>;
+    },
+  ): Promise<void> {
+    await this.deps.db
+      .insert(messageAnalytics)
+      .values({
+        tenantId: key.tenantId,
+        subTenantId: key.subTenantId,
+        messageId: key.messageId,
+        recipientId: key.recipientId ?? null,
+        ...fields,
+      })
+      .onConflictDoUpdate({
+        target: messageAnalytics.messageId,
+        // The index is partial, so the conflict target has to name its predicate.
+        targetWhere: sql`${messageAnalytics.messageId} IS NOT NULL`,
+        set: {
+          openedAt: sql`COALESCE(${messageAnalytics.openedAt}, excluded.opened_at)`,
+          clickedAt: sql`COALESCE(${messageAnalytics.clickedAt}, excluded.clicked_at)`,
+          clickedLink: sql`COALESCE(${messageAnalytics.clickedLink}, excluded.clicked_link)`,
+          repliedAt: sql`COALESCE(${messageAnalytics.repliedAt}, excluded.replied_at)`,
+          replyContent: sql`COALESCE(${messageAnalytics.replyContent}, excluded.reply_content)`,
+          // Merged, not replaced — the same mistake as D49, in a second place.
+          metadata: sql`COALESCE(${messageAnalytics.metadata}, '{}'::jsonb) || COALESCE(excluded.metadata, '{}'::jsonb)`,
+          updatedAt: sql`now()`,
+        },
+      });
   }
 
   /** Which tenant (and possibly which agent) owns the address that was written to. */
