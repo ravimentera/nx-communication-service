@@ -80,7 +80,9 @@ beforeAll(async () => {
   await client.connect();
   const dir = join(process.cwd(), 'migrations');
   for (const file of readdirSync(dir)
-    .filter((f) => /^\d{4}_.*\.sql$/.test(f))
+    // The 0xxx schema series only — the 9xxx files are the one-shot
+    // mentera-core data migration (migration.test.ts covers them).
+    .filter((f) => /^0\d{3}_.*\.sql$/.test(f))
     .sort()) {
     await client.query(readFileSync(join(dir, file), 'utf8'));
   }

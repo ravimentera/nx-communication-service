@@ -55,9 +55,15 @@ const MODEL_TABLES: { name: string; columns: string[] }[] = Object.values(
   ];
 });
 
+/**
+ * The SCHEMA series only. The 9xxx files are one-shot data migrations from
+ * mentera-core: they need a linked source database, they create scaffolding in
+ * the `mig` schema that this file's "no unmodelled tables" assertions would
+ * (correctly) reject, and they are exercised by migration.test.ts instead.
+ */
 function migrationFiles(): string[] {
   return readdirSync(MIGRATIONS_DIR)
-    .filter((f) => /^\d{4}_.*\.sql$/.test(f))
+    .filter((f) => /^0\d{3}_.*\.sql$/.test(f))
     .sort();
 }
 
