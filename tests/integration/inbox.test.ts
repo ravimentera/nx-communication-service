@@ -278,6 +278,31 @@ describe('thread', () => {
   });
 });
 
+describe('the channel filter', () => {
+  /**
+   * The regression this exists for: the engine wrote `messages.channel` as a
+   * lowercase ChannelType (dispatcher.ts) while `MessageService.list`
+   * uppercased the caller's filter before comparing, so a channel filter could
+   * never match a message the engine itself had sent. Nothing caught it because
+   * nothing filtered by channel — the rows in every other test are seeded by
+   * hand and never round-tripped through a filter.
+   */
+  it('finds a message the engine wrote, however the caller spells the channel', async () => {
+    const recipientId = await makeRecipient('Casing Test');
+    await makeMessage({ recipientId, channel: 'sms', content: 'lowercase, as dispatched' });
+
+    for (const spelling of ['sms', 'SMS', 'Sms']) {
+      const page = await messageService.list(scope, { channel: spelling, senderId: SENDER });
+      expect(page.data.map((m) => m.content)).toContain('lowercase, as dispatched');
+    }
+  });
+
+  it('does not match a different channel', async () => {
+    const page = await messageService.list(scope, { channel: 'slack', senderId: SENDER });
+    expect(page.data.map((m) => m.content)).not.toContain('lowercase, as dispatched');
+  });
+});
+
 describe('read state', () => {
   it('marking an already-read message read succeeds instead of 404ing', async () => {
     const recipientId = await makeRecipient('Ada');

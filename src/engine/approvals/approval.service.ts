@@ -50,7 +50,7 @@ import type { ApprovalStatus } from '../../db/schema/approvals.js';
 import type { Priority } from '../../domain/index.js';
 import type { TenantScope } from '../../platform/db/tenant-scope.js';
 import { ForbiddenError, NotFoundError, ValidationError } from '../../platform/http/errors.js';
-import type { ChannelType, ContactPoint, RenderedMessage } from '../../ports/channel.js';
+import { normalizeChannel, type ChannelType, type ContactPoint, type RenderedMessage } from '../../ports/channel.js';
 import type { Dispatcher, DispatchResult } from '../delivery/dispatcher.js';
 import {
   APPROVED_STATES,
@@ -745,7 +745,9 @@ export class ApprovalService {
       messageId: approval.messageId,
       tenantId: scope.tenantId,
       subTenantId: scope.subTenantId,
-      channel: row.channel as ChannelType,
+      // Sound because `messages.channel` holds the normalised spelling — see
+      // normalizeChannel(). `registry.get()` on the other side has no fallback.
+      channel: normalizeChannel(row.channel) as ChannelType,
       to: envelope.to,
       rendered: {
         body,
@@ -953,7 +955,7 @@ export class ApprovalService {
       );
     }
 
-    if (filters.channel) clauses.push(eq(messages.channel, filters.channel));
+    if (filters.channel) clauses.push(eq(messages.channel, normalizeChannel(filters.channel)));
 
     // Priority and playbook key live on the message's JSONB, not on a column of
     // their own — the same shape the source filtered on

@@ -87,10 +87,14 @@ BEGIN
       (SELECT e.id  FROM outreach_events e WHERE e.id = s.event_id),
       (SELECT r.id  FROM recipients r WHERE r.id = mig.recipient_id(s.medspa_id, s.patient_id)),
       s.provider_id,
-      -- Kept as the source wrote it ('EMAIL', 'SMS'): MessageService.list
-      -- uppercases the caller's filter before comparing (message.service.ts:96),
-      -- so uppercase is what a legacy list query can find.
-      s.channel,
+      -- Lower-cased, because that is what the engine stores and what three of
+      -- its own readers require: `ApprovalService.release` casts this column to
+      -- ChannelType and hands it to `registry.get()`, the compliance gate counts
+      -- per channel with an equality on it, and analytics groups by it. A
+      -- migrated 'SMS' would throw on release and be invisible to the rate
+      -- limiter. The legacy surface is unaffected — `toLegacyChannel` puts the
+      -- upper case back on the way out (api/compat/translate.ts:93).
+      lower(btrim(s.channel)),
       CASE WHEN upper(COALESCE(NULLIF(btrim(s.message_direction), ''),
                                s.metadata->>'direction', 'OUTBOUND')) = 'INBOUND'
            THEN 'inbound' ELSE 'outbound' END,

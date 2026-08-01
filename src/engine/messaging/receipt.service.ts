@@ -18,6 +18,7 @@ import type { Logger } from 'winston';
 
 import type { Db } from '../../db/index.js';
 import { messageAnalytics, messages, recipients } from '../../db/schema.js';
+import { normalizeChannel } from '../../ports/channel.js';
 
 /** What a provider is telling us happened. */
 export type ReceiptEvent =
@@ -229,7 +230,7 @@ export class ReceiptService {
         subTenantId: input.subTenantId ?? null,
         senderId: input.senderId ?? null,
         recipientId: input.recipientId ?? null,
-        channel: input.channel.toUpperCase(),
+        channel: normalizeChannel(input.channel),
         direction: 'inbound',
         content: input.content,
         status: 'RECEIVED',

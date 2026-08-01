@@ -297,6 +297,32 @@ describe('the full lifecycle', () => {
   });
 });
 
+describe('a legacy-cased message row', () => {
+  /**
+   * The release path casts `messages.channel` straight to `ChannelType` and
+   * hands it to `registry.get()`, which has no fallback. Every row migrated from
+   * mentera-core, and every inbound row the receipt service used to write, held
+   * the source's upper case — so approving one of them would have looked for an
+   * adapter registered as 'EMAIL' and thrown. P9 normalises the column on the
+   * way in; this asserts the read side tolerates a row that slipped through.
+   */
+  it('still finds its channel adapter when the row says EMAIL', async () => {
+    const recipient = await makeRecipient();
+    const { approval } = await service.submit(scope, draft({ recipientId: recipient.id }), {
+      key: 'medspa.provider-always',
+    });
+
+    await db
+      .update(messages)
+      .set({ channel: 'EMAIL' })
+      .where(eq(messages.id, approval.messageId));
+
+    const { approval: approved } = await service.approve(scope, approval.id, provider);
+    expect(approved.status).toBe('APPROVED');
+    expect(queued).toHaveLength(1);
+  });
+});
+
 describe('idempotency', () => {
   it('double-approve returns the same row and does not send twice', async () => {
     const { approval } = await service.submit(scope, draft(), { key: 'medspa.provider-always' });

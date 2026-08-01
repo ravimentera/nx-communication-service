@@ -26,6 +26,7 @@ import type { Db } from '../../db/index.js';
 import { messageAnalytics, messages, outreachEvents } from '../../db/schema.js';
 import { NotFoundError } from '../../platform/http/errors.js';
 import { tenantWhere, type TenantScope } from '../../platform/db/tenant-scope.js';
+import { normalizeChannel } from '../../ports/channel.js';
 
 export interface MessageFilters {
   channel?: string;
@@ -93,7 +94,9 @@ export class MessageService {
     const where: SQL[] = [tenantWhere(messages, scope)];
     if (f.senderId) where.push(eq(messages.senderId, f.senderId));
     if (f.recipientId) where.push(eq(messages.recipientId, f.recipientId));
-    if (f.channel) where.push(eq(messages.channel, f.channel.toUpperCase()));
+    // A caller may say 'SMS' or 'sms'; the column holds the latter. Uppercasing
+    // here — as this did — matched nothing the engine had ever written.
+    if (f.channel) where.push(eq(messages.channel, normalizeChannel(f.channel)));
     if (f.status) where.push(eq(messages.status, f.status.toUpperCase()));
     if (f.dateFrom) where.push(gte(messages.sentAt, new Date(f.dateFrom)));
     if (f.dateTo) where.push(lte(messages.sentAt, new Date(f.dateTo)));

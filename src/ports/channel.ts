@@ -36,6 +36,34 @@ export function toChannelType(value: string): ChannelType | undefined {
     : undefined;
 }
 
+/**
+ * The stored spelling of a channel: lower case, always.
+ *
+ * **This is the storage convention for `messages.channel` and
+ * `notifications.channel`, and it is not decorative.** Three things inside the
+ * engine read a stored channel back and hand it to something that only knows
+ * `ChannelType`:
+ *
+ *   - `ApprovalService.release` casts `row.channel as ChannelType` and gives it
+ *     to `dispatcher.dispatch()`, which does `registry.get(channel)`. A row
+ *     holding `'SMS'` finds no adapter, so releasing that approval throws.
+ *   - `ComplianceGate.countSent` counts with `eq(messages.channel, channel)`
+ *     where `channel` is a `ChannelType`. Rows in the other spelling are
+ *     invisible, so a per-channel rate limit under-counts.
+ *   - `AnalyticsService` groups by the raw column, so mixed spellings become
+ *     two buckets for one channel.
+ *
+ * Uppercase belongs at the legacy boundary and nowhere else: `toLegacyChannel`
+ * in `api/compat/translate.ts` puts it back on the way out, which is why the
+ * legacy responses are unchanged by any of this.
+ *
+ * Unknown values pass through lower-cased rather than being rejected — an
+ * unrecognised channel on a historic row is data, not a reason to fail a read.
+ */
+export function normalizeChannel(value: string): string {
+  return toChannelType(value) ?? value.trim().toLowerCase();
+}
+
 /** One way of reaching a recipient. Mirrors an entry in `recipients.contact_points`. */
 export interface ContactPoint {
   type: string;

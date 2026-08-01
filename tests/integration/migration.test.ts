@@ -538,8 +538,8 @@ describe('events, notifications and the rest', () => {
        FROM notifications ORDER BY channel`,
     );
     expect(rows).toEqual([
-      { channel: 'EMAIL', resolved: false, channel_ref: 'someone@example.com' },
-      { channel: 'SMS', resolved: true, channel_ref: null },
+      { channel: 'email', resolved: false, channel_ref: 'someone@example.com' },
+      { channel: 'sms', resolved: true, channel_ref: null },
     ]);
   });
 
@@ -618,6 +618,15 @@ describe('messages', () => {
     );
     // source_timezone is 'UTC', so the stored wall clock is the UTC wall clock.
     expect(migrated).toBe(naive);
+  });
+
+  it('stores the channel in the spelling the engine reads back', async () => {
+    // Not cosmetic: ApprovalService.release casts this column to ChannelType and
+    // hands it to registry.get(), and the compliance gate counts per channel
+    // with an equality on it. The legacy surface still says 'SMS' — that is
+    // toLegacyChannel's job, on the way out.
+    const { rows } = await target.query(`SELECT DISTINCT channel FROM messages ORDER BY 1`);
+    expect(rows.map((r) => r.channel)).toEqual(['email', 'sms']);
   });
 
   it('carries the identity, threading and engagement columns', async () => {

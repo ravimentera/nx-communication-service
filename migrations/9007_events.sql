@@ -204,7 +204,8 @@ BEGIN
       content, status, sent_at, delivered_at, read_at, error, metadata,
       created_at, updated_at
     )
-    SELECT s.id, e.medspa_id, e.location_id, e.id, s.channel,
+    -- Lower-cased for the same reason as messages.channel (see 9008).
+    SELECT s.id, e.medspa_id, e.location_id, e.id, lower(btrim(s.channel)),
            r.id,
            CASE WHEN r.id IS NULL THEN s.recipient_id END,
            COALESCE(s.content, ''),
