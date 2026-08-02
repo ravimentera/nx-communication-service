@@ -65,7 +65,11 @@ beforeAll(async () => {
       tenantId: TENANT,
       senderId: PROVIDER,
       recipientId,
-      channel: 'EMAIL',
+      // Lower case, because that is what the engine writes (D80). The legacy
+      // responses below still say 'EMAIL' — toLegacyChannel restores it on the
+      // way out, and that round trip is the point of the filter test further
+      // down.
+      channel: 'email',
       content: 'Your appointment is confirmed',
       status: 'SENT',
       direction: 'outbound',
@@ -435,6 +439,29 @@ describe('/communications — 16', () => {
     expect(seeded).toMatchObject({ patientId: PATIENT, providerId: PROVIDER, medspaId: TENANT });
     expect(seeded).not.toHaveProperty('recipientId');
     expect(seeded).not.toHaveProperty('senderId');
+  });
+
+  /**
+   * The legacy `?channel=` filter had no coverage at all, which is how a
+   * casing mismatch between the writer and the reader survived from P3 to P9
+   * (D80). It is the FE's filter, so it is worth testing on the FE's endpoint
+   * rather than only on the service beneath it.
+   */
+  it('GET /communications/medspa/:medspaId?channel= filters, in either spelling', async () => {
+    for (const spelling of ['EMAIL', 'email']) {
+      const res = await get(`/communications/medspa/${TENANT}?channel=${spelling}`);
+      expect(res.status).toBe(200);
+      const seeded = res.body.data.find((m: { id: string }) => m.id === messageId);
+      expect(seeded).toBeDefined();
+      // The legacy vocabulary is upper case on the way out, whatever is stored.
+      expect(seeded.channel).toBe('EMAIL');
+    }
+  });
+
+  it('GET /communications/medspa/:medspaId?channel= excludes other channels', async () => {
+    const res = await get(`/communications/medspa/${TENANT}?channel=SLACK`);
+    expect(res.status).toBe(200);
+    expect(res.body.data.find((m: { id: string }) => m.id === messageId)).toBeUndefined();
   });
 
   it('GET /communications/provider/:providerId is double-nested', async () => {
