@@ -1,0 +1,8 @@
+{
+  "id": "lead-generation",
+  "name": "Lead generation",
+  "version": "1.0.0",
+  "description": "A sales nurture pack for any industry. Exists to prove the engine is industry-blind: it declares NO context providers (an empty list is the point \u2014 a provider reaches an external service with the ENGINE's credentials, so a generic pack must work from caller-supplied data alone), and NO required config (the medspa pack needs four keys only because the source hardcoded four destinations). If this pack needs an engine change to work, the abstraction is wrong.",
+  "contextProviders": [],
+  "requiredConfig": []
+}

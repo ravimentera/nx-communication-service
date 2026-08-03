@@ -1,0 +1,264 @@
+[
+  {
+    "key": "lead.initial-contact",
+    "name": "Initial contact",
+    "description": "communication.model.ts:52, LEAD_INITIAL_CONTACT \u2014 priority HIGH in the source's own table (:318). Template-rendered, so no approval: the first reply to an enquiry should be immediate and identical every time.",
+    "priority": 10,
+    "approvalPolicyKey": "system.transactional",
+    "contentSource": {
+      "kind": "template",
+      "templateKey": "lead.initial-contact.email"
+    },
+    "channelPlan": [
+      {
+        "channel": "email",
+        "templateKey": "lead.initial-contact.email"
+      },
+      {
+        "channel": "sms",
+        "templateKey": "lead.initial-contact.sms"
+      }
+    ],
+    "dataContract": {
+      "type": "object",
+      "properties": {
+        "interest": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string",
+          "default": "enquiry"
+        }
+      }
+    },
+    "throttle": {
+      "maxPerRecipientPerDay": 1
+    },
+    "triggers": [
+      {
+        "type": "event",
+        "eventType": "LEAD_INITIAL_CONTACT"
+      },
+      {
+        "type": "campaign",
+        "where": {
+          "campaignPlaybookKey": {
+            "eq": "lead.initial-contact"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "key": "lead.followup",
+    "name": "Follow-up (AI-written)",
+    "description": "LEAD_FOLLOWUP. The one playbook in this pack the model writes, because a follow-up has to respond to what the enquiry actually said \u2014 which is exactly the judgement a template cannot make and a human should therefore check. Ships isActive:false like every AI playbook (D59) \u2014 installing a pack must never be the moment a tenant starts sending model-written messages to strangers; POST /v1/playbooks/lead.followup/activate switches it on. Its data contract is the field list lead-message.service.ts read off the `lead_profiles` table (interests, inquiry_source, conversion_stage, last_interaction, metadata); there is no such table here, so the caller supplies them per event and anything durable lives on recipients.attributes (\u00a70.10 tiers 1 and 2). Every field is optional with a default, because the source read them all defensively.",
+    "priority": 20,
+    "isActive": false,
+    "approvalPolicyKey": "lead.sales-review",
+    "contentSource": {
+      "kind": "ai",
+      "promptPackKey": "lead.nurture",
+      "goal": "Follow up on the enquiry with something useful and one easy-to-decline next step"
+    },
+    "channelPlan": [
+      {
+        "channel": "email"
+      },
+      {
+        "channel": "sms"
+      }
+    ],
+    "dataContract": {
+      "type": "object",
+      "properties": {
+        "interest": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string",
+          "default": "enquiry"
+        },
+        "stage": {
+          "type": "string",
+          "default": "new"
+        },
+        "lastTouch": {
+          "type": "string"
+        },
+        "budgetBand": {
+          "type": "string"
+        },
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
+    "throttle": {
+      "maxPerRecipientPerDay": 1,
+      "cooldownHours": 48
+    },
+    "triggers": [
+      {
+        "type": "event",
+        "eventType": "LEAD_FOLLOWUP"
+      },
+      {
+        "type": "campaign",
+        "where": {
+          "campaignPlaybookKey": {
+            "eq": "lead.followup"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "key": "lead.educational",
+    "name": "Educational",
+    "description": "LEAD_EDUCATIONAL \u2014 priority LOW in the source (:320). The body arrives in the payload rather than being written here, so the same playbook carries any vertical's material.",
+    "priority": 30,
+    "approvalPolicyKey": "system.transactional",
+    "contentSource": {
+      "kind": "template",
+      "templateKey": "lead.educational.email"
+    },
+    "channelPlan": [
+      {
+        "channel": "email",
+        "templateKey": "lead.educational.email"
+      }
+    ],
+    "dataContract": {
+      "type": "object",
+      "required": [
+        "body"
+      ],
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "topic": {
+          "type": "string"
+        },
+        "interest": {
+          "type": "string"
+        }
+      }
+    },
+    "throttle": {
+      "cooldownHours": 72
+    },
+    "triggers": [
+      {
+        "type": "event",
+        "eventType": "LEAD_EDUCATIONAL"
+      },
+      {
+        "type": "campaign",
+        "where": {
+          "campaignPlaybookKey": {
+            "eq": "lead.educational"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "key": "lead.promotional",
+    "name": "Promotional",
+    "description": "LEAD_PROMOTIONAL. Every field of the offer comes from the caller \u2014 the engine has no promotions table and does not want one (D12). Throttled to one promotional message per recipient per week. The source had no throttle of any kind, which is how a lead ends up on three sequences at once.",
+    "priority": 40,
+    "approvalPolicyKey": "system.transactional",
+    "contentSource": {
+      "kind": "template",
+      "templateKey": "lead.promotional.email"
+    },
+    "channelPlan": [
+      {
+        "channel": "email",
+        "templateKey": "lead.promotional.email"
+      }
+    ],
+    "dataContract": {
+      "type": "object",
+      "required": [
+        "offerName"
+      ],
+      "properties": {
+        "offerName": {
+          "type": "string"
+        },
+        "offerDetail": {
+          "type": "string"
+        },
+        "offerEnds": {
+          "type": "string"
+        }
+      }
+    },
+    "throttle": {
+      "maxPerRecipientPerDay": 1,
+      "cooldownHours": 168
+    },
+    "triggers": [
+      {
+        "type": "event",
+        "eventType": "LEAD_PROMOTIONAL"
+      },
+      {
+        "type": "campaign",
+        "where": {
+          "campaignPlaybookKey": {
+            "eq": "lead.promotional"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "key": "lead.reengagement",
+    "name": "Re-engagement",
+    "description": "LEAD_REENGAGEMENT. The end of the sequence, and the template says so \u2014 a nurture that never stops is what gets a domain blocklisted.",
+    "priority": 50,
+    "approvalPolicyKey": "system.transactional",
+    "contentSource": {
+      "kind": "template",
+      "templateKey": "lead.reengagement.email"
+    },
+    "channelPlan": [
+      {
+        "channel": "email",
+        "templateKey": "lead.reengagement.email"
+      }
+    ],
+    "dataContract": {
+      "type": "object",
+      "properties": {
+        "interest": {
+          "type": "string"
+        },
+        "lastTouch": {
+          "type": "string"
+        }
+      }
+    },
+    "throttle": {
+      "cooldownHours": 720
+    },
+    "triggers": [
+      {
+        "type": "event",
+        "eventType": "LEAD_REENGAGEMENT"
+      },
+      {
+        "type": "campaign",
+        "where": {
+          "campaignPlaybookKey": {
+            "eq": "lead.reengagement"
+          }
+        }
+      }
+    ]
+  }
+]

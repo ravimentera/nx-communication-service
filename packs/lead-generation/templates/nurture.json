@@ -1,0 +1,55 @@
+[
+  {
+    "key": "lead.initial-contact.email",
+    "name": "Initial contact (email)",
+    "description": "Sent once, on the enquiry itself. Deliberately template-rendered rather than model-written: the first message a stranger receives should be the same message every time, and it is the one nobody wants a model improvising.",
+    "channel": "email",
+    "category": "nurture",
+    "format": "TEXT",
+    "subject": "Thanks for getting in touch",
+    "content": "Hi {{recipient.firstName}},\n\nThanks for your enquiry{{#if context.interest}} about {{context.interest}}{{/if}}. I've made a note of it and I'll follow up properly shortly.\n\nIf it's easier to talk it through, just reply to this email and we'll find a time.\n\n{{sender.displayName}}\n{{tenant.name}}"
+  },
+
+  {
+    "key": "lead.initial-contact.sms",
+    "name": "Initial contact (SMS)",
+    "description": "Identifies the sender in the first clause. An unidentified SMS from an unknown number is both a bad first impression and a TCPA exposure.",
+    "channel": "sms",
+    "category": "nurture",
+    "format": "TEXT",
+    "content": "{{sender.displayName}} here from {{tenant.name}} — thanks for your enquiry{{#if context.interest}} about {{context.interest}}{{/if}}. I'll be in touch shortly. Reply STOP to opt out."
+  },
+
+  {
+    "key": "lead.educational.email",
+    "name": "Educational (email)",
+    "description": "The middle of the sequence. Sends something useful and asks for nothing, which is what makes the later ask land.",
+    "channel": "email",
+    "category": "nurture",
+    "format": "TEXT",
+    "subject": "{{#if context.topic}}{{context.topic}}{{else}}Something that might help{{/if}}",
+    "content": "Hi {{recipient.firstName}},\n\n{{context.body}}\n\nNo action needed — I just thought it might be useful{{#if context.interest}} given your interest in {{context.interest}}{{/if}}.\n\n{{sender.displayName}}\n{{tenant.name}}"
+  },
+
+  {
+    "key": "lead.promotional.email",
+    "name": "Promotional (email)",
+    "description": "The only template that carries an offer. Every field of the offer arrives in the event payload — the engine has no promotions table and does not want one (§0.5 Seam D, D12).",
+    "channel": "email",
+    "category": "nurture",
+    "format": "TEXT",
+    "subject": "{{context.offerName}}",
+    "content": "Hi {{recipient.firstName}},\n\n{{context.offerName}}{{#if context.offerDetail}} — {{context.offerDetail}}{{/if}}.\n\n{{#if context.offerEnds}}Available until {{formatDate context.offerEnds}}.\n\n{{/if}}Reply if you'd like to take it up, or ignore this and I won't chase.\n\n{{sender.displayName}}\n{{tenant.name}}"
+  },
+
+  {
+    "key": "lead.reengagement.email",
+    "name": "Re-engagement (email)",
+    "description": "The last message in the sequence, and it says so. A nurture sequence that never admits it is over is the thing that gets a sender marked as spam.",
+    "channel": "email",
+    "category": "nurture",
+    "format": "TEXT",
+    "subject": "Still worth a conversation?",
+    "content": "Hi {{recipient.firstName}},\n\nIt's been a while since you got in touch{{#if context.interest}} about {{context.interest}}{{/if}}, and I don't want to keep landing in your inbox uninvited.\n\nIf it's still worth a conversation, reply and I'll pick it up. If not, no reply needed — this is the last you'll hear from me on it.\n\n{{sender.displayName}}\n{{tenant.name}}"
+  }
+]

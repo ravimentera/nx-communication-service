@@ -1,0 +1,21 @@
+{
+  "key": "lead.sales-review",
+  "name": "Sales manager reviews low-confidence drafts",
+  "mode": "threshold",
+  "confidenceThreshold": 0.85,
+  "approverResolution": {
+    "kind": "role",
+    "role": "sales-manager"
+  },
+  "rights": {
+    "approve": true,
+    "edit": true,
+    "decline": true,
+    "reschedule": true,
+    "bulk": true
+  },
+  "sla": {
+    "deadlineMs": 14400000,
+    "onExpiry": "escalate"
+  }
+}

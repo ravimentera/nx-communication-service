@@ -1,0 +1,18 @@
+{
+  "$comment": "The five LEAD_* values from communication.model.ts:52-56. All five were enum members with a priority declared at :318-322 — and not one of them had a case in the 17-branch handler, so every LEAD_* event a caller sent was logged as unknown and dropped. Here they are playbooks, and an unmatched event is recorded as UNMATCHED rather than reported as a failure (D56).",
+
+  "known": [
+    "LEAD_INITIAL_CONTACT",
+    "LEAD_FOLLOWUP",
+    "LEAD_EDUCATIONAL",
+    "LEAD_PROMOTIONAL",
+    "LEAD_REENGAGEMENT"
+  ],
+
+  "$comment.aliases": "The medspa pack needs aliases because its enum and its switch disagree about eight spellings (D56). Nothing has ever successfully sent a LEAD_* event, so there is no legacy spelling to be compatible with — the shorter names below are for callers who find the enum shouting unpleasant, not for anyone's existing integration.",
+  "aliases": {
+    "LEAD_INITIAL_CONTACT": ["LEAD_CREATED", "LEAD_NEW"],
+    "LEAD_FOLLOWUP": ["LEAD_FOLLOW_UP"],
+    "LEAD_REENGAGEMENT": ["LEAD_RE_ENGAGEMENT", "LEAD_DORMANT"]
+  }
+}

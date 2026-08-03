@@ -1,0 +1,26 @@
+{
+  "$comment": "CAN-SPAM and TCPA only. Compare packs/medspa/compliance.json, which carries PHI patterns and clinical phrase bans — none of which belong here, and several of which would be actively wrong: a sales message SHOULD be able to say 'results' and quote a price. Two verticals, two rulesets, one lint engine.",
+
+  "$comment.merging": "Every installed pack's rules are merged, not just the draft's own — the composition root builds one generator and does not know which pack a given draft came from (docs/PACKS.md). A tenant that installs both packs therefore gets both rulesets, and a false warning from the other vertical costs one human glance. A tenant that installs only this one never sees a HIPAA rule.",
+
+  "prohibitedPhrases": [
+    "guaranteed results",
+    "risk free",
+    "risk-free",
+    "no obligation whatsoever",
+    "act now or lose",
+    "limited time only",
+    "you have been selected",
+    "this is not spam"
+  ],
+
+  "$comment.prohibitedPhrases": "Two families. The first is unsubstantiated-claim language ('guaranteed results', 'risk free') — an FTC problem, not a spam-filter one. The second is the vocabulary that trips spam classifiers regardless of intent; 'this is not spam' is on the list because writing it is the single most reliable way to be treated as spam.",
+
+  "phiPatterns": [],
+  "$comment.phiPatterns": "Empty and staying empty. A lead has not consented to share health information and should never be sending any, so there is nothing here to detect. The engine's own default checks still run underneath this file.",
+
+  "maxLength": {
+    "sms": 320
+  },
+  "$comment.maxLength": "160 characters is one SMS segment; 320 is two, which is the point at which a nurture message is too long for the channel. The engine's defaults apply to every other channel."
+}

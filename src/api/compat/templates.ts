@@ -173,10 +173,15 @@ export function createLegacyTemplateRouter(deps: ContentApiDeps): Router {
       );
     });
 
-  router.post('/campaigns', campaignNotPorted('POST /v1/outreach/trigger'));
-  router.post('/campaigns/follow-up', campaignNotPorted('POST /v1/outreach/trigger'));
-  router.post('/campaigns/educational', campaignNotPorted('POST /v1/outreach/trigger'));
-  router.post('/campaigns/promotional', campaignNotPorted('POST /v1/outreach/trigger'));
+  // P11 built the campaign RUNTIME, so the successor these point at now exists.
+  // What is still missing is what these four endpoints actually did: generate
+  // template copy *with images* (campaign-template-generator.ts:124 builds an
+  // image prompt alongside the body), which needs the image-capable provider
+  // that lands in P12 — see docs/api/BREAKING.md.
+  router.post('/campaigns', campaignNotPorted('POST /v1/campaigns'));
+  router.post('/campaigns/follow-up', campaignNotPorted('POST /v1/campaigns'));
+  router.post('/campaigns/educational', campaignNotPorted('POST /v1/campaigns'));
+  router.post('/campaigns/promotional', campaignNotPorted('POST /v1/campaigns'));
 
   /**
    * Asset upload and image generation are the two things P4 explicitly left

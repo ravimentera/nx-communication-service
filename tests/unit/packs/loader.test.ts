@@ -25,6 +25,48 @@ describe('loading', () => {
     expect(pack.compliance).toBeDefined();
   });
 
+  it('loads the lead-generation pack with no validation errors', () => {
+    // Every file is parsed through Zod with .strict() (D57), so a misspelled
+    // key in a pack file is a load error naming the file rather than a
+    // silently-ignored field that renders the wrong thing forever.
+    expect(packs.errors()).toEqual([]);
+    expect(packs.list()).toContain('lead-generation');
+
+    const pack = packs.get('lead-generation')!;
+    expect(pack.playbooks!).toHaveLength(5);
+    expect(pack.policies!).toHaveLength(1);
+    expect(pack.templates!).toHaveLength(5);
+    expect(pack.prompts.size).toBe(1);
+  });
+
+  it('declares no context provider, which is the pack’s entire point', () => {
+    // A context provider reaches an external service using the ENGINE's
+    // credentials, so it is a security boundary and not a lookup table. The
+    // medspa pack has one because it was extracted from a system that has one;
+    // a generic pack must work with caller-supplied data alone.
+    expect(packs.get('lead-generation')!.manifest!.contextProviders).toEqual([]);
+    expect(packs.get('medspa')!.manifest!.contextProviders).toContain('mentera-patient');
+  });
+
+  it('keeps the two packs’ compliance rules apart', () => {
+    const lead = packs.get('lead-generation')!.compliance!;
+    const medspa = packs.get('medspa')!.compliance!;
+
+    // A sales message must be able to quote a price and say 'results'; a
+    // clinical one must not leak an MRN. Neither ruleset belongs to the other.
+    expect(lead.phiPatterns ?? []).toEqual([]);
+    expect((medspa.phiPatterns ?? []).length).toBeGreaterThan(0);
+    expect(lead.prohibitedPhrases).toContain('guaranteed results');
+  });
+
+  it('ships the AI playbook inactive and the template ones live', () => {
+    // D59: installing a pack must never be the moment a tenant starts sending
+    // model-written messages to strangers.
+    const byKey = new Map(packs.get('lead-generation')!.playbooks!.map((p) => [p.key, p]));
+    expect(byKey.get('lead.followup')!.isActive).toBe(false);
+    expect(byKey.get('lead.initial-contact')!.isActive).not.toBe(false);
+  });
+
   it('strips $comment keys from the rules, as it does from aliases', () => {
     const rules = packs.get('medspa')!.compliance!;
     expect(Object.keys(rules).every((key) => !key.startsWith('$'))).toBe(true);
@@ -33,7 +75,13 @@ describe('loading', () => {
   it('returns every pack’s rules when no id is given', () => {
     // The composition root does not know which pack a draft belongs to, so it
     // merges them all. A warning from the wrong pack costs a human glance.
-    expect(packs.compliance()).toHaveLength(packs.compliance('medspa').length);
+    //
+    // This asserted `=== medspa's length` while medspa was the only pack with a
+    // compliance.json. Two packs now ship one, so the number is 2 — the
+    // behaviour did not change, the arithmetic did.
+    expect(packs.compliance()).toHaveLength(2);
+    expect(packs.compliance('medspa')).toHaveLength(1);
+    expect(packs.compliance('lead-generation')).toHaveLength(1);
     expect(packs.compliance('no-such-pack')).toEqual([]);
   });
 });
