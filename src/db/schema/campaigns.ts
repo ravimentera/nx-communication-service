@@ -138,6 +138,15 @@ export const campaignRecipients = pgTable(
     campaignId: uuid('campaign_id').references(() => campaigns.id, { onDelete: 'cascade' }),
     recipientId: uuid('recipient_id').references(() => recipients.id, { onDelete: 'cascade' }),
     status: text('status').notNull().default('PENDING'),
+    /**
+     * The message this recipient produced (0009). Nullable: a suppressed or
+     * still-pending recipient never gets one, and the P9 backfill migrates
+     * historic rows from a source that had no such link.
+     *
+     * The approval is deliberately NOT duplicated here — `messages.approval_id`
+     * already carries it, and two paths to one fact is how they disagree.
+     */
+    messageId: uuid('message_id'),
     sentAt: ts('sent_at'),
     deliveredAt: ts('delivered_at'),
     error: text('error'),
@@ -148,5 +157,34 @@ export const campaignRecipients = pgTable(
   (t) => [
     index('idx_campaign_recipients_campaign').on(t.campaignId, t.status),
     index('idx_campaign_recipients_recipient').on(t.recipientId),
+  ],
+);
+
+/**
+ * One row per rejected CSV line (0009).
+ *
+ * A table rather than a jsonb column on the audience for the same reason a log
+ * is not a column: a 50,000-row lead list with a bad header maps to 50,000
+ * errors, and those need to be paginated and deleted, not read whole.
+ */
+export const importErrors = pgTable(
+  'import_errors',
+  {
+    id: id(),
+    tenantId: tenantId(),
+    audienceId: uuid('audience_id')
+      .notNull()
+      .references(() => audiences.id, { onDelete: 'cascade' }),
+    /** Groups one upload's errors, so a re-import is not read as a worse one. */
+    importId: uuid('import_id').notNull(),
+    /** 1-based, counting the header, so it matches what the operator sees. */
+    rowNumber: integer('row_number').notNull(),
+    raw: jsonb('raw'),
+    reason: text('reason').notNull(),
+    createdAt: createdAt(),
+    updatedAt: updatedAt(),
+  },
+  (t) => [
+    index('idx_import_errors_audience').on(t.tenantId, t.audienceId, t.importId, t.rowNumber),
   ],
 );
