@@ -18,6 +18,8 @@ import { Client } from 'pg';
 import winston from 'winston';
 
 import { createApp } from '../../../src/app.js';
+import { AudienceService } from '../../../src/engine/campaigns/audience.service.js';
+import { CampaignOrchestrator } from '../../../src/engine/campaigns/orchestrator.js';
 import { loadConfig } from '../../../src/config/index.js';
 import { createDb, type Db } from '../../../src/db/index.js';
 import { ApprovalService } from '../../../src/engine/approvals/approval.service.js';
@@ -243,6 +245,15 @@ export async function startHarness(): Promise<Harness> {
   const recipientDeps = { recipients, preferences, gate };
   const contentDeps = { renderer, store: templateStore, generator, packs };
 
+  // P11. Registered here so the OpenAPI contract test actually SEES the
+  // campaign routes — a harness that omits a dep bundle makes
+  // "documents every registered /v1 route" pass by having nothing to document.
+  const audiences = new AudienceService({ db, logger, recipients });
+  const campaignDeps = {
+    audiences,
+    campaigns: new CampaignOrchestrator({ db, logger, runtime, audiences }),
+  };
+
   const app = createApp({
     config,
     logger,
@@ -256,6 +267,7 @@ export async function startHarness(): Promise<Harness> {
     playbooks: playbookDeps,
     messaging,
     channels,
+    campaigns: campaignDeps,
     mcp: {
       dispatcher,
       queue,

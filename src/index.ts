@@ -46,6 +46,8 @@ import {
 } from './engine/delivery/event-processing-queue.js';
 import { createPlaybookEventProcessor } from './engine/playbooks/event-processor.js';
 import { PlaybookMatcher } from './engine/playbooks/matcher.js';
+import { AudienceService } from './engine/campaigns/audience.service.js';
+import { CampaignOrchestrator } from './engine/campaigns/orchestrator.js';
 import { PlaybookRegistry } from './engine/playbooks/registry.js';
 import { PlaybookRuntime } from './engine/playbooks/runtime.js';
 import {
@@ -330,6 +332,25 @@ async function main(): Promise<void> {
     },
   });
 
+  // ── campaigns (P11) ────────────────────────────────────────────────────────
+  // Constructed after the runtime, because the orchestrator drives generation
+  // through it — the same path a single event takes, so approvals, the
+  // compliance gate and per-recipient throttles apply per message.
+  const audienceService = new AudienceService({
+    db,
+    logger,
+    recipients: recipientService,
+    defaultImportSystem: 'import',
+  });
+  const campaignOrchestrator = new CampaignOrchestrator({
+    db,
+    logger,
+    runtime: runtimeRef.current,
+    audiences: audienceService,
+    concurrency: config.campaigns?.generateConcurrency,
+  });
+
+
   // A pack that failed validation means some playbook silently does not exist.
   // Say so at boot, once, with the paths — not at 3am when a reminder does not
   // arrive.
@@ -364,6 +385,7 @@ async function main(): Promise<void> {
       dispatcher,
     },
     channels: { configs: channelConfigs, dispatcher, queue },
+    campaigns: { campaigns: campaignOrchestrator, audiences: audienceService },
     mcp: {
       dispatcher,
       queue,

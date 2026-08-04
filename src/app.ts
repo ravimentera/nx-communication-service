@@ -9,6 +9,7 @@ import { createCompatMounts, type CompatDeps } from './api/compat/index.js';
 import { createWebhookRouter, type WebhookDeps } from './api/webhooks/index.js';
 import { createMcpRouter, type McpDeps } from './mcp/index.js';
 import { createApprovalRouter, type ApprovalApiDeps } from './api/v1/approvals.js';
+import { createCampaignRouter, type CampaignApiDeps } from './api/v1/campaigns.js';
 import { createChannelRouter, type ChannelApiDeps } from './api/v1/channels.js';
 import { createContentRouter, type ContentApiDeps } from './api/v1/content.js';
 import { createMessagingRouter, type MessagingApiDeps } from './api/v1/messaging.js';
@@ -47,6 +48,8 @@ export interface AppDeps {
   playbooks?: PlaybookApiDeps;
   /** Present from P8 onward. */
   messaging?: MessagingApiDeps;
+  /** Present from P11 onward. */
+  campaigns?: CampaignApiDeps;
   channels?: ChannelApiDeps;
   /** The legacy surface (D60: 110 endpoints, not 77). Absent in /v1-only tests. */
   compat?: CompatDeps;
@@ -169,6 +172,9 @@ export function createApp(deps: AppDeps): Express {
   }
   if (deps.channels) {
     app.use('/v1', createChannelRouter(deps.channels));
+  }
+  if (deps.campaigns) {
+    app.use('/v1', createCampaignRouter(deps.campaigns));
   }
 
   // (5) The legacy surface, LAST — so a `/v1` path can never be shadowed by a
