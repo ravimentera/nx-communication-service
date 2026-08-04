@@ -1307,6 +1307,259 @@ paths:
           description: The database is unreachable.
           content: { application/json: { schema: { type: object, additionalProperties: true } } }
 
+  # ── campaigns and audiences (P11) ──────────────────────────────────────────
+  /v1/audiences:
+    get:
+      operationId: getAudiences
+      tags: [campaigns]
+      summary: List audiences
+      responses:
+        '200':
+          description: Every audience this tenant owns.
+          content: { application/json: { schema: { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Audience' } } } } } }
+    post:
+      operationId: createAudience
+      tags: [campaigns]
+      summary: Create an audience
+      description: >
+        `static` membership is authored; `query` is re-derived from a bounded
+        predicate at materialize time; `accumulating` is appended to by
+        playbooks. An unknown field or operator in `definition` is rejected here
+        rather than silently matching nobody.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/AudienceCreate' } } }
+      responses:
+        '201':
+          description: Created.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Audience' } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /v1/audiences/{id}:
+    get:
+      operationId: getAudienceById
+      tags: [campaigns]
+      summary: Get one audience
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: The audience.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Audience' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/audiences/{id}/members:
+    post:
+      operationId: addAudienceMembers
+      tags: [campaigns]
+      summary: Add existing recipients to an audience
+      description: >
+        Idempotent — the composite key makes a repeated add a no-op. Recipient
+        ids belonging to another tenant are not added and are not reported
+        individually, because saying which ones exist would confirm their
+        existence to someone who should not know.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/AudienceMembers' } } }
+      responses:
+        '200':
+          description: How many were added.
+          content: { application/json: { schema: { type: object, properties: { added: { type: integer } } } } }
+    delete:
+      operationId: removeAudienceMembers
+      tags: [campaigns]
+      summary: Remove recipients from an audience
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/AudienceMembers' } } }
+      responses:
+        '200':
+          description: How many were removed.
+          content: { application/json: { schema: { type: object, properties: { removed: { type: integer } } } } }
+
+  /v1/audiences/{id}/import:
+    post:
+      operationId: importAudienceRows
+      tags: [campaigns]
+      summary: Import rows, creating recipients as it goes
+      description: >
+        Validation is per row, not per file: one malformed line costs that line
+        and lands in the import-errors report with its line number. Re-importing
+        the same list is safe — recipients are upserted by external ref — and a
+        row already in the audience is reported as `skipped`, not `imported`.
+        **This is the bounded path**, limited by the JSON body size; streamed
+        multipart upload arrives with the storage adapter in P12.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/AudienceImport' } } }
+      responses:
+        '200':
+          description: Every row imported cleanly.
+          content: { application/json: { schema: { $ref: '#/components/schemas/ImportResult' } } }
+        '207':
+          description: Imported with rejects. Read them from the import-errors report.
+          content: { application/json: { schema: { $ref: '#/components/schemas/ImportResult' } } }
+
+  /v1/audiences/{id}/import-errors:
+    get:
+      operationId: getAudienceImportErrors
+      tags: [campaigns]
+      summary: The rejected rows of an import, by line number
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+        - { name: importId, in: query, schema: { type: string, format: uuid } }
+        - { name: limit, in: query, schema: { type: integer, default: 200 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        '200':
+          description: The report.
+          content: { application/json: { schema: { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/ImportError' } } } } } }
+
+  /v1/audiences/{id}/materialize:
+    post:
+      operationId: materializeAudience
+      tags: [campaigns]
+      summary: Re-derive a query audience's membership
+      description: >
+        A no-op for `static` and `accumulating` audiences — their membership is
+        the authored answer, and recomputing it would drop everyone a human
+        added. They return their current count rather than an error.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: The resulting member count.
+          content: { application/json: { schema: { type: object, properties: { count: { type: integer } } } } }
+
+  /v1/campaigns:
+    get:
+      operationId: getCampaigns
+      tags: [campaigns]
+      summary: List campaigns
+      responses:
+        '200':
+          description: Every campaign this tenant owns.
+          content: { application/json: { schema: { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Campaign' } } } } } }
+    post:
+      operationId: createCampaign
+      tags: [campaigns]
+      summary: Create a campaign
+      description: >
+        A campaign is a playbook plus an audience plus a schedule. `context` is
+        merged into every recipient's trigger payload and is subject to the
+        playbook's data contract — a field the contract does not declare renders
+        empty rather than leaking.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/CampaignCreate' } } }
+      responses:
+        '201':
+          description: Created, in DRAFT.
+          content: { application/json: { schema: { type: object, properties: { id: { type: string, format: uuid } } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/campaigns/{id}:
+    get:
+      operationId: getCampaignById
+      tags: [campaigns]
+      summary: Get one campaign
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: The campaign.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Campaign' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/campaigns/{id}/stats:
+    get:
+      operationId: getCampaignStats
+      tags: [campaigns]
+      summary: Per-status counts and engagement
+      description: >
+        Engagement joins through the message each recipient produced. One
+        analytics row per message is guaranteed by the schema, so opens and
+        clicks cannot double-count.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: The roll-up.
+          content: { application/json: { schema: { $ref: '#/components/schemas/CampaignStats' } } }
+
+  /v1/campaigns/{id}/recipients:
+    get:
+      operationId: getCampaignRecipients
+      tags: [campaigns]
+      summary: Per-recipient outcome
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+        - { name: status, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 100 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        '200':
+          description: A page of recipients and what happened to each.
+          content: { application/json: { schema: { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/CampaignRecipient' } } } } } }
+
+  /v1/campaigns/{id}/launch:
+    post:
+      operationId: launchCampaign
+      tags: [campaigns]
+      summary: Expand the audience and start generating
+      description: >
+        **202, not 200.** Every recipient is recorded as PENDING before the
+        response is written, and generation continues after it — a large
+        campaign is minutes of model calls, and a request that waits for it is a
+        request that times out while the work carries on invisibly. Poll
+        `/stats`. Relaunching a COMPLETED or CANCELLED campaign is a 409.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '202':
+          description: Accepted; expansion is done and generation is running.
+          content: { application/json: { schema: { type: object, properties: { expanded: { type: integer }, batchId: { type: string, format: uuid } } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/campaigns/{id}/pause:
+    post:
+      operationId: pauseCampaign
+      tags: [campaigns]
+      summary: Stop generating, keeping the remaining recipients PENDING
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: Paused.
+          content: { application/json: { schema: { type: object, properties: { status: { type: string } } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/campaigns/{id}/resume:
+    post:
+      operationId: resumeCampaign
+      tags: [campaigns]
+      summary: Continue a paused campaign from where it stopped
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '202':
+          description: Accepted; generation is running again.
+          content: { application/json: { schema: { type: object, properties: { status: { type: string } } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/campaigns/{id}/cancel:
+    post:
+      operationId: cancelCampaign
+      tags: [campaigns]
+      summary: Stop generating and cancel everyone not yet generated
+      description: >
+        **Messages already handed to the queue are NOT recalled** — the delivery
+        port has no job removal. Everything not yet generated is cancelled, and
+        the response says how many that was rather than implying the campaign
+        was stopped dead.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: Cancelled, with the count that was stopped before generation.
+          content: { application/json: { schema: { type: object, properties: { status: { type: string }, cancelled: { type: integer }, note: { type: string } } } } }
+        '409': { $ref: '#/components/responses/Conflict' }
+
 components:
   securitySchemes:
     gatewayIdentity:
@@ -1348,6 +1601,9 @@ components:
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     NotFound:
       description: No such resource in this tenant.
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Conflict:
+      description: The resource is not in a state that allows this.
       content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
     BadSignature:
       description: The provider signature did not verify. Nothing was written.
@@ -1612,6 +1868,166 @@ components:
         total: { type: integer }
         page: { type: integer }
         pageSize: { type: integer }
+
+    Audience:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        tenantId: { type: string }
+        name: { type: string }
+        kind: { type: string, enum: [static, query, accumulating] }
+        definition: { $ref: '#/components/schemas/AudienceDefinition' }
+        memberCount: { type: integer }
+        lastMaterializedAt: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    AudienceDefinition:
+      type: object
+      description: >
+        A bounded predicate, not a DSL. Fields are `status`, `locale`,
+        `timezone`, `subTenantId` or `attributes.<key>`; operators are the same
+        seven a playbook trigger uses. Anything else is rejected at create time.
+      properties:
+        where:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              eq: {}
+              neq: {}
+              in: { type: array, items: {} }
+              nin: { type: array, items: {} }
+              gt: {}
+              lt: {}
+              exists: { type: boolean }
+      example:
+        where: { status: { eq: active }, 'attributes.budgetBand': { in: [high, mid] } }
+
+    AudienceCreate:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        kind: { type: string, enum: [static, query, accumulating], default: static }
+        definition: { $ref: '#/components/schemas/AudienceDefinition' }
+
+    AudienceMembers:
+      type: object
+      required: [recipientIds]
+      properties:
+        recipientIds: { type: array, minItems: 1, items: { type: string, format: uuid } }
+        source: { type: string, description: How the membership arose, for audit. }
+
+    AudienceImport:
+      type: object
+      required: [rows]
+      properties:
+        system:
+          type: string
+          description: >
+            The `external_ref.system` these ids are keyed under. Per import, not
+            global — two CSVs from two CRMs must not collide on id `1`.
+        rows:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/ImportRow' }
+
+    ImportRow:
+      type: object
+      required: [externalId]
+      description: >
+        `externalId` is what makes a re-import idempotent. A row needs at least
+        one of `email` or `phone`, or nothing can be sent to it.
+      properties:
+        externalId: { type: string }
+        email: { type: string }
+        phone: { type: string }
+        displayName: { type: string }
+        firstName: { type: string }
+        lastName: { type: string }
+        locale: { type: string }
+        timezone: { type: string }
+        attributes: { type: object, additionalProperties: true }
+
+    ImportResult:
+      type: object
+      properties:
+        importId: { type: string, format: uuid }
+        imported: { type: integer, description: Memberships actually created. }
+        skipped: { type: integer, description: Valid rows already in the audience. }
+        errors: { type: integer }
+
+    ImportError:
+      type: object
+      properties:
+        rowNumber: { type: integer, description: 1-based and counting the header, so it matches the spreadsheet. }
+        reason: { type: string }
+        raw: { type: object, additionalProperties: true }
+
+    Campaign:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        tenantId: { type: string }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        type: { type: string }
+        status: { type: string, enum: [DRAFT, QUEUED, PROCESSING, PAUSED, COMPLETED, CANCELLED] }
+        playbookId: { type: string, format: uuid, nullable: true }
+        audienceId: { type: string, format: uuid, nullable: true }
+        senderId: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    CampaignCreate:
+      type: object
+      required: [name, playbookKey, audienceId]
+      properties:
+        name: { type: string }
+        description: { type: string }
+        type: { type: string }
+        playbookKey: { type: string, description: Must be installed for this tenant. }
+        audienceId: { type: string, format: uuid }
+        senderId: { type: string }
+        context:
+          type: object
+          additionalProperties: true
+          description: >
+            Merged into every recipient's trigger payload, then validated
+            against the playbook's data contract — an undeclared field renders
+            empty rather than leaking.
+        schedule:
+          type: object
+          properties: { sendAt: { type: string, format: date-time } }
+        metadata: { type: object, additionalProperties: true }
+
+    CampaignStats:
+      type: object
+      properties:
+        campaignId: { type: string, format: uuid }
+        status: { type: string }
+        total: { type: integer }
+        byStatus: { type: object, additionalProperties: { type: integer } }
+        sent: { type: integer }
+        delivered: { type: integer }
+        opened: { type: integer }
+        clicked: { type: integer }
+        replied: { type: integer }
+        suppressed: { type: integer }
+        failed: { type: integer }
+
+    CampaignRecipient:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        recipientId: { type: string, format: uuid, nullable: true }
+        status:
+          type: string
+          enum: [PENDING, PENDING_APPROVAL, QUEUED, SENT, SUPPRESSED, SKIPPED, FAILED, CANCELLED]
+        messageId: { type: string, format: uuid, nullable: true }
+        error: { type: string, nullable: true }
+        sentAt: { type: string, format: date-time, nullable: true }
 
     Preferences:
       type: object
