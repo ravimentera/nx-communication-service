@@ -146,6 +146,31 @@ describe('migrations apply cleanly', () => {
   });
 });
 
+describe('the platform tenant (0011)', () => {
+  it('seeds exactly one, marked reserved', async () => {
+    const { rows } = await client.query(
+      `SELECT name, timezone, settings->>'engineReserved' AS reserved
+       FROM tenants WHERE id = 'platform'`,
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ name: 'Platform', timezone: 'UTC', reserved: 'true' });
+  });
+
+  it('refuses to run when a migrated medspa already holds the id', async () => {
+    // 0011 applies before 9002, so the collision this guards against shows up as
+    // 9002 silently skipping a medspa and its mail sharing the platform tenant.
+    await client.query('BEGIN');
+    try {
+      await client.query(`UPDATE tenants SET settings = '{}'::jsonb WHERE id = 'platform'`);
+      await expect(
+        client.query(readFileSync(join(MIGRATIONS_DIR, '0011_platform_tenant.sql'), 'utf8')),
+      ).rejects.toThrow(/almost certainly a migrated medspa/);
+    } finally {
+      await client.query('ROLLBACK');
+    }
+  });
+});
+
 describe('Rule 4 — every table is tenant-scoped', () => {
   it('gives every table a tenant_id, except tenants and packs', async () => {
     const { rows } = await client.query<{ table_name: string }>(
