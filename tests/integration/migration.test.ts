@@ -221,19 +221,26 @@ async function seedSource(): Promise<void> {
 
     -- Two rows for one (medspa, patient): the newer one wins. The third has no
     -- patient_id and cannot be keyed to a recipient at all.
+    -- The opt-in flags vary across the two competing rows, and the winner holds
+    -- a false and a NULL, so 0010's ADD COLUMN ... DEFAULT true cannot pass for
+    -- a faithful load.
     INSERT INTO communication_preferences
       (id, user_id, patient_id, medspa_id, allow_communications, preferred_channels,
        preferred_frequency, quiet_hours_start, quiet_hours_end, contact_info,
+       email_opt_in, sms_opt_in, push_opt_in, voice_opt_in, direct_mail_opt_in,
        created_at, updated_at)
     VALUES
       ('dddd1111-0000-0000-0000-000000000001', 'user-1', 'patient-1', 'medspa-a', true,
        ARRAY['EMAIL'], 'MODERATE', '21:00', '08:00',
-       '{"email":"old@example.com"}'::json, ${day(70)}, ${day(70)}),
+       '{"email":"old@example.com"}'::json,
+       true, true, true, true, true, ${day(70)}, ${day(70)}),
       ('dddd1111-0000-0000-0000-000000000002', 'user-1', 'patient-1', 'medspa-a', false,
        ARRAY['SMS'], 'LOW', '22:00', '07:00',
-       '{"email":"jane@example.com","phone":"+15550001"}'::json, ${day(70)}, ${day(10)}),
+       '{"email":"jane@example.com","phone":"+15550001"}'::json,
+       false, true, NULL, false, true, ${day(70)}, ${day(10)}),
       ('dddd1111-0000-0000-0000-000000000003', 'user-2', NULL, 'medspa-a', true,
-       NULL, 'MODERATE', NULL, NULL, '{}'::json, ${day(70)}, ${day(70)});
+       NULL, 'MODERATE', NULL, NULL, '{}'::json,
+       NULL, NULL, NULL, NULL, NULL, ${day(70)}, ${day(70)});
 
     -- b1 has an event and so has a tenant; b2 has neither.
     INSERT INTO communication_batches (id, name, status, event_count, success_count, failure_count, created_at)
@@ -509,6 +516,25 @@ describe('preferences', () => {
       // New column: the source resolved the zone at check time from a config
       // lookup, so it is written down here instead (D38, D39).
       quiet_hours_timezone: 'America/Los_Angeles',
+    });
+  });
+
+  it('carries the five display-only opt-in flags across verbatim', async () => {
+    const { rows } = await target.query(
+      `SELECT email_opt_in, sms_opt_in, push_opt_in, voice_opt_in, direct_mail_opt_in
+       FROM recipient_preferences`,
+    );
+    expect(rows).toHaveLength(1);
+    // The winning row's values, not the losing row's and not the column default.
+    // push_opt_in in particular must stay NULL: 0010 adds these columns with
+    // DEFAULT true, and a load that let the default stand would report true here
+    // for a source that never said so.
+    expect(rows[0]).toEqual({
+      email_opt_in: false,
+      sms_opt_in: true,
+      push_opt_in: null,
+      voice_opt_in: false,
+      direct_mail_opt_in: true,
     });
   });
 

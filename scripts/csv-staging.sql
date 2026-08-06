@@ -108,7 +108,12 @@ CREATE TABLE IF NOT EXISTS src.communication_preferences (
   preferred_channels text[], preferred_language text, preferred_frequency text,
   preferred_time_of_day text, quiet_hours_start text, quiet_hours_end text,
   contact_info json, created_at timestamp, updated_at timestamp,
-  updated_by text, metadata json
+  updated_by text, metadata json,
+  -- Display-only flags 9006 carries through for FE parity. Present here because
+  -- this transport declares columns explicitly, unlike the FDW path where
+  -- IMPORT FOREIGN SCHEMA ... LIMIT TO restricts tables and not columns.
+  email_opt_in boolean, sms_opt_in boolean, push_opt_in boolean,
+  voice_opt_in boolean, direct_mail_opt_in boolean
 );
 
 CREATE TABLE IF NOT EXISTS src.communication_batches (

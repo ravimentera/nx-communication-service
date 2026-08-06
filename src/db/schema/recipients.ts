@@ -113,6 +113,17 @@ export const recipientPreferences = pgTable(
     quietHoursTimezone: text('quiet_hours_timezone'),
     /** Playbook keys this recipient has opted out of. */
     eventOptOuts: text('event_opt_outs').array().notNull().default(sql`'{}'::text[]`),
+    /**
+     * Display-only, carried from the source so Seam B can drop patient-service's
+     * JOIN without removing a field the FE renders. Nothing reads these for
+     * consent — `allowCommunications` and `preferredChannels` do that — and
+     * nothing has ever written them in either system. See `0010_recipient_optins.sql`.
+     */
+    emailOptIn: boolean('email_opt_in').default(true),
+    smsOptIn: boolean('sms_opt_in').default(true),
+    pushOptIn: boolean('push_opt_in').default(true),
+    voiceOptIn: boolean('voice_opt_in').default(true),
+    directMailOptIn: boolean('direct_mail_opt_in').default(true),
     unsubscribeToken: text('unsubscribe_token'),
     contactInfo: jsonb('contact_info'),
     metadata: jsonb('metadata'),

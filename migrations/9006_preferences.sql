@@ -52,6 +52,7 @@ ins AS (
     preferred_frequency, preferred_time_of_day,
     quiet_hours_start, quiet_hours_end, quiet_hours_timezone,
     event_opt_outs, unsubscribe_token, contact_info, metadata, updated_by,
+    email_opt_in, sms_opt_in, push_opt_in, voice_opt_in, direct_mail_opt_in,
     created_at, updated_at
   )
   SELECT l.id, l.medspa_id, l.location_id,
@@ -72,6 +73,10 @@ ins AS (
          -- migrated placeholder would collide with the UNIQUE constraint.
          NULL,
          l.contact_info::jsonb, l.metadata::jsonb, l.updated_by,
+         -- Display-only flags, carried verbatim including NULLs. Nothing in
+         -- either system reads them; the FE renders them and Seam B removes the
+         -- JOIN that used to supply them. See 0010_recipient_optins.sql.
+         l.email_opt_in, l.sms_opt_in, l.push_opt_in, l.voice_opt_in, l.direct_mail_opt_in,
          COALESCE(mig.to_tz(l.created_at), now()), COALESCE(mig.to_tz(l.updated_at), now())
   FROM latest l
   LEFT JOIN tenants t ON t.id = l.medspa_id
@@ -104,6 +109,13 @@ ins AS (
     contact_info          = EXCLUDED.contact_info,
     metadata              = EXCLUDED.metadata,
     updated_by            = EXCLUDED.updated_by,
+    -- Included so a re-run repairs rows loaded before 0010 added these columns:
+    -- those took the ADD COLUMN default of true rather than the source's value.
+    email_opt_in          = EXCLUDED.email_opt_in,
+    sms_opt_in            = EXCLUDED.sms_opt_in,
+    push_opt_in           = EXCLUDED.push_opt_in,
+    voice_opt_in          = EXCLUDED.voice_opt_in,
+    direct_mail_opt_in    = EXCLUDED.direct_mail_opt_in,
     updated_at            = EXCLUDED.updated_at
   RETURNING 1
 )
