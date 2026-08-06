@@ -327,6 +327,33 @@ paths:
           description: The stored preferences.
           content: { application/json: { schema: { $ref: '#/components/schemas/Preferences' } } }
 
+  /v1/recipients/by-external-ref/{system}/{externalId}/preferences:
+    get:
+      operationId: getRecipientPreferencesByExternalRef
+      tags: [recipients]
+      summary: Get communication preferences by the caller's own identifier
+      description: >
+        For callers that hold their own id rather than the engine's — patient-service
+        knows a patient id, not a recipient uuid (§0.5 Seam B). An unknown recipient
+        is 404; a known one with nothing expressed is 200 with the defaults.
+      parameters:
+        - name: system
+          in: path
+          required: true
+          schema: { type: string }
+          description: The external system, e.g. `mentera-patient`.
+        - name: externalId
+          in: path
+          required: true
+          schema: { type: string }
+          description: That system's identifier for the recipient.
+      responses:
+        '200':
+          description: The preferences.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Preferences' } } }
+        '404':
+          description: No recipient with that external reference in this tenant.
+
   /v1/recipients/{id}/unsubscribe-url:
     get:
       operationId: getRecipientsByIdUnsubscribeUrl

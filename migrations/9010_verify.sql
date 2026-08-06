@@ -52,7 +52,13 @@ BEGIN
           UNION SELECT medspa_id FROM src.campaigns                WHERE medspa_id IS NOT NULL
           UNION SELECT medspa_id FROM src.communication_templates  WHERE medspa_id IS NOT NULL
           UNION SELECT medspa_id FROM src.provider_configurations  WHERE medspa_id IS NOT NULL) u),
-       (SELECT count(*) FROM tenants), 'FAIL'),
+       -- Engine-reserved tenants are excluded: they have no counterpart in the
+       -- source, by definition. `platform` (0011) exists so that identity-level
+       -- mail — email verification, password reset — has a tenant to send under,
+       -- and counting it here would report a one-row surplus and FAIL a
+       -- migration that is in fact correct.
+       (SELECT count(*) FROM tenants
+        WHERE COALESCE(settings->>'engineReserved', 'false') <> 'true'), 'FAIL'),
 
       ('tenant_channel_configs',
        (SELECT count(*) FROM src.medspa_configurations WHERE medspa_id IS NOT NULL),

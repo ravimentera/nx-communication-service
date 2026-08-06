@@ -396,7 +396,14 @@ describe('the 9xxx series never writes to the source', () => {
 
 describe('tenants and sub-tenants', () => {
   it('creates a tenant for the configured medspa and for the one only messages mention', async () => {
-    const { rows } = await target.query(`SELECT id, name, timezone FROM tenants ORDER BY id`);
+    // The reserved `platform` tenant (0011) is excluded: it is engine
+    // scaffolding for tenant-less identity mail and has no source counterpart.
+    // `mig.verify()` excludes it from the tenant count for the same reason.
+    const { rows } = await target.query(
+      `SELECT id, name, timezone FROM tenants
+       WHERE COALESCE(settings->>'engineReserved', 'false') <> 'true'
+       ORDER BY id`,
+    );
     expect(rows.map((r) => r.id)).toEqual(['medspa-a', 'medspa-b']);
     expect(rows[0]).toMatchObject({ name: 'Clinic A', timezone: 'America/Los_Angeles' });
     // Invented tenants take the source's own default zone, not the schema's UTC:

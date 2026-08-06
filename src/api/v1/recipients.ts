@@ -117,6 +117,40 @@ export function createRecipientRouter(deps: RecipientApiDeps): Router {
     }),
   );
 
+  /**
+   * Preferences by the caller's own identifier, rather than the engine's.
+   *
+   * §0.5 Seam B. patient-service used to LEFT JOIN `communication_preferences`
+   * onto every patient lookup and hand the row to the FE; the engine owns that
+   * table now, and patient-service knows a patient id, not a recipient uuid.
+   *
+   * Five path segments, so it cannot be confused with `/recipients/:id` or
+   * `/recipients/:id/preferences` — those are two and three.
+   *
+   * An unknown recipient is 404, but a *known* recipient who has expressed no
+   * preferences is 200 with the defaults, the same as the by-id route. The
+   * distinction matters to the caller: the first means "wrong id", the second
+   * means "no opinion recorded", and collapsing them would make a patient with
+   * no preference row indistinguishable from a lookup bug.
+   */
+  router.get(
+    '/recipients/by-external-ref/:system/:externalId/preferences',
+    handle(async (req, res) => {
+      const scope = requireTenant(req);
+      const recipient = await deps.recipients.getByExternalRef(scope, {
+        system: req.params.system as string,
+        id: req.params.externalId as string,
+      });
+      if (!recipient) {
+        throw new NotFoundError(
+          `No recipient for ${req.params.system}:${req.params.externalId}`,
+        );
+      }
+      const prefs = await deps.preferences.get(scope, recipient.id);
+      res.json(prefs ?? { recipientId: recipient.id, allowCommunications: true });
+    }),
+  );
+
   router.put(
     '/recipients/:id/preferences',
     handle(async (req, res) => {
