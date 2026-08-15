@@ -111,9 +111,34 @@ export interface EnqueueOptions {
  * does not have, so any caller using the mock's API breaks the moment the queue
  * is enabled.
  */
+/**
+ * What a recall achieved. Three outcomes, because they mean different things to
+ * the caller and collapsing them would be a lie:
+ *
+ *   removed   the job is gone and will not send
+ *   inFlight  a worker already has it — it is sending, or about to
+ *   notFound  never queued, already completed, or aged out of the queue
+ *
+ * `inFlight` is the honest limit of a recall. Once a worker holds the lock the
+ * provider call may already be in progress, and there is no point at which a
+ * distributed queue can promise otherwise. A caller that reports "cancelled"
+ * without accounting for these is telling somebody their message did not go out
+ * when it did.
+ */
+export interface RemoveResult {
+  removed: string[];
+  inFlight: string[];
+  notFound: string[];
+}
+
 export interface NotificationQueue {
   enqueue(job: Omit<SendJob, 'attempt'>, options?: EnqueueOptions): Promise<EnqueueResult>;
   enqueueMany(jobs: Omit<SendJob, 'attempt'>[], options?: EnqueueOptions): Promise<EnqueueResult[]>;
+  /**
+   * Recall queued jobs that have not started. Added in P12 — until then
+   * `cancel` stopped generation and left anything already queued to send (D83).
+   */
+  remove(jobIds: string[]): Promise<RemoveResult>;
   stats(): Promise<Record<string, number>>;
   close(): Promise<void>;
 }
@@ -242,6 +267,56 @@ export class BullNotificationQueue implements NotificationQueue {
     return added.map((j) => ({ queued: true, jobId: j.id }));
   }
 
+  /**
+   * Remove by job id, one at a time and tolerantly.
+   *
+   * Not `queue.removeJobs(pattern)`: that matches on job NAME, and this queue's
+   * names are `send-<channel>-<messageId>` — a pattern broad enough to catch one
+   * message is broad enough to catch a sibling. Ids are exact.
+   *
+   * A job a worker already holds cannot be removed; BullMQ throws rather than
+   * silently succeeding, and that error is the signal, not a failure. It is
+   * reported as `inFlight` so the caller can say so.
+   */
+  async remove(jobIds: string[]): Promise<RemoveResult> {
+    const result: RemoveResult = { removed: [], inFlight: [], notFound: [] };
+
+    for (const jobId of jobIds) {
+      try {
+        const job = await this.queue.getJob(jobId);
+        if (!job) {
+          result.notFound.push(jobId);
+          continue;
+        }
+        // Checked before removing so the common case reports accurately; the
+        // catch below still covers the race where it becomes active in between.
+        if (await job.isActive()) {
+          result.inFlight.push(jobId);
+          continue;
+        }
+        await job.remove();
+        result.removed.push(jobId);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        // "could not be removed because it is locked by another worker"
+        if (/locked|could not be removed/i.test(message)) {
+          result.inFlight.push(jobId);
+        } else {
+          this.deps.logger.warn('failed to remove send job', { jobId, error: message });
+          result.notFound.push(jobId);
+        }
+      }
+    }
+
+    this.deps.logger.info('send jobs recalled', {
+      requested: jobIds.length,
+      removed: result.removed.length,
+      inFlight: result.inFlight.length,
+      notFound: result.notFound.length,
+    });
+    return result;
+  }
+
   async stats(): Promise<Record<string, number>> {
     const [waiting, active, completed, failed, delayed] = await Promise.all([
       this.queue.getWaitingCount(),
@@ -292,6 +367,11 @@ export class DisabledNotificationQueue implements NotificationQueue {
     options?: EnqueueOptions,
   ): Promise<EnqueueResult[]> {
     return Promise.all(jobs.map((job) => this.enqueue(job, options)));
+  }
+
+  /** Nothing was ever queued, so nothing can be recalled. */
+  async remove(jobIds: string[]): Promise<RemoveResult> {
+    return { removed: [], inFlight: [], notFound: [...jobIds] };
   }
 
   async stats(): Promise<Record<string, number>> {

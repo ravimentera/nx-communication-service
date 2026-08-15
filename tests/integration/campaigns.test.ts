@@ -22,7 +22,7 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 import { Client } from 'pg';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import winston from 'winston';
@@ -85,12 +85,21 @@ const channels: ChannelRegistry = {
   list: () => ['email' as ChannelType],
 };
 
+/** Job ids the fake queue should refuse to remove, standing in for a worker
+ *  that already holds the lock. */
+const lockedJobs = new Set<string>();
+
 const queue: NotificationQueue = {
   enqueue: async (job) => {
     sent.push({ messageId: job.messageId });
     return { queued: true, jobId: `job-${sent.length}` };
   },
   enqueueMany: async (jobs) => jobs.map(() => ({ queued: true })),
+  remove: async (jobIds) => ({
+    removed: jobIds.filter((id) => !lockedJobs.has(id)),
+    inFlight: jobIds.filter((id) => lockedJobs.has(id)),
+    notFound: [],
+  }),
   stats: async () => ({}),
   close: async () => {},
 };
@@ -171,7 +180,7 @@ beforeAll(async () => {
   });
 
   audiences = new AudienceService({ db, logger, recipients: new RecipientService({ db, logger }) });
-  campaigns = new CampaignOrchestrator({ db, logger, runtime, audiences, concurrency: 3 });
+  campaigns = new CampaignOrchestrator({ db, logger, runtime, audiences, concurrency: 3, queue });
 
   // ── the playbook a campaign targets, and a decoy that must never fire ──────
   const [policy] = await db
@@ -458,6 +467,96 @@ describe('the orchestrator', () => {
     // PENDING — a cancelled campaign must not resume later.
     expect(rows.every((r) => r.status !== 'PENDING')).toBe(true);
     expect((await campaigns.stats(scope, campaignId)).status).toBe('CANCELLED');
+  });
+
+  it('recalls generated messages still sitting in the queue', async () => {
+    // The D83 hole: before P12, generation stopped but anything already handed
+    // to the queue went out regardless, and `cancel` did not say so.
+    const { campaignId } = await campaignOver(['r1@example.test', 'r2@example.test'], 'recall');
+    // `await: true` — the default is fire-and-forget, and cancelling before
+    // generation finishes tests the P11 path, not this one.
+    await campaigns.launch(scope, campaignId, { await: true });
+
+    // This campaign's messages only. Other tests in this suite leave their own
+    // QUEUED rows behind, and a tenant-wide count would silently include them.
+    const before = await db
+      .select({ id: messages.id })
+      .from(campaignRecipients)
+      .innerJoin(messages, eq(messages.id, campaignRecipients.messageId))
+      .where(
+        and(
+          eq(campaignRecipients.tenantId, TENANT),
+          eq(campaignRecipients.campaignId, campaignId),
+          eq(messages.status, 'QUEUED'),
+        ),
+      );
+    expect(before.length).toBeGreaterThan(0);
+
+    const result = await campaigns.cancel(scope, campaignId);
+
+    expect(result.recalled).toBe(before.length);
+    expect(result.alreadySending).toBe(0);
+
+    const after = await db
+      .select({ status: messages.status })
+      .from(messages)
+      .where(
+        and(
+          eq(messages.tenantId, TENANT),
+          inArray(
+            messages.id,
+            before.map((m) => m.id),
+          ),
+        ),
+      );
+    // Recalled means it will not send, and the row has to say so — leaving it
+    // QUEUED would read as "still going out".
+    expect(after.every((m) => m.status === 'CANCELLED')).toBe(true);
+  });
+
+  it('reports a message a worker already holds instead of claiming it stopped it', async () => {
+    const { campaignId } = await campaignOver(['flight@example.test'], 'inflight');
+    await campaigns.launch(scope, campaignId, { await: true });
+
+    const queued = await db
+      .select({ jobId: sql<string>`${messages.metadata}->>'jobId'` })
+      .from(campaignRecipients)
+      .innerJoin(messages, eq(messages.id, campaignRecipients.messageId))
+      .where(
+        and(
+          eq(campaignRecipients.tenantId, TENANT),
+          eq(campaignRecipients.campaignId, campaignId),
+          eq(messages.status, 'QUEUED'),
+        ),
+      );
+    const jobIds = queued.map((q) => q.jobId).filter(Boolean);
+    expect(jobIds.length).toBeGreaterThan(0);
+    jobIds.forEach((id) => lockedJobs.add(id));
+
+    try {
+      const result = await campaigns.cancel(scope, campaignId);
+
+      // The honest limit of a recall. Claiming these were cancelled would tell
+      // an operator a message did not go out when it may well have.
+      expect(result.alreadySending).toBe(jobIds.length);
+      expect(result.recalled).toBe(0);
+
+      const rows = await db
+        .select({ status: messages.status })
+        .from(campaignRecipients)
+        .innerJoin(messages, eq(messages.id, campaignRecipients.messageId))
+        .where(
+          and(
+            eq(campaignRecipients.tenantId, TENANT),
+            eq(campaignRecipients.campaignId, campaignId),
+          ),
+        );
+      // Left QUEUED, not marked CANCELLED: the worker owns the outcome now, and
+      // it will report what actually happened.
+      expect(rows.every((r) => r.status === 'QUEUED')).toBe(true);
+    } finally {
+      lockedJobs.clear();
+    }
   });
 
   it('refuses a campaign whose playbook the tenant does not have', async () => {

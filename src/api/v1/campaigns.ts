@@ -271,10 +271,14 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
   );
 
   /**
-   * Stops generation and cancels every recipient not yet generated. It does NOT
-   * recall messages already handed to the queue — the delivery port has no
-   * removal (D83). The response says how many were actually cancelled rather
-   * than implying the whole campaign was stopped dead.
+   * Stops generation, cancels every recipient not yet generated, and recalls
+   * generated messages still waiting in the queue (P12; the delivery port had no
+   * removal until then — D83).
+   *
+   * The response reports three numbers because they are three different
+   * outcomes, and `alreadySending` is the one an operator needs: those messages
+   * were with a worker when the cancel landed and may well have gone out. There
+   * is no point at which a distributed queue can promise otherwise.
    */
   router.post(
     '/campaigns/:id/cancel',
@@ -284,7 +288,10 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
       res.json({
         status: 'CANCELLED',
         ...result,
-        note: 'Messages already queued are not recalled; anything not yet generated is cancelled.',
+        note:
+          result.alreadySending > 0
+            ? `${result.alreadySending} message(s) were already being sent and could not be recalled.`
+            : 'Nothing was in flight; every generated message still queued was recalled.',
       });
     }),
   );

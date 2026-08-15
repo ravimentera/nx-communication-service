@@ -74,7 +74,7 @@
  * 10,000-recipient campaign that is 200 in leaves 9,800 ungenerated and at most
  * a few in flight.
  */
-import { and, eq, sql, type SQL } from 'drizzle-orm';
+import { and, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import type { Logger } from 'winston';
 
 import type { Db } from '../../db/index.js';
@@ -90,6 +90,7 @@ import { ConflictError, NotFoundError, ValidationError } from '../../platform/ht
 import { tenantWhere, type TenantScope } from '../../platform/db/tenant-scope.js';
 import type { PlaybookRuntime } from '../playbooks/runtime.js';
 import type { OutreachTrigger, PlaybookRunResult } from '../playbooks/trigger.js';
+import type { NotificationQueue } from '../delivery/notification-queue.js';
 import type { AudienceService } from './audience.service.js';
 
 /** Batch states, and they are the source's own (0001's CHECK). */
@@ -146,6 +147,23 @@ export interface CampaignStats {
   failed: number;
 }
 
+/**
+ * What `cancel` actually achieved, in three numbers rather than one.
+ *
+ * A single "cancelled" count cannot distinguish a recipient that was never
+ * generated from a message pulled back off the queue from one that a worker was
+ * already sending — and an operator cancelling a campaign needs the third
+ * number most of all.
+ */
+export interface CancelResult {
+  /** Recipients cancelled before anything was generated for them. */
+  cancelled: number;
+  /** Generated and queued, pulled back before the worker took them. */
+  recalled: number;
+  /** Already with a worker. These may well have gone out. */
+  alreadySending: number;
+}
+
 export interface OrchestratorDeps {
   db: Db;
   logger: Logger;
@@ -153,6 +171,13 @@ export interface OrchestratorDeps {
   audiences: AudienceService;
   /** Bounded fan-out. Model providers rate-limit; so does this. */
   concurrency?: number;
+  /**
+   * Recalls queued-but-unsent jobs on cancel. Optional: without it, cancel
+   * behaves as it did before P12 — it stops generation and leaves whatever was
+   * already queued to send (D83) — and says so in its result rather than
+   * implying a fuller cancellation than it achieved.
+   */
+  queue?: NotificationQueue;
 }
 
 const DEFAULT_CONCURRENCY = 5;
@@ -272,10 +297,30 @@ export class CampaignOrchestrator {
    * Stop generating, and cancel everyone not yet generated. Messages already
    * handed to the queue are NOT recalled — see the header.
    */
-  async cancel(scope: TenantScope, campaignId: string): Promise<{ cancelled: number }> {
+  async cancel(scope: TenantScope, campaignId: string): Promise<CancelResult> {
     const campaign = await this.require(scope, campaignId);
+
+    // COMPLETED means every recipient has been GENERATED, which is not the same
+    // as every message having been SENT — a large campaign finishes generating
+    // long before the queue drains. Refusing here outright, as this did before
+    // the recall existed, would have made the recall useless in the window it
+    // was built for: the operator who says "stop" one minute after the run loop
+    // finished is exactly the caller who has something left to stop.
+    //
+    // The campaign's own status stays COMPLETED. It did complete; rewriting that
+    // to CANCELLED would misreport what happened to the generation run. What is
+    // cancelled is the messages, and those are marked individually.
     if (campaign.status === 'COMPLETED') {
-      throw new ConflictError(`Campaign '${campaignId}' has already completed`);
+      const recalled = await this.recallQueued(scope, campaignId);
+      if (recalled.recalled === 0 && recalled.alreadySending === 0) {
+        throw new ConflictError(`Campaign '${campaignId}' has already completed`);
+      }
+      this.deps.logger.info('completed campaign recalled', {
+        tenantId: scope.tenantId,
+        campaignId,
+        ...recalled,
+      });
+      return { cancelled: 0, ...recalled };
     }
 
     await this.setStatus(scope, campaignId, 'CANCELLED');
@@ -292,6 +337,8 @@ export class CampaignOrchestrator {
       )
       .returning({ id: campaignRecipients.id });
 
+    const recalled = await this.recallQueued(scope, campaignId);
+
     const batchId = await this.currentBatch(scope, campaignId).catch(() => null);
     if (batchId) {
       await this.deps.db
@@ -304,8 +351,77 @@ export class CampaignOrchestrator {
       tenantId: scope.tenantId,
       campaignId,
       cancelledBeforeGeneration: cancelled.length,
+      ...recalled,
     });
-    return { cancelled: cancelled.length };
+    return { cancelled: cancelled.length, ...recalled };
+  }
+
+  /**
+   * Pull back what has been generated and queued but not yet sent.
+   *
+   * Before P12 this was the hole in `cancel`: generation stopped and ungenerated
+   * recipients were cancelled, but anything already handed to the queue went out
+   * anyway (D83). The exposure was bounded — a recipient is enqueued only after
+   * it is generated, so cancelling a 10,000-recipient campaign 200 in left 9,800
+   * untouched — but it was not zero, and "cancel" is a word an operator trusts.
+   *
+   * Two things this does NOT do, deliberately:
+   *
+   *  - it does not touch messages that have already sent. There is no recalling
+   *    an email, and marking a sent message CANCELLED would corrupt the record
+   *    of what a recipient actually received.
+   *  - it does not wait for in-flight jobs. A worker holding the lock may be
+   *    inside the provider call; the count is reported so the caller can say
+   *    "3 were already sending" rather than claiming they were stopped.
+   */
+  private async recallQueued(
+    scope: TenantScope,
+    campaignId: string,
+  ): Promise<{ recalled: number; alreadySending: number }> {
+    if (!this.deps.queue) return { recalled: 0, alreadySending: 0 };
+
+    const queued = await this.deps.db
+      .select({ id: messages.id, jobId: sql<string | null>`${messages.metadata}->>'jobId'` })
+      .from(campaignRecipients)
+      .innerJoin(messages, eq(messages.id, campaignRecipients.messageId))
+      .where(
+        and(
+          tenantWhere(campaignRecipients, scope),
+          eq(campaignRecipients.campaignId, campaignId),
+          // QUEUED only. SENT has gone; PENDING_APPROVAL was never enqueued.
+          eq(messages.status, 'QUEUED'),
+        ),
+      );
+
+    const jobIds = queued.map((r) => r.jobId).filter((id): id is string => Boolean(id));
+    if (jobIds.length === 0) return { recalled: 0, alreadySending: 0 };
+
+    const removal = await this.deps.queue.remove(jobIds);
+    const removedSet = new Set(removal.removed);
+    const stopped = queued.filter((r) => r.jobId && removedSet.has(r.jobId));
+
+    // Only the rows whose job actually went. A message still in flight keeps
+    // status QUEUED and will report its real outcome through the worker.
+    if (stopped.length > 0) {
+      const ids = stopped.map((r) => r.id);
+      await this.deps.db
+        .update(messages)
+        .set({ status: 'CANCELLED', updatedAt: new Date() })
+        .where(and(tenantWhere(messages, scope), inArray(messages.id, ids)));
+
+      await this.deps.db
+        .update(campaignRecipients)
+        .set({ status: 'CANCELLED', updatedAt: new Date() })
+        .where(
+          and(
+            tenantWhere(campaignRecipients, scope),
+            eq(campaignRecipients.campaignId, campaignId),
+            inArray(campaignRecipients.messageId, ids),
+          ),
+        );
+    }
+
+    return { recalled: stopped.length, alreadySending: removal.inFlight.length };
   }
 
   async stats(scope: TenantScope, campaignId: string): Promise<CampaignStats> {

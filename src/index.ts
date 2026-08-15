@@ -364,6 +364,9 @@ async function main(): Promise<void> {
     runtime: runtimeRef.current,
     audiences: audienceService,
     concurrency: config.campaigns?.generateConcurrency,
+    // Lets cancel recall queued-but-unsent jobs (P12). Without it, cancel is
+    // the P11 behaviour: generation stops, anything already queued still sends.
+    queue,
   });
 
 

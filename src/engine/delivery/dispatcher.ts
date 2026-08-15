@@ -307,6 +307,25 @@ export class Dispatcher {
       return { queued: false, messageId: row.id, skipped: enqueued.reason };
     }
 
+    // Record the job id so the message can be recalled later (P12). BullMQ
+    // generates it, so it cannot be derived: the obvious shortcut — passing
+    // `jobId: messageId` — collides with the queue's own 24h completed-job
+    // retention the moment the deferral sweeper retries the same message.
+    //
+    // A write per send, on a row that was inserted moments ago. Not free, but
+    // the alternative is scanning the queue to find a job by payload, which is
+    // O(depth) at exactly the moment somebody is cancelling a large campaign.
+    if (enqueued.jobId) {
+      await this.deps.db
+        .update(messages)
+        .set({
+          metadata: sql`coalesce(${messages.metadata}, '{}'::jsonb) || ${JSON.stringify({
+            jobId: enqueued.jobId,
+          })}::jsonb`,
+        })
+        .where(and(eq(messages.tenantId, msg.tenantId), eq(messages.id, messageId)));
+    }
+
     return { queued: true, messageId: row.id, jobId: enqueued.jobId };
   }
 }

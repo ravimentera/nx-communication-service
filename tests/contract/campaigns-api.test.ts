@@ -242,7 +242,7 @@ describe('/v1/campaigns', () => {
     if (second.status === 409) expect(second.body.error.message).toMatch(/COMPLETED|running/i);
   });
 
-  it('cancels, and says plainly that queued messages are not recalled', async () => {
+  it('cancels, and accounts for what it could and could not stop', async () => {
     const audience = (await post('/v1/audiences', { name: 'Cancellable' })).body;
     const id = (
       await post('/v1/campaigns', {
@@ -255,9 +255,20 @@ describe('/v1/campaigns', () => {
     const res = await post(`/v1/campaigns/${id}/cancel`);
     expect(res.status).toBe(200);
     expect(res.body.status).toBe('CANCELLED');
-    // The note is part of the contract: an operator reading "cancelled" would
-    // otherwise assume nothing more goes out (D83).
-    expect(res.body.note).toMatch(/not recalled/i);
+
+    // Three numbers, not one. Until P12 queued messages could not be recalled at
+    // all (D83) and the note said so; now they can, and the contract is that the
+    // response distinguishes never-generated from recalled from already-sending.
+    // An operator reading "cancelled" must be able to tell whether anything
+    // still went out.
+    expect(res.body).toMatchObject({
+      cancelled: expect.any(Number),
+      recalled: expect.any(Number),
+      alreadySending: expect.any(Number),
+    });
+    // Nothing was launched, so nothing was in flight.
+    expect(res.body.alreadySending).toBe(0);
+    expect(res.body.note).toMatch(/nothing was in flight/i);
   });
 
   it('404s another tenant’s campaign', async () => {
