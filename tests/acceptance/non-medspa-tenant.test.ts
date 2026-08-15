@@ -38,6 +38,7 @@ import {
   tenantChannelConfigs,
 } from '../../src/db/schema.js';
 import { ApprovalService } from '../../src/engine/approvals/approval.service.js';
+import { TenantConfigAuthorizationProvider } from '../../src/engine/approvals/authorization.js';
 import { PolicyService } from '../../src/engine/approvals/policy.service.js';
 import { AudienceService } from '../../src/engine/campaigns/audience.service.js';
 import { CampaignOrchestrator } from '../../src/engine/campaigns/orchestrator.js';
@@ -173,7 +174,13 @@ beforeAll(async () => {
     defaultTimezone: 'UTC',
     unsubscribeBaseUrl: 'https://acme-realty.test/u',
   });
-  const policies = new PolicyService({ db, logger, rotation: { next: async () => 0 } });
+  const authorization = new TenantConfigAuthorizationProvider({ db, logger });
+  const policies = new PolicyService({
+    db,
+    logger,
+    authorization,
+    rotation: { next: async () => 0 },
+  });
 
   const dispatcher = new Dispatcher({
     db,
@@ -276,7 +283,7 @@ beforeAll(async () => {
       assembler: new PromptAssembler(renderer),
       logger,
     }),
-    approvals: new ApprovalService({ db, logger, policies, dispatcher }),
+    approvals: new ApprovalService({ db, logger, policies, dispatcher, authorization }),
     policies,
     dispatcher,
     preferences,
@@ -284,14 +291,19 @@ beforeAll(async () => {
     packConfig: async () => ({}),
   });
 
-  approvalService = new ApprovalService({ db, logger, policies, dispatcher });
+  approvalService = new ApprovalService({ db, logger, policies, dispatcher, authorization });
   registry = new PlaybookRegistry({ db, logger, packs });
   audiences = new AudienceService({ db, logger, recipients: new RecipientService({ db, logger }) });
   campaigns = new CampaignOrchestrator({ db, logger, runtime, audiences, concurrency: 5 });
 
   // Acme installs ONE pack. The medspa pack is installed for the clinic only,
   // so "the medspa tenant is untouched" has something to be untouched.
-  await registry.installPack(acme, 'lead-generation');
+  // Acme names who holds `sales-manager`. The lead-gen pack routes approvals to
+  // that role, and P12 made the check real: without the membership, approving
+  // is refused rather than waved through on the permission alone (D98).
+  await registry.installPack(acme, 'lead-generation', {
+    config: { roleMembers: { 'sales-manager': ['manager-1'] } },
+  });
   await registry.installPack(clinic, 'medspa', {
     config: {
       emergencyContacts: ['ops@clinic.test'],

@@ -147,6 +147,32 @@ export const playbookDefinitionSchema = z
         message: `playbook '${playbook.key}' generates content with a model but names no approvalPolicyKey — state one explicitly, using 'system.transactional' if no review is wanted`,
       });
     }
+
+    /**
+     * D82, closed in P12.
+     *
+     * `OutreachTrigger` has no "run this playbook" field, so a campaign targets
+     * its playbook through the predicate: the orchestrator puts
+     * `campaignPlaybookKey` in the payload and a campaign-capable playbook
+     * declares `where: {campaignPlaybookKey: {eq: '...'}}`.
+     *
+     * That works, and until now nothing enforced it. A pack author who omits the
+     * predicate gets a playbook that fires on **every** campaign the tenant
+     * runs — silently, with no warning, and discovered when an audience receives
+     * a message meant for a different one.
+     *
+     * A loader check was the fix docs/PACKS.md proposed. This is it.
+     */
+    for (const [index, trigger] of (playbook.triggers ?? []).entries()) {
+      if (trigger.type !== 'campaign') continue;
+      if (trigger.where && 'campaignPlaybookKey' in trigger.where) continue;
+
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['triggers', index, 'where'],
+        message: `playbook '${playbook.key}' has a campaign trigger with no 'campaignPlaybookKey' predicate, so it would fire on every campaign this tenant runs — add where: { campaignPlaybookKey: { eq: '${playbook.key}' } }`,
+      });
+    }
   });
 
 export const policyDefinitionSchema = z

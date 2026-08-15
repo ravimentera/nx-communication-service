@@ -63,6 +63,7 @@ import {
 import {
   FALLBACK_POLICY,
   type ApprovalDecision,
+  type AuthorizationProvider,
   type ApprovalPolicy,
   type PolicyService,
 } from './policy.service.js';
@@ -175,6 +176,8 @@ export interface ApprovalServiceDeps {
   logger: Logger;
   policies: PolicyService;
   dispatcher: Dispatcher;
+  /** P12. Resolves role membership; without it, role approvals fail closed. */
+  authorization?: AuthorizationProvider;
 }
 
 export class ApprovalService {
@@ -467,7 +470,7 @@ export class ApprovalService {
 
   async approve(scope: TenantScope, id: string, actor: Actor): Promise<ActionResult> {
     const current = await this.require(scope, id);
-    this.authorize(current, actor, 'approve');
+    await this.authorize(current, actor, 'approve');
 
     // Idempotent: the FE double-clicks, the network retries, the operator runs
     // the same bulk action twice. Approving an approved row is a no-op that
@@ -499,7 +502,7 @@ export class ApprovalService {
     subject?: string,
   ): Promise<Approval> {
     const current = await this.require(scope, id);
-    this.authorize(current, actor, 'edit');
+    await this.authorize(current, actor, 'edit');
 
     if (current.status !== 'PENDING_APPROVAL') {
       throw new ValidationError(`Only a pending approval can be edited; this one is ${current.status}`);
@@ -565,7 +568,7 @@ export class ApprovalService {
     reason?: string,
   ): Promise<ActionResult> {
     const current = await this.require(scope, id);
-    this.authorize(current, actor, 'decline');
+    await this.authorize(current, actor, 'decline');
 
     if (current.status === 'DECLINED') {
       return { approval: current, idempotent: true };
@@ -598,7 +601,7 @@ export class ApprovalService {
     sendAt: Date,
   ): Promise<ActionResult> {
     const current = await this.require(scope, id);
-    this.authorize(current, actor, 'reschedule');
+    await this.authorize(current, actor, 'reschedule');
 
     if (Number.isNaN(sendAt.getTime())) {
       throw new ValidationError('sendAt is not a valid date');
@@ -633,7 +636,7 @@ export class ApprovalService {
 
   async cancel(scope: TenantScope, id: string, actor: Actor, reason?: string): Promise<Approval> {
     const current = await this.require(scope, id);
-    this.authorize(current, actor, 'decline');
+    await this.authorize(current, actor, 'decline');
     const approval = await this.move(scope, current, { to: 'CANCELLED', actor, reason });
     await this.setMessageStatus(scope, current.messageId, 'CANCELLED');
     return approval;
@@ -858,12 +861,24 @@ export class ApprovalService {
    *
    * `agent` is today's rule generalized: the sender the message belongs to is
    * the one who may act on it — `approvals.controller.ts:65–71`, which the
-   * source applies to the pending list and to nothing else. Every other
-   * approver kind requires `outreach:approve`, because "is this user in that
-   * role or group" is not a question this service can answer until P12 wires a
-   * real authorization provider, and a permission is the honest stand-in.
+   * source applies to the pending list and to nothing else.
+   *
+   * `group` checks membership against the ids carried inline on `approverRef`.
+   *
+   * `role` checks membership through the `AuthorizationProvider` (P12). Until
+   * then this fell through to a bare `outreach:approve` test, so anyone in the
+   * tenant holding that permission could act on any role's approvals — while
+   * `policy.service.ts:339` said in a comment that members were "resolved at
+   * authorization time". They were not. See D98.
+   *
+   * The permission is still required in every non-agent case. It is necessary,
+   * not sufficient.
    */
-  private authorize(approval: Approval, actor: Actor, right: keyof ApprovalRightsShape): void {
+  private async authorize(
+    approval: Approval,
+    actor: Actor,
+    right: keyof ApprovalRightsShape,
+  ): Promise<void> {
     if (this.isAdmin(actor)) return;
 
     if (approval.approverType === 'agent' || approval.approverType === null) {
@@ -883,16 +898,40 @@ export class ApprovalService {
       );
     }
 
+    const identity = actor.senderId ?? actor.ref;
+
     // `group` with `all_of` semantics needs every member to decide. The
     // aggregate lives in the audit trail; until a second decider is modelled,
     // membership in the group is the requirement.
     if (approval.approverType === 'group' && approval.approverRef) {
       const members = approval.approverRef.split(',');
-      const identity = actor.senderId ?? actor.ref;
       if (!members.includes(identity)) {
         throw new ForbiddenError('Access denied: you are not a member of this approval group', {
           right,
         });
+      }
+      return;
+    }
+
+    if (approval.approverType === 'role' && approval.approverRef) {
+      if (!this.deps.authorization) {
+        // No provider wired. Fail closed and say why: silently allowing is how
+        // this check was decorative in the first place.
+        throw new ForbiddenError(
+          `This approval is assigned to the '${approval.approverRef}' role, and no authorization provider is configured to resolve its members`,
+          { right, approverRef: approval.approverRef },
+        );
+      }
+
+      const members = await this.deps.authorization.membersOf(
+        this.scopeOf(approval),
+        approval.approverRef,
+      );
+      if (!members.includes(identity)) {
+        throw new ForbiddenError(
+          `Access denied: you do not hold the '${approval.approverRef}' role`,
+          { right },
+        );
       }
     }
   }

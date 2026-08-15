@@ -90,8 +90,28 @@ const dispatcher = {
   dispatch: async () => ({ queued: true, messageId: 'm-1', jobId: 'j-1' }),
 } as unknown as Dispatcher;
 
-function service(row: Row, seen?: { updates: number }): ApprovalService {
-  return new ApprovalService({ db: fakeDb(row, seen), logger, policies, dispatcher });
+/**
+ * P12: role approvals resolve membership through this. `clinical-lead` is held
+ * by `provider-A` and by nobody else, so the tests can distinguish "holds the
+ * permission" from "holds the role" — which before P12 were the same thing.
+ */
+const authorization = {
+  membersOf: async (_scope: unknown, role: string) =>
+    role === 'clinical-lead' ? ['provider-A'] : [],
+};
+
+function service(
+  row: Row,
+  seen?: { updates: number },
+  over: { authorization?: typeof authorization } = {},
+): ApprovalService {
+  return new ApprovalService({
+    db: fakeDb(row, seen),
+    logger,
+    policies,
+    dispatcher,
+    authorization: 'authorization' in over ? over.authorization : authorization,
+  });
 }
 
 const actor = (over: Partial<Actor> = {}): Actor => ({
@@ -162,12 +182,59 @@ describe('approverType role and group', () => {
     ).rejects.toThrow(/outreach:approve permission/);
   });
 
-  it('admits the holder of outreach:approve', async () => {
+  it('additionally requires holding the role — the permission is not enough', async () => {
+    // Before P12 this passed on the permission alone, so anyone with
+    // `outreach:approve` could act on any role's queue in their tenant while
+    // policy.service.ts:339 claimed members were "resolved at authorization
+    // time". They were not. See D98.
+    const row = approvalRow({ approverType: 'role', approverRef: 'clinical-lead' });
+
     await expect(
-      service(approvalRow({ approverType: 'role', approverRef: 'clinical-lead' })).decline(
+      service(row).decline(
         scope,
         'a-1',
-        actor({ permissions: ['outreach:approve'] }),
+        actor({ senderId: 'provider-Z', permissions: ['outreach:approve'] }),
+      ),
+    ).rejects.toThrow(/do not hold the 'clinical-lead' role/);
+
+    await expect(
+      service(row).decline(
+        scope,
+        'a-1',
+        actor({ senderId: 'provider-A', permissions: ['outreach:approve'] }),
+      ),
+    ).resolves.toBeDefined();
+  });
+
+  it('fails closed when no authorization provider is configured', async () => {
+    // Allowing here is exactly how the check was decorative to begin with.
+    await expect(
+      service(
+        approvalRow({ approverType: 'role', approverRef: 'clinical-lead' }),
+        undefined,
+        { authorization: undefined },
+      ).decline(scope, 'a-1', actor({ permissions: ['outreach:approve'] })),
+    ).rejects.toThrow(/no authorization provider is configured/);
+  });
+
+  it('refuses a role nobody is configured for', async () => {
+    // "No configuration" must not read as "everyone", or the check is
+    // decorative again for every unconfigured role.
+    await expect(
+      service(approvalRow({ approverType: 'role', approverRef: 'nobody-holds-this' })).decline(
+        scope,
+        'a-1',
+        actor({ senderId: 'provider-A', permissions: ['outreach:approve'] }),
+      ),
+    ).rejects.toThrow(/do not hold the 'nobody-holds-this' role/);
+  });
+
+  it('still lets an admin through a role approval', async () => {
+    await expect(
+      service(approvalRow({ approverType: 'role', approverRef: 'nobody-holds-this' })).decline(
+        scope,
+        'a-1',
+        actor({ role: 'admin' }),
       ),
     ).resolves.toBeDefined();
   });

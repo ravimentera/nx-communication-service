@@ -12,6 +12,7 @@ import winston from 'winston';
 
 import { DEFAULT_RULES, lintContent, mergeRules } from '../../../src/engine/compliance/lint.js';
 import { loadPacks } from '../../../src/packs/loader.js';
+import { playbookDefinitionSchema } from '../../../src/packs/schema.js';
 
 const logger = winston.createLogger({ silent: true });
 const packs = loadPacks(join(process.cwd(), 'packs'), logger);
@@ -83,6 +84,72 @@ describe('loading', () => {
     expect(packs.compliance('medspa')).toHaveLength(1);
     expect(packs.compliance('lead-generation')).toHaveLength(1);
     expect(packs.compliance('no-such-pack')).toEqual([]);
+  });
+});
+
+describe('the campaign predicate check (D82)', () => {
+  const base = {
+    key: 'lead.followup',
+    name: 'Lead follow-up',
+    contentSource: { kind: 'template' as const, templateKey: 'lead.followup.email' },
+    channelPlan: [{ channel: 'email', templateKey: 'lead.followup.email' }],
+  };
+
+  it('rejects a campaign trigger with no campaignPlaybookKey predicate', () => {
+    // Without the predicate the playbook fires on EVERY campaign the tenant
+    // runs, silently — discovered when an audience receives a message meant for
+    // a different one. Nothing enforced this before P12.
+    const result = playbookDefinitionSchema.safeParse({
+      ...base,
+      triggers: [{ type: 'campaign' }],
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error!.issues[0]!.message).toMatch(/would fire on every campaign/);
+    // The message names the fix, including the key to use.
+    expect(result.error!.issues[0]!.message).toContain("campaignPlaybookKey: { eq: 'lead.followup' }");
+  });
+
+  it('rejects one whose predicate is on some other field', () => {
+    const result = playbookDefinitionSchema.safeParse({
+      ...base,
+      triggers: [{ type: 'campaign', where: { source: { eq: 'instagram' } } }],
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts one that declares it', () => {
+    const result = playbookDefinitionSchema.safeParse({
+      ...base,
+      triggers: [{ type: 'campaign', where: { campaignPlaybookKey: { eq: 'lead.followup' } } }],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('leaves every other trigger type alone', () => {
+    // The predicate is a campaign-targeting convention; an event trigger has an
+    // eventType and needs nothing of the sort.
+    const result = playbookDefinitionSchema.safeParse({
+      ...base,
+      triggers: [{ type: 'event', eventType: 'LEAD_CREATED' }],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('holds for every campaign trigger the shipped packs declare', () => {
+    // The rule is worth nothing if the packs in this repo would fail it.
+    expect(packs.errors()).toEqual([]);
+
+    const campaignTriggers = packs
+      .list()
+      .flatMap((id) => packs.get(id)?.playbooks ?? [])
+      .flatMap((playbook) => playbook.triggers ?? [])
+      .filter((trigger) => trigger.type === 'campaign');
+
+    expect(campaignTriggers.length).toBeGreaterThan(0);
+    expect(
+      campaignTriggers.every((t) => t.where && 'campaignPlaybookKey' in t.where),
+    ).toBe(true);
   });
 });
 

@@ -17,6 +17,7 @@ import { createStorageProvider } from './adapters/storage/index.js';
 import { tenantPacks } from './db/schema.js';
 import { ApprovalService } from './engine/approvals/approval.service.js';
 import { PolicyService } from './engine/approvals/policy.service.js';
+import { TenantConfigAuthorizationProvider } from './engine/approvals/authorization.js';
 import { ApprovalSlaWorker } from './engine/approvals/sla.worker.js';
 import { DeferralWorker } from './engine/delivery/deferral.worker.js';
 import { ComplianceGate } from './engine/compliance/gate.js';
@@ -211,9 +212,15 @@ async function main(): Promise<void> {
   });
 
   // ── approvals plane ───────────────────────────────────────────────────────
+  // P12. Role approvals were falling through to a bare permission check, so
+  // anyone holding outreach:approve could act on any role's queue (D98). The
+  // policy service already had the seam and resolved to no members; this fills it.
+  const authorization = new TenantConfigAuthorizationProvider({ db, logger });
+
   const policies = new PolicyService({
     db,
     logger,
+    authorization,
     rotation: {
       // Redis INCR when it is up; the in-memory store when it is not, which
       // makes the rotation per-replica rather than global. Round-robin is a
@@ -222,7 +229,13 @@ async function main(): Promise<void> {
     },
   });
 
-  const approvals = new ApprovalService({ db, logger, policies, dispatcher });
+  const approvals = new ApprovalService({
+    db,
+    logger,
+    policies,
+    dispatcher,
+    authorization,
+  });
   approvalsRef.current = approvals;
 
   const slaWorker = new ApprovalSlaWorker({
