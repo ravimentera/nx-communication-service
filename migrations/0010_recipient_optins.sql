@@ -34,9 +34,10 @@
 -- would remove data a rendered screen consumes.
 --
 -- -----------------------------------------------------------------------------
--- WHAT THESE FLAGS ACTUALLY ARE, RECORDED SO NOBODY RE-DERIVES IT
+-- WHAT THESE FLAGS ARE: AN UNFINISHED FEATURE, NOT DEAD WEIGHT
 --
--- They are inert, and it took four greps to be sure of it:
+-- Nothing uses them yet, and it took four greps to establish exactly how far
+-- "yet" goes:
 --
 --   1. Nothing writes them. The only occurrence of `email_opt_in` anywhere in
 --      mentera_core is the column declaration itself
@@ -46,15 +47,32 @@
 --      state and there is no mutation behind it.
 --   4. No send has ever been gated on them, in either system.
 --
--- So every row holds the column DEFAULT and always has. The card renders five
--- toggles that are permanently on, and flipping one survives until the next
--- refresh.
+-- So every row holds the column DEFAULT and always has, and the patient screen
+-- renders five toggles that are permanently on.
 --
--- They are carried across anyway, and deliberately: hard rule 3 of the plan is
--- preserve behaviour over elegance, the flags are the shape a live screen
--- reads, and inventing a mapping from `preferred_channels` would make the
--- toggles start meaning something they have never meant. Retiring dead UI is a
--- product decision, and it is not P10's to take mid-cutover.
+-- THE DECISION IS TO KEEP THEM, as a reserved surface for per-channel opt-in
+-- that is half-built rather than abandoned. The UI exists and users can see it;
+-- the storage exists and is now tenant-scoped and migrated; what is missing is
+-- the write path and the enforcement. That is a feature to finish, and the
+-- cheapest moment to preserve the option was this migration — recovering these
+-- columns after the source database is decommissioned would mean recovering
+-- them from a backup.
+--
+-- WHAT FINISHING IT WOULD TAKE, so the next person does not have to work it out:
+--
+--   - a write path: `PreferencePatch` and the `PUT /v1/recipients/:id/preferences`
+--     schema do not accept these fields, deliberately — nothing wrote them
+--     before and P10 was not the place to add a new mutation.
+--   - enforcement in `ComplianceGate`: today consent is `allow_communications`
+--     (global) and `preferred_channels` (per channel). A finished feature has to
+--     decide how these five relate to `preferred_channels`, which already
+--     expresses the same idea in a different shape. **Two overlapping
+--     representations of per-channel consent is the real debt here**, and
+--     collapsing them is the design question, not whether to keep the columns.
+--   - an FE mutation behind the existing toggles.
+--
+-- Until then they are storage only, and the COMMENT below says so on the column
+-- itself, where someone reading `\d recipient_preferences` will find it.
 --
 -- NULLABLE WITH DEFAULT true, matching the source exactly. `.default(true)`
 -- without `.notNull()` is what `patient-service/src/db/schema.ts:156-160`
@@ -74,8 +92,20 @@ ALTER TABLE recipient_preferences
   ADD COLUMN IF NOT EXISTS voice_opt_in       boolean DEFAULT true,
   ADD COLUMN IF NOT EXISTS direct_mail_opt_in boolean DEFAULT true;
 
-COMMENT ON COLUMN recipient_preferences.email_opt_in IS
-  'Display-only, carried from the source for FE parity. Consent is enforced via allow_communications and preferred_channels — see 0010_recipient_optins.sql.';
+-- On every one of the five, not just the first: whoever inspects this table will
+-- look at whichever column prompted the question.
+DO $$
+DECLARE col text;
+BEGIN
+  FOREACH col IN ARRAY ARRAY['email_opt_in','sms_opt_in','push_opt_in','voice_opt_in','direct_mail_opt_in']
+  LOOP
+    EXECUTE format(
+      'COMMENT ON COLUMN recipient_preferences.%I IS %L',
+      col,
+      'RESERVED — storage for per-channel opt-in, not yet enforced. Nothing reads this for consent: allow_communications (global) and preferred_channels (per channel) do that. No write path exists either. See 0010_recipient_optins.sql before building on it.'
+    );
+  END LOOP;
+END $$;
 
 COMMIT;
 

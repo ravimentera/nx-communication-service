@@ -114,10 +114,19 @@ export const recipientPreferences = pgTable(
     /** Playbook keys this recipient has opted out of. */
     eventOptOuts: text('event_opt_outs').array().notNull().default(sql`'{}'::text[]`),
     /**
-     * Display-only, carried from the source so Seam B can drop patient-service's
-     * JOIN without removing a field the FE renders. Nothing reads these for
-     * consent — `allowCommunications` and `preferredChannels` do that — and
-     * nothing has ever written them in either system. See `0010_recipient_optins.sql`.
+     * RESERVED — per-channel opt-in storage, not yet enforced.
+     *
+     * A half-built feature kept deliberately rather than dropped: the patient
+     * screen already renders five toggles for these, and the storage is now
+     * migrated and tenant-scoped. What is missing is a write path (they are
+     * absent from `PreferencePatch` on purpose) and enforcement.
+     *
+     * **Do not read these for consent.** `allowCommunications` and
+     * `preferredChannels` are what the gate uses, and `preferredChannels`
+     * already expresses per-channel consent in a different shape — reconciling
+     * the two is the design question that finishing this feature has to answer.
+     *
+     * See `0010_recipient_optins.sql`.
      */
     emailOptIn: boolean('email_opt_in').default(true),
     smsOptIn: boolean('sms_opt_in').default(true),

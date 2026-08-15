@@ -73,9 +73,10 @@ ins AS (
          -- migrated placeholder would collide with the UNIQUE constraint.
          NULL,
          l.contact_info::jsonb, l.metadata::jsonb, l.updated_by,
-         -- Display-only flags, carried verbatim including NULLs. Nothing in
-         -- either system reads them; the FE renders them and Seam B removes the
-         -- JOIN that used to supply them. See 0010_recipient_optins.sql.
+         -- Reserved per-channel opt-in flags, carried verbatim including NULLs.
+         -- Not yet enforced anywhere — kept because the feature is half-built
+         -- rather than abandoned, and this is the only moment the values can be
+         -- recovered without a backup. See 0010_recipient_optins.sql.
          l.email_opt_in, l.sms_opt_in, l.push_opt_in, l.voice_opt_in, l.direct_mail_opt_in,
          COALESCE(mig.to_tz(l.created_at), now()), COALESCE(mig.to_tz(l.updated_at), now())
   FROM latest l
