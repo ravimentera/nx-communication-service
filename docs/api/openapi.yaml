@@ -380,6 +380,96 @@ paths:
       responses:
         '204': { description: Unsubscribed. }
 
+  /v1/recipients/{id}/erase:
+    post:
+      operationId: postRecipientsByIdErase
+      tags: [recipients]
+      summary: Erase a recipient (GDPR article 17)
+      description: |
+        **Irreversible**, and gated twice: the caller needs `outreach:admin`, and
+        the tenant must carry the `gdpr` compliance profile
+        (`{"gdpr": true}` on `tenants.compliance_profile`). A tenant without it
+        gets 403 naming the profile.
+
+        Erasure is not `DELETE FROM messages`. A message row is also the record
+        that a send happened, which counts, rate-limit windows and audits depend
+        on — so the *content* and the recipient's address are overwritten and the
+        row, its timestamps, channel and status stay.
+
+        - `messages.content` overwritten; `correlationId` and `playbookKey` kept
+        - `recipient_context`, `recipient_memories`, `recipient_preferences` deleted
+        - `message_analytics.metadata` cleared
+        - `recipients` tombstoned — status `deleted`, contact points emptied — not
+          deleted, because `messages.recipient_id` is a foreign key
+        - **`consent_records` are kept**, deliberately: they are the evidence each
+          send was lawful when it happened (article 17(3)(b), (e)). The response
+          says so.
+      security: [{ gatewayIdentity: [outreach:admin] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: What was erased, and what was kept and why.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  recipientId: { type: string, format: uuid }
+                  erasedAt: { type: string, format: date-time }
+                  counts:
+                    type: object
+                    properties:
+                      messages: { type: integer }
+                      analytics: { type: integer }
+                      context: { type: integer }
+                      memories: { type: integer }
+                      preferences: { type: integer }
+                  retained:
+                    type: object
+                    properties:
+                      consentRecords: { type: integer }
+                      reason: { type: string }
+        '403':
+          description: The caller lacks `outreach:admin`, or the tenant has no `gdpr` profile.
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/recipients/{id}/export:
+    get:
+      operationId: getRecipientsByIdExport
+      tags: [recipients]
+      summary: Export everything held about a recipient (GDPR article 20)
+      description: |
+        Same two gates as erase. Served with a `Content-Disposition` attachment
+        header, because a portability export is a file someone sends onward.
+
+        Bounded by `limit` (10,000 messages by default) and it **says when it
+        truncated** rather than stopping silently — a short export presented as
+        complete is a compliance failure, not a performance feature.
+      security: [{ gatewayIdentity: [outreach:admin] }]
+      parameters:
+        - { $ref: '#/components/parameters/Id' }
+        - { name: limit, in: query, schema: { type: integer, default: 10000 } }
+      responses:
+        '200':
+          description: The recipient's data.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  recipientId: { type: string, format: uuid }
+                  exportedAt: { type: string, format: date-time }
+                  recipient: { $ref: '#/components/schemas/Recipient' }
+                  preferences: { type: [object, 'null'], additionalProperties: true }
+                  consent: { type: array, items: { type: object, additionalProperties: true } }
+                  context: { type: array, items: { type: object, additionalProperties: true } }
+                  memories: { type: array, items: { type: object, additionalProperties: true } }
+                  messages: { type: array, items: { $ref: '#/components/schemas/Message' } }
+                  truncated: { type: boolean }
+        '403':
+          description: The caller lacks `outreach:admin`, or the tenant has no `gdpr` profile.
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /v1/preferences/check:
     post:
       operationId: postPreferencesCheck

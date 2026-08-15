@@ -21,6 +21,7 @@ import { ApprovalSlaWorker } from './engine/approvals/sla.worker.js';
 import { DeferralWorker } from './engine/delivery/deferral.worker.js';
 import { ComplianceGate } from './engine/compliance/gate.js';
 import { lintContent, mergeRules } from './engine/compliance/lint.js';
+import { ErasureService } from './engine/compliance/erasure.service.js';
 import { PreferenceService } from './engine/compliance/preference.service.js';
 import { CORE_PACK, ContextRegistry } from './engine/context/registry.js';
 import { AnalyticsService } from './engine/messaging/analytics.service.js';
@@ -194,6 +195,10 @@ async function main(): Promise<void> {
     // change most likely to silently stop messages that currently ship.
     shadowMode: config.compliance.shadowMode,
     unsubscribeUrl: (scope, recipientId) => preferences.unsubscribeUrl(scope, recipientId),
+    // P12: the `hipaa` profile's PHI rule. Runs only for that profile, on the
+    // channels it applies to — see engine/compliance/profiles.ts.
+    lint: async ({ content, channel, tenantId }) =>
+      lintContent({ content, channel, tenantId }, lintRules),
   });
 
   const dispatcher = new Dispatcher({
@@ -443,6 +448,7 @@ async function main(): Promise<void> {
       recipients: recipientService,
       preferences,
       gate: complianceGate,
+      erasure: new ErasureService({ db, logger }),
     },
     approvals: { approvals, policies },
     playbooks: { runtime: runtimeRef.current, registry: playbookRegistry, packs },

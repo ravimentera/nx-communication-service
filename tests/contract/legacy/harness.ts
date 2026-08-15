@@ -29,6 +29,7 @@ import { createDb, type Db } from '../../../src/db/index.js';
 import { ApprovalService } from '../../../src/engine/approvals/approval.service.js';
 import { PolicyService } from '../../../src/engine/approvals/policy.service.js';
 import { ComplianceGate } from '../../../src/engine/compliance/gate.js';
+import { ErasureService } from '../../../src/engine/compliance/erasure.service.js';
 import { PreferenceService } from '../../../src/engine/compliance/preference.service.js';
 import { LocalStorageProvider } from '../../../src/adapters/storage/local.provider.js';
 import { AssetService } from '../../../src/engine/content/asset.service.js';
@@ -258,7 +259,12 @@ export async function startHarness(): Promise<Harness> {
   };
   const channels = { configs: channelConfigs, dispatcher, queue };
   const playbookDeps = { runtime, registry: new PlaybookRegistry({ db, logger, packs }), packs };
-  const recipientDeps = { recipients, preferences, gate };
+  const recipientDeps = {
+    recipients,
+    preferences,
+    gate,
+    erasure: new ErasureService({ db, logger }),
+  };
   // P12. A real `AssetService` over a throwaway directory, so the upload path
   // is exercised end to end rather than mocked. No `images` provider: the engine
   // ships no adapter (D92), and the contract is that the generate-image route

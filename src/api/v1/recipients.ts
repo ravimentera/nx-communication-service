@@ -11,10 +11,15 @@ import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
 
 import type { ComplianceGate } from '../../engine/compliance/gate.js';
+import type { ErasureService } from '../../engine/compliance/erasure.service.js';
 import type { PreferenceService } from '../../engine/compliance/preference.service.js';
 import type { RecipientService } from '../../engine/recipients/recipient.service.js';
-import { requireTenant } from '../../platform/http/auth.middleware.js';
-import { NotFoundError } from '../../platform/http/errors.js';
+import {
+  Permission,
+  requirePermissions,
+  requireTenant,
+} from '../../platform/http/auth.middleware.js';
+import { NotFoundError, NotImplementedError } from '../../platform/http/errors.js';
 import { CHANNEL_TYPES } from '../../ports/channel.js';
 
 const preferenceSchema = z.object({
@@ -60,6 +65,8 @@ export interface RecipientApiDeps {
   recipients: RecipientService;
   preferences: PreferenceService;
   gate: ComplianceGate;
+  /** P12. Absent means the two GDPR routes answer 501 rather than 404. */
+  erasure?: ErasureService;
 }
 
 function handle(
@@ -180,6 +187,49 @@ export function createRecipientRouter(deps: RecipientApiDeps): Router {
       await deps.preferences.unsubscribe(scope, id, req.body?.reason);
       await deps.recipients.setStatus(scope, id, 'unsubscribed');
       res.status(204).end();
+    }),
+  );
+
+  // ── GDPR (P12) ─────────────────────────────────────────────────────────────
+  // Both require the tenant to carry the `gdpr` compliance profile; the service
+  // answers 403 naming it otherwise. Both also require `outreach:admin`: this is
+  // the one pair of endpoints in the service that destroys data or hands all of
+  // a person's data to whoever asked.
+
+  router.post(
+    '/recipients/:id/erase',
+    requirePermissions(Permission.ADMIN),
+    handle(async (req, res) => {
+      if (!deps.erasure) {
+        throw new NotImplementedError('Erasure is not wired into this deployment');
+      }
+      const scope = requireTenant(req);
+      // Irreversible. The report says what was erased and what was deliberately
+      // kept, so the answer to "why are the consent records still there" ships
+      // with the response rather than living in someone's memory.
+      res.json(await deps.erasure.erase(scope, req.params.id as string));
+    }),
+  );
+
+  router.get(
+    '/recipients/:id/export',
+    requirePermissions(Permission.ADMIN),
+    handle(async (req, res) => {
+      if (!deps.erasure) {
+        throw new NotImplementedError('Export is not wired into this deployment');
+      }
+      const scope = requireTenant(req);
+      const bundle = await deps.erasure.export(
+        scope,
+        req.params.id as string,
+        req.query.limit ? Number(req.query.limit) : undefined,
+      );
+      // Named, because a portability export is a file someone sends onward.
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="recipient-${req.params.id}-export.json"`,
+      );
+      res.json(bundle);
     }),
   );
 

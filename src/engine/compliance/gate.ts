@@ -41,6 +41,14 @@ import { metricsRegistry, promClient } from '../../platform/observability/metric
 import type { TenantScope } from '../../platform/db/tenant-scope.js';
 import type { ChannelType, RenderedMessage } from '../../ports/channel.js';
 import type { PreferenceService } from './preference.service.js';
+import {
+  gdprRequiresConsent,
+  isMarketing,
+  parseComplianceProfile,
+  phiBlocked,
+  phiChannelIsUnsecured,
+  tcpaWindow,
+} from './profiles.js';
 
 export const SUPPRESSION_REASONS = [
   'RECIPIENT_UNSUBSCRIBED',
@@ -53,6 +61,9 @@ export const SUPPRESSION_REASONS = [
   'QUIET_HOURS',
   'RATE_LIMITED',
   'THROTTLED',
+  // P12, from `tenants.compliance_profile`.
+  'TCPA_QUIET_HOURS',
+  'PHI_ON_UNSECURED_CHANNEL',
 ] as const;
 
 export type SuppressionReason = (typeof SUPPRESSION_REASONS)[number];
@@ -61,6 +72,8 @@ export type SuppressionReason = (typeof SUPPRESSION_REASONS)[number];
 const DEFERRABLE: ReadonlySet<SuppressionReason> = new Set([
   'QUIET_HOURS',
   'RATE_LIMITED',
+  // A marketing text at 3am is fine at 9am. Blocking would drop it.
+  'TCPA_QUIET_HOURS',
 ]);
 
 export const suppressedTotal = new promClient.Counter({
@@ -100,6 +113,24 @@ export interface ComplianceGateDeps {
   /** Evaluate everything, report, but still allow. Default true. */
   shadowMode: boolean;
   unsubscribeUrl: (scope: TenantScope, recipientId: string) => Promise<string>;
+  /**
+   * The content linter, for the `hipaa` PHI rule (P12).
+   *
+   * The gate runs it **itself** rather than taking warnings from the caller.
+   * `ContentGenerator` already has them, so threading them through would have
+   * been cheaper — and it would have meant a caller that forgot to pass them
+   * silently disabled the rule, on a checkpoint whose whole value is that it
+   * cannot be skipped. Template-rendered messages get no lint pass anywhere
+   * else, and they carry PHI too.
+   *
+   * Only called when the profile is `hipaa` and the channel is one whose
+   * transport we do not control, so it costs nothing for anyone else.
+   */
+  lint?: (input: {
+    content: string;
+    channel: ChannelType;
+    tenantId: string;
+  }) => Promise<string[]>;
 }
 
 export class ComplianceGate {
@@ -177,11 +208,16 @@ export class ComplianceGate {
       if (!exempt) return this.block('COMMUNICATIONS_DISABLED');
     }
 
+    const profile = parseComplianceProfile(tenantRow?.complianceProfile);
+
     // 3 — per-channel preference, then consent when the tenant requires opt-in
     if (!this.deps.preferences.channelAllowed(prefs, input.channel)) {
       return this.block('CHANNEL_OPTED_OUT');
     }
-    if (tenantConfig?.requireOptIn && recipientId) {
+    // GDPR widens this: marketing needs a consent record whatever the tenant's
+    // `require_opt_in` column says, because under GDPR consent is the lawful
+    // basis rather than a tenant preference.
+    if (recipientId && (tenantConfig?.requireOptIn || gdprRequiresConsent(profile, input))) {
       const consented = await this.hasConsent(scope, recipientId, input.channel);
       if (!consented) return this.block('CONSENT_REQUIRED');
     }
@@ -199,6 +235,43 @@ export class ComplianceGate {
       );
       if (quiet.configured && quiet.inQuietHours) {
         return { allow: false, reason: 'QUIET_HOURS', deferrable: true, retryAt: quiet.endsAt };
+      }
+    }
+
+    // 5b — TCPA's telemarketing window, which is law rather than a preference.
+    //      Checked separately from (5) because that one only fires when the
+    //      recipient has *configured* quiet hours, and almost nobody has: a
+    //      tenant with no preferences set would otherwise send marketing texts
+    //      at 3am and satisfy every rule the engine models.
+    //
+    //      Urgent does NOT override. "Urgent" is the sender's assessment of
+    //      their own marketing, and the statute does not have that exemption.
+    if (profile.tcpa && isMarketing(input)) {
+      const window = tcpaWindow(
+        input.channel,
+        recipient?.timezone ?? tenantRow?.timezone ?? 'UTC',
+      );
+      if (window.inQuietHours) {
+        return {
+          allow: false,
+          reason: 'TCPA_QUIET_HOURS',
+          deferrable: true,
+          retryAt: window.endsAt,
+        };
+      }
+    }
+
+    // 5c — HIPAA: content the linter called PHI does not go over a channel we
+    //      do not control the transport of. A block, not a defer — the hour
+    //      does not make it acceptable.
+    if (profile.hipaa && this.deps.lint && phiChannelIsUnsecured(input.channel)) {
+      const warnings = await this.deps.lint({
+        content: input.rendered.body,
+        channel: input.channel,
+        tenantId: scope.tenantId,
+      });
+      if (phiBlocked(profile, input.channel, warnings)) {
+        return this.block('PHI_ON_UNSECURED_CHANNEL');
       }
     }
 
