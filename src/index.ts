@@ -29,7 +29,9 @@ import { MessageService } from './engine/messaging/message.service.js';
 import { ReceiptService } from './engine/messaging/receipt.service.js';
 import { RecipientService } from './engine/recipients/recipient.service.js';
 import { ApiKeyService } from './engine/tenancy/api-key.service.js';
+import { CredentialCipher } from './engine/tenancy/credential-cipher.js';
 import { UsageService } from './engine/tenancy/usage.service.js';
+import { hasDuplicateKeys, parseKeyList, Sealer } from './platform/crypto/envelope.js';
 import { AssetService } from './engine/content/asset.service.js';
 import { ContentGenerator } from './engine/content/generator.js';
 import { PromptAssembler } from './engine/content/prompt-assembler.js';
@@ -86,8 +88,14 @@ async function main(): Promise<void> {
   const redis = await createRedis(config.redis, logger);
   const cache = new Cache(redis, logger);
 
+  // ── credential encryption (P12) ───────────────────────────────────────────
+  // Off unless keys are configured. `credentials_encrypted` was reserved in P2
+  // for exactly this, and turning it on is an operator step sequenced with
+  // `scripts/encrypt-credentials.mjs` — see docs/MIGRATION_RUNBOOK.md.
+  const credentialCipher = buildCredentialCipher(config, logger);
+
   // ── delivery plane ────────────────────────────────────────────────────────
-  const channelConfigs = new ChannelConfigService(db, cache, logger);
+  const channelConfigs = new ChannelConfigService(db, cache, logger, credentialCipher);
   const credentials = new CredentialResolver(
     channelConfigs,
     createCredentialMappers(),
@@ -525,6 +533,46 @@ async function main(): Promise<void> {
   for (const signal of ['SIGTERM', 'SIGINT'] as const) {
     process.on(signal, () => void shutdown(signal));
   }
+}
+
+/**
+ * Build the credential cipher, or return undefined when no keys are configured.
+ *
+ * A misconfigured key is a **boot failure**, not a silent fall back to
+ * plaintext: an operator who set `CREDENTIAL_ENCRYPTION_KEYS` and got a typo
+ * wrong must not end up with a service quietly writing unencrypted credentials
+ * while believing otherwise.
+ */
+function buildCredentialCipher(
+  config: ReturnType<typeof loadConfig>,
+  logger: ReturnType<typeof createServiceLogger>,
+): CredentialCipher | undefined {
+  const raw = config.credentialEncryption.keys;
+  if (!raw) {
+    logger.info('credential encryption is off — channel credentials are stored in plaintext', {
+      hint: 'set CREDENTIAL_ENCRYPTION_KEYS to enable; see docs/MIGRATION_RUNBOOK.md',
+    });
+    return undefined;
+  }
+
+  const keys = parseKeyList(raw);
+  const keyIds = Object.keys(keys);
+  const activeKeyId = config.credentialEncryption.activeKeyId ?? keyIds[0];
+
+  if (!activeKeyId) {
+    throw new Error('CREDENTIAL_ENCRYPTION_KEYS is set but parsed to no keys');
+  }
+  if (hasDuplicateKeys(keys)) {
+    // Two ids for one key defeats the point of naming them: retiring one would
+    // not tell you whether anything still needed the other.
+    throw new Error(
+      'CREDENTIAL_ENCRYPTION_KEYS contains the same key material under more than one id',
+    );
+  }
+
+  const sealer = new Sealer({ keys, activeKeyId });
+  logger.info('credential encryption is on', { keyIds, activeKeyId });
+  return new CredentialCipher({ sealer, logger });
 }
 
 main().catch((error: unknown) => {

@@ -142,6 +142,19 @@ const envSchema = z.object({
   /** Bytes. Rejected before the body is read into memory. */
   ASSET_MAX_BYTES: int(10 * 1024 * 1024),
 
+  // --- credential encryption (P12) ---
+  /**
+   * `<keyId>:<base64 32 bytes>[,<keyId>:<...>]`. Unset means credentials stay
+   * in the flat plaintext columns, which is the behaviour every phase before
+   * P12 had — deliberately the default, because turning this on has to be
+   * sequenced with `scripts/encrypt-credentials.mjs` and the parallel run.
+   *
+   *   openssl rand -base64 32
+   */
+  CREDENTIAL_ENCRYPTION_KEYS: optionalString,
+  /** Which key new values seal under. Defaults to the only one when there is one. */
+  CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID: optionalString,
+
   // --- compliance ---
   UNSUBSCRIBE_BASE_URL: str('http://localhost:5007/unsubscribe'),
   DEFAULT_TIMEZONE: str('America/Los_Angeles'),
@@ -253,6 +266,10 @@ function shape(env: Env) {
       s3PublicBaseUrl: env.S3_PUBLIC_BASE_URL,
       s3Region: env.S3_REGION ?? env.AWS_REGION,
       maxBytes: env.ASSET_MAX_BYTES,
+    },
+    credentialEncryption: {
+      keys: env.CREDENTIAL_ENCRYPTION_KEYS,
+      activeKeyId: env.CREDENTIAL_ENCRYPTION_ACTIVE_KEY_ID,
     },
     compliance: {
       unsubscribeBaseUrl: env.UNSUBSCRIBE_BASE_URL,

@@ -33,6 +33,8 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { baselineMigrations } from '../helpers/migrations.js';
+
 import { Client } from 'pg';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 
@@ -76,9 +78,7 @@ async function applyFile(client: Client, path: string): Promise<void> {
 }
 
 function schemaMigrations(): string[] {
-  return readdirSync(MIGRATIONS_DIR)
-    .filter((f) => /^0\d{3}_.*\.sql$/.test(f))
-    .sort();
+  return baselineMigrations(MIGRATIONS_DIR);
 }
 
 function dataMigrations(): string[] {

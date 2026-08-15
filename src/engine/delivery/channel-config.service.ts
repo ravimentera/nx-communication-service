@@ -19,6 +19,10 @@ import type { Logger } from 'winston';
 
 import type { Db } from '../../db/index.js';
 import { agentChannelConfigs, tenantChannelConfigs } from '../../db/schema.js';
+import {
+  TENANT_SECRET_COLUMNS,
+  type CredentialCipher,
+} from '../tenancy/credential-cipher.js';
 import type { Cache } from '../../platform/redis/index.js';
 
 export type TenantChannelConfig = typeof tenantChannelConfigs.$inferSelect;
@@ -46,7 +50,24 @@ export class ChannelConfigService {
     private readonly db: Db,
     private readonly cache: Cache,
     private readonly logger: Logger,
+    /**
+     * P12. Absent means credentials stay in the flat plaintext columns, which
+     * is the P3 behaviour and remains the default: turning encryption on is an
+     * operator decision that has to be sequenced with the backfill script, and
+     * a service that started sealing credentials on its own would produce rows
+     * only it could read.
+     */
+    private readonly cipher?: CredentialCipher,
   ) {}
+
+  /**
+   * Open a row's sealed credentials, if any. Reads go through this so a caller
+   * sees usable values whether the row is sealed or still plaintext — see the
+   * header of `credential-cipher.ts` for why both have to work at once.
+   */
+  private decrypt(row: TenantChannelConfig): TenantChannelConfig {
+    return this.cipher ? this.cipher.decryptRow(row) : row;
+  }
 
   private tenantKey(tenantId: string): string {
     return this.cache.key('config:tenant', tenantId);
@@ -58,8 +79,11 @@ export class ChannelConfigService {
 
   async getTenantConfig(tenantId: string): Promise<TenantChannelConfig | null> {
     const key = this.tenantKey(tenantId);
+    // Decrypted AFTER the cache, never before: what goes into Redis is the row
+    // as stored, so sealing a credential in Postgres does not put the cleartext
+    // into a second store that has its own access rules.
     const cached = await this.cache.get<TenantChannelConfig>(key);
-    if (cached) return cached;
+    if (cached) return this.decrypt(cached);
 
     const [row] = await this.db
       .select()
@@ -78,7 +102,7 @@ export class ChannelConfigService {
     }
 
     await this.cache.set(key, row, CACHE_TTL_SECONDS);
-    return row;
+    return this.decrypt(row);
   }
 
   async getAgentConfig(tenantId: string, senderId: string): Promise<AgentChannelConfig | null> {
@@ -178,12 +202,17 @@ export class ChannelConfigService {
     values: Partial<TenantChannelConfigInput>,
     actor?: string,
   ): Promise<TenantChannelConfig> {
+    // Seal on write when a cipher is configured, so a credential set through the
+    // API never lands as plaintext even while the backfill is still working
+    // through the rows that arrived before it.
+    const sealed = this.cipher ? await this.sealCredentials(tenantId, values) : values;
+
     const [row] = await this.db
       .insert(tenantChannelConfigs)
       .values({
         tenantId,
         name: values.name ?? tenantId,
-        ...values,
+        ...sealed,
         createdBy: actor,
         updatedBy: actor,
       })
@@ -191,12 +220,59 @@ export class ChannelConfigService {
         target: tenantChannelConfigs.tenantId,
         // Only what the caller supplied. A PUT that names two SendGrid fields
         // must not null out the Twilio credentials it did not mention.
-        set: { ...definedOnly(values), updatedBy: actor, updatedAt: sql`now()` },
+        set: { ...definedOnly(sealed), updatedBy: actor, updatedAt: sql`now()` },
       })
       .returning();
 
     await this.invalidate(tenantId);
-    return row!;
+    return this.decrypt(row!);
+  }
+
+  /**
+   * Move any supplied secret out of its flat column and into the sealed bundle.
+   *
+   * **The flat column is nulled in the same write.** Leaving it — the first cut
+   * of this — meant a credential set through the API *after* encryption was
+   * turned on still landed in cleartext, and then into the config cache, which
+   * is the exact thing encryption is for. The value is recoverable from the
+   * bundle in the same row, so nothing is lost.
+   *
+   * This nulls only the columns this request supplied. Rows the service never
+   * writes — the ones `9003_channel_configs.sql` inserts during the parallel
+   * run — keep their plaintext until `0013_encrypt_credentials.sql` clears them,
+   * and the read path resolves both shapes until then.
+   */
+  private async sealCredentials(
+    tenantId: string,
+    values: Partial<TenantChannelConfigInput>,
+  ): Promise<Partial<TenantChannelConfigInput>> {
+    if (!this.cipher) return values;
+
+    const supplied = TENANT_SECRET_COLUMNS.filter((column) => values[column]);
+    if (supplied.length === 0) return values;
+
+    // The stored bundle, not the caller's: `credentials_encrypted` is one jsonb
+    // column, so writing only the newly-sealed entries would drop every
+    // credential this request did not mention — the same class of bug as the
+    // pack-config replace in D95.
+    const [current] = await this.db
+      .select({ credentialsEncrypted: tenantChannelConfigs.credentialsEncrypted })
+      .from(tenantChannelConfigs)
+      .where(eq(tenantChannelConfigs.tenantId, tenantId))
+      .limit(1);
+
+    const existing = (current?.credentialsEncrypted ?? {}) as Record<string, unknown>;
+    const bundle = this.cipher.seal(
+      Object.fromEntries(supplied.map((column) => [column, values[column]])),
+    );
+
+    return {
+      ...values,
+      // Sealed, so the cleartext does not stay in the column beside it.
+      ...Object.fromEntries(supplied.map((column) => [column, null])),
+      credentialsEncrypted: { ...existing, ...bundle },
+      encryptionKeyId: this.cipher.activeKeyId,
+    };
   }
 
   /** Same shape, per agent. UNIQUE(tenant_id, sender_id) backs the conflict target. */

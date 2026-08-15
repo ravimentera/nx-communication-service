@@ -15,6 +15,8 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { baselineMigrations } from '../helpers/migrations.js';
+
 import { eq } from 'drizzle-orm';
 import { Redis } from 'ioredis';
 import { Client } from 'pg';
@@ -110,7 +112,7 @@ beforeAll(async () => {
   const dir = join(process.cwd(), 'migrations');
   // The 0xxx schema series only — the 9xxx files are the one-shot mentera-core
   // data migration and need a linked source database (migration.test.ts covers them).
-  for (const file of readdirSync(dir).filter((f) => /^0\d{3}_.*\.sql$/.test(f)).sort()) {
+  for (const file of baselineMigrations(dir)) {
     await client.query(readFileSync(join(dir, file), 'utf8'));
   }
   await client.query(`INSERT INTO tenants (id, name) VALUES ('${TENANT}', 'Queue Test')`);

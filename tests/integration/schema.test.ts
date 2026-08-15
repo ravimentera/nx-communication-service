@@ -25,6 +25,8 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { baselineMigrations } from '../helpers/migrations.js';
+
 import { getTableName, getTableColumns, is } from 'drizzle-orm';
 import { PgTable } from 'drizzle-orm/pg-core';
 import { Client } from 'pg';
@@ -62,9 +64,7 @@ const MODEL_TABLES: { name: string; columns: string[] }[] = Object.values(
  * (correctly) reject, and they are exercised by migration.test.ts instead.
  */
 function migrationFiles(): string[] {
-  return readdirSync(MIGRATIONS_DIR)
-    .filter((f) => /^0\d{3}_.*\.sql$/.test(f))
-    .sort();
+  return baselineMigrations(MIGRATIONS_DIR);
 }
 
 async function applyMigrations(client: Client): Promise<void> {

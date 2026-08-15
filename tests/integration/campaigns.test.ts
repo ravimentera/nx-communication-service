@@ -22,6 +22,8 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { baselineMigrations } from '../helpers/migrations.js';
+
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { Client } from 'pg';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
@@ -114,7 +116,7 @@ beforeAll(async () => {
   const client = new Client({ connectionString: container.getConnectionUri() });
   await client.connect();
   const dir = join(process.cwd(), 'migrations');
-  for (const file of readdirSync(dir).filter((f) => /^0\d{3}_.*\.sql$/.test(f)).sort()) {
+  for (const file of baselineMigrations(dir)) {
     await client.query(readFileSync(join(dir, file), 'utf8'));
   }
   await client.query(

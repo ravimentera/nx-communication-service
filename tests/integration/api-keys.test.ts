@@ -10,6 +10,8 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { baselineMigrations } from '../helpers/migrations.js';
+
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import express, { type Express } from 'express';
 import { Client } from 'pg';
@@ -69,9 +71,7 @@ beforeAll(async () => {
   const client = new Client({ connectionString: container.getConnectionUri() });
   await client.connect();
   const dir = join(process.cwd(), 'migrations');
-  for (const file of readdirSync(dir)
-    .filter((f) => /^0\d{3}_.*\.sql$/.test(f))
-    .sort()) {
+  for (const file of baselineMigrations(dir)) {
     await client.query(readFileSync(join(dir, file), 'utf8'));
   }
   await client.end();

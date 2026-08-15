@@ -14,6 +14,8 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { baselineMigrations } from '../../helpers/migrations.js';
+
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import type { Express } from 'express';
 import { Client } from 'pg';
@@ -107,11 +109,7 @@ export async function startHarness(): Promise<Harness> {
   const client = new Client({ connectionString: container.getConnectionUri() });
   await client.connect();
   const dir = join(process.cwd(), 'migrations');
-  for (const file of readdirSync(dir)
-    // The 0xxx schema series only — the 9xxx files are the one-shot
-    // mentera-core data migration (migration.test.ts covers them).
-    .filter((f) => /^0\d{3}_.*\.sql$/.test(f))
-    .sort()) {
+  for (const file of baselineMigrations(dir)) {
     await client.query(readFileSync(join(dir, file), 'utf8'));
   }
   await client.query(
