@@ -59,6 +59,11 @@ export interface OutboundMessage {
    * unlike the source's `scheduledFor`, which was a string nothing read.
    */
   sendAt?: Date;
+  /**
+   * How many times the deferral sweeper has already retried this message.
+   * Set only by `DeferralSweeper`; a first dispatch leaves it undefined.
+   */
+  deferralAttempts?: number;
 }
 
 export interface DispatchResult {
@@ -100,6 +105,8 @@ export class Dispatcher {
       rendered?: RenderedMessage;
       suppressionReason?: string;
       extraMetadata?: Record<string, unknown>;
+      /** Set when deferring; explicit null clears a previous deferral. */
+      deferredUntil?: Date | null;
     },
   ): Promise<string> {
     const rendered = options.rendered ?? msg.rendered;
@@ -118,6 +125,9 @@ export class Dispatcher {
           content: rendered.body,
           status: options.status,
           suppressionReason: options.suppressionReason,
+          // undefined leaves it alone; null clears a deferral that has now been
+          // released, so the row drops out of the sweeper's partial index.
+          ...(options.deferredUntil !== undefined ? { deferredUntil: options.deferredUntil } : {}),
           approvalId: msg.approvalId,
           metadata: sql`coalesce(${messages.metadata}, '{}'::jsonb) || ${JSON.stringify(metadata)}::jsonb`,
           updatedAt: new Date(),
@@ -144,6 +154,7 @@ export class Dispatcher {
         content: rendered.body,
         status: options.status,
         suppressionReason: options.suppressionReason,
+        ...(options.deferredUntil ? { deferredUntil: options.deferredUntil } : {}),
         playbookId: msg.playbookId,
         templateId: msg.templateId,
         approvalId: msg.approvalId,
@@ -212,7 +223,34 @@ export class Dispatcher {
         const suppressed = await this.persist(msg, correlationId, {
           status: 'SUPPRESSED',
           suppressionReason: verdict.reason,
-          extraMetadata: { deferrable: verdict.deferrable, retryAt: verdict.retryAt },
+          // The queryable copy of retryAt. A hard suppression has no retryAt
+          // and leaves the column NULL, which is what keeps it out of the sweep.
+          deferredUntil: verdict.deferrable ? (verdict.retryAt ?? null) : null,
+          extraMetadata: {
+            deferrable: verdict.deferrable,
+            retryAt: verdict.retryAt,
+            // A deferred message has to be re-sendable from its row alone,
+            // hours later, in a different process. The row carries the body,
+            // the channel and the recipient; everything else that `dispatch`
+            // needs is only in this call's arguments, so it is written down
+            // here. Only on the deferrable path — a hard suppression is never
+            // retried and does not need the baggage.
+            ...(verdict.deferrable
+              ? {
+                  deferral: {
+                    attempts: (msg.deferralAttempts ?? 0) + 1,
+                    firstDeferredAt:
+                      msg.deferralAttempts ? undefined : new Date().toISOString(),
+                    toType: msg.to.type,
+                    ...(rendered.html ? { html: rendered.html } : {}),
+                    priority,
+                    ...(msg.playbookKey ? { playbookKey: msg.playbookKey } : {}),
+                    ...(msg.transactional ? { transactional: true } : {}),
+                    ...(msg.throttle ? { throttle: msg.throttle } : {}),
+                  },
+                }
+              : {}),
+          },
         });
         logger.info('message suppressed by compliance gate', {
           messageId: suppressed,
@@ -236,6 +274,9 @@ export class Dispatcher {
     const messageId = await this.persist(msg, correlationId, {
       status: 'QUEUED',
       rendered,
+      // Released: whether this is a first dispatch or the sweeper's retry, the
+      // message is no longer waiting on a window.
+      deferredUntil: null,
       extraMetadata: shadowed ? { shadowSuppressionReason: shadowed } : undefined,
     });
 

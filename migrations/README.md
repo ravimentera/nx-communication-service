@@ -16,6 +16,7 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0008_receipt_integrity.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0009_campaigns.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0010_recipient_optins.sql
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0011_platform_tenant.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0012_deferred_messages.sql
 ```
 
 Each file is idempotent (`IF NOT EXISTS` / guarded `DO` blocks) and wrapped in a
@@ -33,6 +34,7 @@ transaction.
 | `0009_campaigns.sql` | `campaign_recipients.message_id` and `import_errors`. Every other campaign table has existed since `0001`. |
 | `0010_recipient_optins.sql` | The five display-only opt-in flags on `recipient_preferences`. **Apply before `9006_preferences.sql`**, which loads them. Adds columns only; no index, nothing reads them for consent. |
 | `0011_platform_tenant.sql` | The `platform` tenant, for identity-level mail that belongs to no medspa — email verification and password reset. Refuses to run if a migrated medspa already holds the id. Set `OUTREACH_PLATFORM_TENANT_ID=platform` in providers-service after applying. |
+| `0012_deferred_messages.sql` | `messages.deferred_until` and the partial index the deferral sweeper runs on. Without it, a message the compliance gate held for quiet hours or a rate limit is never retried. Catalogue-only `ADD COLUMN`; no table rewrite. |
 
 **There is no `0004`.** Everything it was scheduled to create already exists in
 `0001`, so the content plane shipped no migration. The number is left unused

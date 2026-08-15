@@ -129,6 +129,13 @@ export const messages = pgTable(
      */
     suppressionReason: text('suppression_reason'),
     /**
+     * When a message the gate HELD becomes sendable again (P10). Distinct from
+     * a hard suppression, which never becomes sendable and leaves this NULL.
+     * `deferral.worker.ts` sweeps on it; see `0012_deferred_messages.sql` for
+     * why it is a column rather than the `metadata.retryAt` it duplicates.
+     */
+    deferredUntil: ts('deferred_until'),
+    /**
      * The legacy approval blob. Kept so the P9 backfill has a source to read
      * and to compare against; DROPPED in P12 once the approvals table is proven.
      */

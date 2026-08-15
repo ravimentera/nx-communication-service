@@ -17,6 +17,7 @@ import { tenantPacks } from './db/schema.js';
 import { ApprovalService } from './engine/approvals/approval.service.js';
 import { PolicyService } from './engine/approvals/policy.service.js';
 import { ApprovalSlaWorker } from './engine/approvals/sla.worker.js';
+import { DeferralWorker } from './engine/delivery/deferral.worker.js';
 import { ComplianceGate } from './engine/compliance/gate.js';
 import { lintContent, mergeRules } from './engine/compliance/lint.js';
 import { PreferenceService } from './engine/compliance/preference.service.js';
@@ -238,6 +239,21 @@ async function main(): Promise<void> {
   });
   await slaWorker.start();
 
+  // The other end of P5's deferral. The compliance gate holds a message back
+  // with a `retryAt` rather than dropping it — quiet hours, a rate limit — and
+  // until now nothing read that back, so a "deferred" message was simply lost
+  // while its row claimed otherwise. This puts due messages through
+  // `dispatcher.dispatch()` again, so the gate re-runs against the state of the
+  // world now: somebody who unsubscribed during their own quiet hours does not
+  // receive what was waiting for them.
+  const deferralWorker = new DeferralWorker({
+    db,
+    logger,
+    dispatcher,
+    connection: redis.connection,
+  });
+  await deferralWorker.start();
+
   // ── context plane ─────────────────────────────────────────────────────────
   const contextRegistry = new ContextRegistry({
     installedPacks: async (tenantId) => {
@@ -443,6 +459,7 @@ async function main(): Promise<void> {
         await queue.close();
         await eventQueue.close();
         await slaWorker.close();
+        await deferralWorker.close();
         await redis.close();
         await closeDb(pool, logger);
         process.exit(0);
