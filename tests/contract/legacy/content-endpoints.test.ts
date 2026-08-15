@@ -135,25 +135,101 @@ describe('/templates — 14', () => {
     expect(res.body.content).toBeTruthy();
   });
 
-  it.each([
-    '/templates/campaigns',
-    '/templates/campaigns/follow-up',
-    '/templates/campaigns/educational',
-    '/templates/campaigns/promotional',
-  ])('%s answers 501 naming its successor, and is not read as a template id', async (path) => {
-    const res = await post(path, {});
-    expect(res.status).toBe(501);
-    expect(res.body.error.message).toMatch(/v1\//);
+  it('POST /generate resolves its default prompt pack', async () => {
+    // The default key was `core.template-author`, which no pack shipped until
+    // P12 — so this endpoint 404'd unless the caller named a pack, and
+    // providers-service proxies this router. See D93.
+    const res = await post('/templates/generate', { prompt: 'a reminder', format: 'TEXT' });
+    expect(res.status).toBe(201);
+    expect(res.body.templateId).toEqual(expect.any(String));
   });
 
-  it.each(['/templates/assets/upload', '/templates/assets/generate-image', '/templates/generate-with-images'])(
-    '%s answers 501 saying what is missing',
-    async (path) => {
-      const res = await post(path, {});
-      expect(res.status).toBe(501);
-      expect(res.body.error.message).toMatch(/storage adapter|image model/i);
+  it.each([
+    ['/templates/campaigns', 'newsletter'],
+    ['/templates/campaigns/follow-up', 'follow_up'],
+    ['/templates/campaigns/educational', 'educational'],
+    ['/templates/campaigns/promotional', 'promotion'],
+  ])(
+    '%s generates campaign copy, and is not read as a template id',
+    async (path, expectedCategory) => {
+      // D92: these were recorded as blocked on an image model. They never were —
+      // the source generates copy with Bedrock text and every image attempt
+      // throws and is swallowed (campaign-template-generator.ts:232-238).
+      const res = await post(path, {
+        campaignType: path.endsWith('/campaigns') ? 'newsletter' : undefined,
+        audienceType: 'all_recipients',
+        tone: 'friendly',
+        purpose: 'announce the new opening hours',
+        keyPoints: ['open until 8pm', 'closed Sundays'],
+        callToAction: 'Book online',
+      });
+      expect(res.status).toBe(201);
+      expect(res.body).toMatchObject({
+        templateId: expect.any(String),
+        previewContent: expect.any(String),
+        emailConfig: { subjectLine: expect.any(String), preheader: expect.any(String) },
+      });
+      // No image provider is registered, so the source's always-empty result.
+      expect(res.body.imageAssets).toBeUndefined();
+
+      const stored = await get(`/templates/${res.body.templateId}`);
+      expect(stored.body.metadata.category).toBe(expectedCategory);
     },
   );
+
+  it('POST /campaigns requires the four fields the source requires', async () => {
+    expect((await post('/templates/campaigns', { campaignType: 'newsletter' })).status).toBe(400);
+  });
+
+  it('POST /generate-with-images generates the body and no images', async () => {
+    const res = await post('/templates/generate-with-images', {
+      prompt: 'a seasonal announcement',
+      format: 'TEXT',
+      imageSuggestions: ['a bunch of flowers'],
+    });
+    expect(res.status).toBe(201);
+    expect(res.body.templateId).toEqual(expect.any(String));
+    expect(res.body.content).toBeTruthy();
+    // The source's loop catches every failure and continues, and every attempt
+    // failed, so this has always been absent.
+    expect(res.body.imageAssets).toBeUndefined();
+  });
+
+  it('POST /assets/upload stores the file and reports where it went', async () => {
+    const res = await request(h.app)
+      .post('/templates/assets/upload')
+      .set(gatewayHeaders())
+      .attach('file', Buffer.from('a tiny png, honestly'), {
+        filename: 'logo.png',
+        contentType: 'image/png',
+      });
+
+    expect(res.status).toBe(201);
+    expect(res.body).toMatchObject({
+      originalName: 'logo.png',
+      mimeType: 'image/png',
+      size: 20,
+      // New: the source returned a bare filename, which nothing could fetch.
+      assetId: expect.any(String),
+      url: expect.stringContaining('http'),
+    });
+    // The key is service-assigned and tenant-prefixed — never the caller's name.
+    expect(res.body.filename).toMatch(new RegExp(`^${TENANT}/image/[0-9a-f-]+\\.png$`));
+    expect(res.body.filename).not.toContain('logo');
+  });
+
+  it('POST /assets/upload rejects a request with no file', async () => {
+    expect((await post('/templates/assets/upload', {})).status).toBe(400);
+  });
+
+  it('POST /assets/generate-image answers 501 — no image model has ever existed', async () => {
+    // The one endpoint that IS image-blocked, and the source could not serve it
+    // either: AIService.generateImage throws unconditionally, uncaught on this
+    // path, so it has answered 500 for its whole life (D92).
+    const res = await post('/templates/assets/generate-image', { prompt: 'a logo' });
+    expect(res.status).toBe(501);
+    expect(res.body.error.message).toMatch(/image model/i);
+  });
 
   it('DELETE /:id returns {success}', async () => {
     const res = await del(`/templates/${templateId}`);
@@ -186,9 +262,29 @@ describe('/ai — 8', () => {
     expect((await post('/ai/generate', {})).status).toBe(400);
   });
 
-  it('POST /ai/multimodal answers 501 — the LlmProvider port is text-only', async () => {
-    const res = await post('/ai/multimodal', { prompt: 'x' });
-    expect(res.status).toBe(501);
+  it('POST /ai/multimodal returns copy plus image descriptions', async () => {
+    // Named for images, generates none: the source builds a text prompt asking
+    // for copy and N image *descriptions* and calls generateJsonContent
+    // (ai-content-controller.ts:406). It never needed an image model — D92.
+    const res = await post('/ai/multimodal', {
+      prompt: 'announce the spring hours',
+      textFormat: 'html',
+      imageCount: 1,
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ success: true });
+    expect(res.body.multimodalContent).toMatchObject({
+      textContent: expect.any(String),
+      images: [{ description: expect.any(String), position: expect.any(String) }],
+    });
+    expect(res.body.metadata).toMatchObject({
+      tokensIn: expect.any(Number),
+      tokensOut: expect.any(Number),
+    });
+  });
+
+  it('POST /ai/multimodal requires a prompt', async () => {
+    expect((await post('/ai/multimodal', {})).status).toBe(400);
   });
 });
 

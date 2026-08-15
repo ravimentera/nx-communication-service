@@ -1,0 +1,27 @@
+{
+  "$comment": "Backs the four legacy POST /templates/campaigns* endpoints. The source built this prompt in code (campaign-template-generator.ts:362) with the vertical's nouns hardcoded — 'new patients who have recently joined the practice', 'healthcare best practices'. Those phrasings are pack content, so the engine now passes campaignType, audience, tone and purpose through as context and the prompt does the wording. A vertical that wants its own vocabulary overrides this key in its own pack.",
+  "key": "core.campaign-author",
+  "version": 1,
+  "persona": "You are authoring a {{context.tone}} {{context.campaignType}} campaign template for {{tenant.name}}.",
+  "goal": "Write a campaign message template addressed to {{context.audience}}. Its purpose is: {{context.purpose}}",
+  "constraints": [
+    "Cover every supplied key point, in the order given, and add none of your own.",
+    "End with the supplied call to action, stated once and plainly. If none was supplied, do not invent one.",
+    "Output a template: leave per-recipient values as Handlebars placeholders such as {{recipient.firstName}} and {{sender.displayName}}.",
+    "Honour the requested format exactly — MJML means responsive MJML tags, HTML means inline CSS for mail-client compatibility.",
+    "Use the supplied brand colours if any were given, and no others.",
+    "Where image placeholders were requested, leave a placeholder. Do not describe an image as if it were present.",
+    "This is marketing: include an unsubscribe affordance.",
+    "Write only the template body. No preamble, no explanation, no markdown fences.",
+    "Never state a fact, offer, price or claim that is not in the supplied context."
+  ],
+  "channelRules": {
+    "sms": "One or two sentences, under 320 characters. No subject line, no HTML.",
+    "email": "Subject under 60 characters. Short paragraphs, scannable, one clear call to action.",
+    "slack": "Plain text with Slack markdown. No greeting or sign-off."
+  },
+  "modelHints": {
+    "temperature": 0.7,
+    "maxTokens": 2000
+  }
+}

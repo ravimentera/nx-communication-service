@@ -4,12 +4,15 @@
  * shim in P8, not here.
  */
 import { Router, type Request, type Response, type NextFunction } from 'express';
+import type { Logger } from 'winston';
 import { z } from 'zod';
 
+import type { AssetService } from '../../engine/content/asset.service.js';
 import type { ContentGenerator } from '../../engine/content/generator.js';
 import { emptyContext, type RenderContext } from '../../engine/content/render-context.js';
 import type { Renderer } from '../../engine/content/renderer.js';
 import type { PackRegistry } from '../../packs/loader.js';
+import type { ImageProvider } from '../../ports/image.js';
 import { NotFoundError, ValidationError } from '../../platform/http/errors.js';
 import { Permission, requirePermissions, requireTenant } from '../../platform/http/auth.middleware.js';
 import { CHANNEL_TYPES } from '../../ports/channel.js';
@@ -63,6 +66,16 @@ export interface ContentApiDeps {
   store: TemplateStore;
   generator: ContentGenerator;
   packs: PackRegistry;
+  /**
+   * P12. Optional so the P4-era tests that build this object without a storage
+   * adapter still compile; absent means `/templates/assets/upload` keeps
+   * answering 501 rather than pretending to store a file.
+   */
+  assets?: AssetService;
+  /** P12. Never set in a shipped configuration — see `ports/image.ts` and D92. */
+  images?: ImageProvider;
+  /** Optional: only the best-effort image pass needs to report a swallowed failure. */
+  logger?: Logger;
 }
 
 /** Wrap an async handler so rejections reach the error middleware. */

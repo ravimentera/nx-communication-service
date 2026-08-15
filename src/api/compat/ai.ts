@@ -29,7 +29,7 @@ import {
   requirePermissions,
   requireTenant,
 } from '../../platform/http/auth.middleware.js';
-import { NotFoundError, NotImplementedError } from '../../platform/http/errors.js';
+import { NotFoundError } from '../../platform/http/errors.js';
 import { deprecate } from './index.js';
 
 /** Legacy path → prompt pack key. Pack content, not code. */
@@ -53,6 +53,47 @@ const bodySchema = z.object({
   temperature: z.number().optional(),
   maxTokens: z.number().int().positive().optional(),
 });
+
+/** The source's body for `/multimodal` (`ai-content-controller.ts:360-367`). */
+const multimodalSchema = z.object({
+  prompt: z.string().min(1),
+  context: z.union([z.string(), z.record(z.string(), z.unknown())]).optional(),
+  textFormat: z.string().default('html'),
+  imageCount: z.number().int().min(1).max(10).default(1),
+  model: z.string().optional(),
+  // Accepted and ignored, like every other `/ai` mode — the pack owns sampling.
+  temperature: z.number().optional(),
+});
+
+interface MultimodalContent {
+  textContent: string;
+  images: { description: string; position: string; style?: string }[];
+}
+
+/**
+ * The shape the source describes in prose inside its prompt string
+ * (`ai-content-controller.ts:388-401`), stated as a schema the provider
+ * enforces instead.
+ */
+const MULTIMODAL_JSON_SCHEMA = {
+  type: 'object',
+  required: ['textContent', 'images'],
+  properties: {
+    textContent: { type: 'string' },
+    images: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['description', 'position'],
+        properties: {
+          description: { type: 'string' },
+          position: { type: 'string' },
+          style: { type: 'string' },
+        },
+      },
+    },
+  },
+} as const;
 
 function handle(
   fn: (req: Request, res: Response) => Promise<void>,
@@ -135,16 +176,71 @@ export function createLegacyAiRouter(deps: ContentApiDeps): Router {
   }
 
   /**
-   * `generateMultimodalContent` took images alongside the prompt. The
-   * `LlmProvider` port is text-only by design — `generate` and `generateJson`
-   * — so this needs a port change, not a router change.
+   * PORTED IN P12, and it never needed an image model — D92.
+   *
+   * The name misleads, and it misled this plan. `generateMultimodalContent`
+   * takes no image and produces no image: it builds a text prompt asking for
+   * copy plus N image *descriptions* and calls `generateJsonContent`
+   * (`ai-content-controller.ts:379-407`), which is the text-only path. The
+   * output is a composition plan a human or a downstream tool acts on.
+   *
+   * The eight-line JSON shape the source appends to its prompt string
+   * (`:388-401`) becomes a real JSON Schema the provider enforces, so a model
+   * that ignores the instruction produces a validation failure instead of prose
+   * the caller has to parse.
    */
   router.post(
     '/multimodal',
-    handle(async () => {
-      throw new NotImplementedError(
-        'Multimodal generation needs an image-capable LlmProvider; the port is text-only. Tracked for P11.',
-      );
+    requirePermissions(Permission.SEND),
+    handle(async (req, res) => {
+      const { tenantId, subTenantId } = requireTenant(req);
+      const body = multimodalSchema.parse(req.body);
+
+      const packKey = 'core.content-multimodal';
+      const pack = deps.packs.prompt(packKey);
+      if (!pack) {
+        throw new NotFoundError(
+          `No prompt pack '${packKey}' is installed for this mode.`,
+          { mode: 'multimodal', available: deps.packs.list() },
+        );
+      }
+
+      const context: RenderContext = {
+        ...emptyContext(tenantId),
+        context: {
+          prompt: body.prompt,
+          format: body.textFormat,
+          imageCount: body.imageCount,
+          ...(typeof body.context === 'string'
+            ? { background: body.context }
+            : (body.context ?? {})),
+        },
+      };
+
+      const result = await deps.generator.generateStructured<MultimodalContent>({
+        tenantId,
+        subTenantId,
+        pack,
+        channel: 'email',
+        playbookGoal: body.prompt,
+        context,
+        jsonSchema: MULTIMODAL_JSON_SCHEMA,
+        ...(body.model ? { overrides: { model: body.model } } : {}),
+      });
+
+      res.status(200).json({
+        success: true,
+        multimodalContent: result.data,
+        metadata: {
+          model: result.model,
+          textFormat: body.textFormat,
+          imageCount: body.imageCount,
+          promptLength: body.prompt.length,
+          tokensIn: result.tokensIn,
+          tokensOut: result.tokensOut,
+          costUsd: result.costUsd,
+        },
+      });
     }),
   );
 

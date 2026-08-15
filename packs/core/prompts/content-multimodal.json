@@ -1,0 +1,23 @@
+{
+  "$comment": "Backs the legacy POST /ai/multimodal. Despite the name, nothing here generates an image: the source builds a text prompt asking for copy plus image *descriptions* and calls generateJsonContent (ai-content-controller.ts:406). It has never needed an image model — see D92.",
+  "key": "core.content-multimodal",
+  "version": 1,
+  "persona": "You are planning a piece of illustrated content for {{tenant.name}}.",
+  "goal": "Write the {{context.format}} content described by {{context.prompt}}, together with {{context.imageCount}} image descriptions that would complement it.",
+  "constraints": [
+    "Describe each image well enough that a designer or an image model could produce it without asking a question.",
+    "Say where in the text each image belongs, in terms of the content you wrote — not as a pixel position.",
+    "Describe only images that earn their place. A decorative image with nothing to say is worse than none.",
+    "Never describe an image containing text, a logo, or a real person's likeness.",
+    "Never state a fact in the copy that is not in the supplied context.",
+    "Return the JSON object and nothing else — no preamble, no markdown fences."
+  ],
+  "channelRules": {
+    "email": "Subject under 60 characters. Short paragraphs.",
+    "sms": "Under 320 characters, and at most one image — an MMS with three attachments is not a text message."
+  },
+  "modelHints": {
+    "temperature": 0.7,
+    "maxTokens": 2000
+  }
+}

@@ -138,6 +138,61 @@ export class ContentGenerator {
   }
 
   /**
+   * Generate against a caller-supplied JSON Schema instead of the draft
+   * contract. Added in P12 for `POST /ai/multimodal`, whose output is not a
+   * message body at all — it is `{textContent, images[]}`, a composition plan.
+   *
+   * Everything the draft path gets that still applies is kept: the pack owns
+   * sampling, the assembler builds the prompt, and the call is audited into
+   * `ai_interactions` through `RecordingLlmProvider`. What is skipped is what
+   * does not apply — `lint` and `aiConfidence` both judge a message someone will
+   * receive, and nothing here is one. Emitting a confidence score for a
+   * composition plan would put a number in front of P6's `threshold` mode that
+   * means nothing to it.
+   */
+  async generateStructured<T>(
+    input: GenerateInput & { jsonSchema: object },
+  ): Promise<{
+    data: T;
+    model: string;
+    tokensIn: number;
+    tokensOut: number;
+    costUsd?: number;
+  }> {
+    const assembled = await this.deps.assembler.assemble({
+      pack: input.pack,
+      playbookGoal: input.playbookGoal,
+      channel: input.channel,
+      context: input.context,
+      complianceConstraints: input.complianceConstraints,
+      tenantStyle: input.tenantStyle,
+    });
+
+    const response = await this.deps.llm.generateJson<T>({
+      system: assembled.system,
+      prompt: assembled.prompt,
+      model: input.overrides?.model ?? assembled.model,
+      temperature: assembled.temperature,
+      maxTokens: assembled.maxTokens,
+      jsonSchema: input.jsonSchema,
+      audit: {
+        tenantId: input.tenantId,
+        subTenantId: input.subTenantId,
+        playbookId: input.playbookId,
+        promptPackKey: assembled.packKey,
+      },
+    });
+
+    return {
+      data: response.content,
+      model: response.model,
+      tokensIn: response.tokensIn,
+      tokensOut: response.tokensOut,
+      costUsd: response.costUsd,
+    };
+  }
+
+  /**
    * Compile the playbook's stored JSON Schema to Zod and check the context
    * against it. Returns how complete the context was, which feeds confidence.
    *

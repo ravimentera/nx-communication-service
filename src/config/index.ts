@@ -128,6 +128,17 @@ const envSchema = z.object({
   S3_MEMORY_BUCKET: optionalString,
   USE_LOCAL_STORAGE: bool(true),
   LOCAL_STORAGE_PATH: str('./memory-store'),
+  /**
+   * Origin the local adapter builds asset URLs from. The S3 adapter ignores it
+   * unless `S3_PUBLIC_BASE_URL` is unset and the bucket is behind a CDN, in
+   * which case set that instead. An asset URL is stored on the row, so changing
+   * either value does not rewrite URLs already handed out.
+   */
+  ASSET_PUBLIC_BASE_URL: str('http://localhost:5007/assets'),
+  S3_PUBLIC_BASE_URL: optionalString,
+  S3_REGION: optionalString,
+  /** Bytes. Rejected before the body is read into memory. */
+  ASSET_MAX_BYTES: int(10 * 1024 * 1024),
 
   // --- compliance ---
   UNSUBSCRIBE_BASE_URL: str('http://localhost:5007/unsubscribe'),
@@ -235,6 +246,10 @@ function shape(env: Env) {
       s3Bucket: env.S3_MEMORY_BUCKET,
       useLocal: env.USE_LOCAL_STORAGE,
       localPath: env.LOCAL_STORAGE_PATH,
+      publicBaseUrl: env.ASSET_PUBLIC_BASE_URL,
+      s3PublicBaseUrl: env.S3_PUBLIC_BASE_URL,
+      s3Region: env.S3_REGION ?? env.AWS_REGION,
+      maxBytes: env.ASSET_MAX_BYTES,
     },
     compliance: {
       unsubscribeBaseUrl: env.UNSUBSCRIBE_BASE_URL,

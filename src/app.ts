@@ -9,6 +9,7 @@ import { createCompatMounts, type CompatDeps } from './api/compat/index.js';
 import { createWebhookRouter, type WebhookDeps } from './api/webhooks/index.js';
 import { createMcpRouter, type McpDeps } from './mcp/index.js';
 import { createApprovalRouter, type ApprovalApiDeps } from './api/v1/approvals.js';
+import { createAssetRouter, type AssetApiDeps } from './api/v1/assets.js';
 import { createCampaignRouter, type CampaignApiDeps } from './api/v1/campaigns.js';
 import { createChannelRouter, type ChannelApiDeps } from './api/v1/channels.js';
 import { createContentRouter, type ContentApiDeps } from './api/v1/content.js';
@@ -40,6 +41,8 @@ export interface AppDeps {
   queue?: NotificationQueue;
   /** Present from P4 onward. */
   content?: ContentApiDeps;
+  /** Present from P12 onward — needs a storage adapter. */
+  assets?: AssetApiDeps;
   /** Present from P5 onward. */
   recipients?: RecipientApiDeps;
   /** Present from P6 onward. */
@@ -157,6 +160,9 @@ export function createApp(deps: AppDeps): Express {
   // P3 onward mount the business routers here.
   if (deps.content) {
     app.use('/v1', createContentRouter(deps.content));
+  }
+  if (deps.assets) {
+    app.use('/v1', createAssetRouter(deps.assets));
   }
   if (deps.recipients) {
     app.use('/v1', createRecipientRouter(deps.recipients));

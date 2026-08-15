@@ -10,6 +10,8 @@
  * (Testcontainers, not a real database — see the header of schema.test.ts.)
  */
 import { readFileSync, readdirSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
@@ -26,6 +28,8 @@ import { ApprovalService } from '../../../src/engine/approvals/approval.service.
 import { PolicyService } from '../../../src/engine/approvals/policy.service.js';
 import { ComplianceGate } from '../../../src/engine/compliance/gate.js';
 import { PreferenceService } from '../../../src/engine/compliance/preference.service.js';
+import { LocalStorageProvider } from '../../../src/adapters/storage/local.provider.js';
+import { AssetService } from '../../../src/engine/content/asset.service.js';
 import { ContentGenerator } from '../../../src/engine/content/generator.js';
 import { PromptAssembler } from '../../../src/engine/content/prompt-assembler.js';
 import { Renderer } from '../../../src/engine/content/renderer.js';
@@ -203,8 +207,20 @@ export async function startHarness(): Promise<Harness> {
         tokensOut: 7,
         latencyMs: 1,
       }),
-      generateJson: async () => ({
-        content: { content: 'generated body', subject: 'Generated subject' },
+      /**
+       * Branches on the caller's schema. P12 added `generateStructured`, which
+       * asks for a shape that is not the draft contract — `/ai/multimodal` wants
+       * `{textContent, images[]}` — so a stub that always returns
+       * `{content, subject}` would make that endpoint's contract test assert
+       * only that the handler passed something through.
+       */
+      generateJson: async (req: { jsonSchema?: { properties?: Record<string, unknown> } }) => ({
+        content: req.jsonSchema?.properties?.textContent
+          ? {
+              textContent: 'generated body',
+              images: [{ description: 'a photo of a thing', position: 'above the first paragraph' }],
+            }
+          : { content: 'generated body', subject: 'Generated subject' },
         model: 'stub-model',
         tokensIn: 12,
         tokensOut: 7,
@@ -243,7 +259,22 @@ export async function startHarness(): Promise<Harness> {
   const channels = { configs: channelConfigs, dispatcher, queue };
   const playbookDeps = { runtime, registry: new PlaybookRegistry({ db, logger, packs }), packs };
   const recipientDeps = { recipients, preferences, gate };
-  const contentDeps = { renderer, store: templateStore, generator, packs };
+  // P12. A real `AssetService` over a throwaway directory, so the upload path
+  // is exercised end to end rather than mocked. No `images` provider: the engine
+  // ships no adapter (D92), and the contract is that the generate-image route
+  // 501s in exactly that configuration.
+  const assetRoot = await mkdtemp(join(tmpdir(), 'outreach-assets-'));
+  const assets = new AssetService({
+    db,
+    logger,
+    maxBytes: 1024 * 1024,
+    storage: new LocalStorageProvider({
+      config: { root: assetRoot, publicBaseUrl: 'http://test.local/assets' },
+      logger,
+    }),
+  });
+
+  const contentDeps = { renderer, store: templateStore, generator, packs, assets, logger };
 
   // P11. Registered here so the OpenAPI contract test actually SEES the
   // campaign routes — a harness that omits a dep bundle makes
@@ -262,6 +293,8 @@ export async function startHarness(): Promise<Harness> {
     dispatcher,
     queue,
     content: contentDeps,
+    // P12, registered for the same reason as the campaign bundle below.
+    assets: { assets },
     recipients: recipientDeps,
     approvals: { approvals, policies },
     playbooks: playbookDeps,
@@ -303,6 +336,7 @@ export async function startHarness(): Promise<Harness> {
       await redis.close().catch(() => {});
       await pool.end().catch(() => {});
       await container.stop().catch(() => {});
+      await rm(assetRoot, { recursive: true, force: true }).catch(() => {});
     },
   };
 }

@@ -1,0 +1,24 @@
+{
+  "$comment": "Backs POST /templates/generate, which has defaulted to this key since P8b while no pack shipped it — so the endpoint 404'd unless the caller named a pack of their own. Generic on purpose: authoring a message template is not vertical vocabulary.",
+  "key": "core.template-author",
+  "version": 1,
+  "persona": "You are authoring a reusable message template for {{tenant.name}}.",
+  "goal": "Write the template body described by {{context.prompt}}, in {{context.format}} format.",
+  "constraints": [
+    "Output a template, not a finished message: leave the parts that vary per recipient as Handlebars placeholders.",
+    "Use only placeholders the caller's description implies. Never invent a variable whose value nothing will supply — an unresolved placeholder renders as empty text in a message someone receives.",
+    "Namespace placeholders the way the render context does: {{recipient.firstName}}, {{sender.displayName}}, {{tenant.name}}, {{context.<field>}}.",
+    "Write only the template body. No preamble, no explanation of what you wrote, no markdown fences.",
+    "Include an unsubscribe affordance where the channel and the message type expect one.",
+    "Never state a fact that is not in the supplied description."
+  ],
+  "channelRules": {
+    "sms": "One or two sentences, under 320 characters. No subject line, no HTML.",
+    "email": "Subject under 60 characters. Short paragraphs. Honour the requested format exactly — MJML means MJML tags, HTML means inline CSS for mail-client compatibility.",
+    "slack": "Plain text with Slack markdown. No greeting or sign-off — it is a channel post, not a letter."
+  },
+  "modelHints": {
+    "temperature": 0.6,
+    "maxTokens": 2000
+  }
+}

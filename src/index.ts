@@ -13,6 +13,7 @@ import { InlineContextProvider } from './adapters/context/inline.provider.js';
 import { MenteraContextProvider } from './adapters/context/mentera.provider.js';
 import { BedrockProvider } from './adapters/llm/bedrock.provider.js';
 import { RecordingLlmProvider } from './adapters/llm/recording.provider.js';
+import { createStorageProvider } from './adapters/storage/index.js';
 import { tenantPacks } from './db/schema.js';
 import { ApprovalService } from './engine/approvals/approval.service.js';
 import { PolicyService } from './engine/approvals/policy.service.js';
@@ -27,6 +28,7 @@ import { ConversationService } from './engine/messaging/conversation.service.js'
 import { MessageService } from './engine/messaging/message.service.js';
 import { ReceiptService } from './engine/messaging/receipt.service.js';
 import { RecipientService } from './engine/recipients/recipient.service.js';
+import { AssetService } from './engine/content/asset.service.js';
 import { ContentGenerator } from './engine/content/generator.js';
 import { PromptAssembler } from './engine/content/prompt-assembler.js';
 import { Renderer } from './engine/content/renderer.js';
@@ -310,6 +312,28 @@ async function main(): Promise<void> {
   // `lintWarnings` was always empty — which silently made `aiConfidence` (D35)
   // pure context-completeness and P6's `threshold` mode's lint condition
   // vacuously true.
+  // P12. `config.storage` has been declared since P0 with nothing reading it,
+  // which is why asset upload answered 501. No ImageProvider is constructed:
+  // the port exists (`ports/image.ts`) and the engine ships no adapter, because
+  // the source could not generate an image either (D92).
+  const storage = createStorageProvider(
+    {
+      s3Bucket: config.storage.s3Bucket,
+      useLocal: config.storage.useLocal,
+      localPath: config.storage.localPath,
+      publicBaseUrl: config.storage.publicBaseUrl,
+      s3PublicBaseUrl: config.storage.s3PublicBaseUrl,
+      s3Region: config.storage.s3Region,
+    },
+    logger,
+  );
+  const assetService = new AssetService({
+    db,
+    storage,
+    logger,
+    maxBytes: config.storage.maxBytes,
+  });
+
   const lintRules = mergeRules(...packs.compliance());
   const generator = new ContentGenerator({
     llm,
@@ -388,7 +412,7 @@ async function main(): Promise<void> {
     redis,
     dispatcher,
     queue,
-    content: { renderer, store: templateStore, generator, packs },
+    content: { renderer, store: templateStore, generator, packs, assets: assetService, logger },
     recipients: {
       recipients: recipientService,
       preferences,
@@ -431,7 +455,7 @@ async function main(): Promise<void> {
       approvals: { approvals, policies },
       playbooks: { runtime: runtimeRef.current, registry: playbookRegistry, packs },
       recipients: { recipients: recipientService, preferences, gate: complianceGate },
-      content: { renderer, store: templateStore, generator, packs },
+      content: { renderer, store: templateStore, generator, packs, assets: assetService, logger },
       receipts: receiptService,
       context: contextRegistry,
     },

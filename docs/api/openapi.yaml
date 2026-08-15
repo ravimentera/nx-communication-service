@@ -55,6 +55,8 @@ tags:
     description: Human review of drafts before they send.
   - name: content
     description: Templates, rendering and model-written drafts.
+  - name: assets
+    description: Images and documents a template embeds.
   - name: playbooks
     description: What fires on which event, as data.
   - name: channels
@@ -836,6 +838,122 @@ paths:
         '200':
           description: The rendered output.
           content: { application/json: { schema: { type: object, additionalProperties: true } } }
+
+  # ── assets ─────────────────────────────────────────────────────────────────
+  /v1/assets:
+    get:
+      operationId: getAssets
+      tags: [assets]
+      summary: List this tenant's assets
+      parameters:
+        - { name: kind, in: query, schema: { type: string, enum: [image, document, generated] } }
+        - { $ref: '#/components/parameters/Limit' }
+        - { name: offset, in: query, schema: { type: integer } }
+      responses:
+        '200':
+          description: The assets.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  assets: { type: array, items: { $ref: '#/components/schemas/Asset' } }
+                  count: { type: integer }
+    post:
+      operationId: postAssets
+      tags: [assets]
+      summary: Upload an asset
+      description: |
+        `multipart/form-data` with a single `file` part, bounded by
+        `ASSET_MAX_BYTES` (10 MB by default).
+
+        The stored key is **assigned by the service** — `<tenantId>/<kind>/<uuid>.<ext>`.
+        The filename you send is recorded in `metadata.filename` for display and
+        never reaches a path.
+      security: [{ gatewayIdentity: [outreach:templates:write] }]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '201':
+          description: The stored asset.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Asset' } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '501':
+          description: No storage adapter is configured.
+
+  /v1/assets/generate:
+    post:
+      operationId: postAssetsGenerate
+      tags: [assets]
+      summary: Generate an image asset
+      description: |
+        **Answers 501 in every shipped configuration.** The `ImageProvider` port
+        is declared (`src/ports/image.ts`) and the engine registers no adapter,
+        because the service this was extracted from could not generate an image
+        either — `AIService.generateImage` threw unconditionally. See D92.
+
+        A deployment with an image model registers an adapter in the composition
+        root and this begins working; no other code changes.
+      security: [{ gatewayIdentity: [outreach:templates:write] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [prompt]
+              properties:
+                prompt: { type: string }
+                size:
+                  type: string
+                  enum: ['256x256', '512x512', '1024x1024', '1792x1024', '1024x1792']
+                style: { type: string, enum: [natural, vivid] }
+                count: { type: integer, minimum: 1, maximum: 4 }
+                model: { type: string }
+      responses:
+        '201':
+          description: The generated assets.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  assets: { type: array, items: { $ref: '#/components/schemas/Asset' } }
+                  count: { type: integer }
+        '501':
+          description: No image model is configured.
+
+  /v1/assets/{id}:
+    get:
+      operationId: getAssetsById
+      tags: [assets]
+      summary: Get one asset
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: The asset.
+          content: { application/json: { schema: { $ref: '#/components/schemas/Asset' } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: deleteAssetsById
+      tags: [assets]
+      summary: Delete an asset
+      description: |
+        Removes the row, then the stored object. That order is deliberate: an
+        orphaned object costs storage, an orphaned row costs a broken image in a
+        template that renders as though it were fine.
+      security: [{ gatewayIdentity: [outreach:templates:write] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '204': { description: Deleted. }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   # ── playbooks ──────────────────────────────────────────────────────────────
   /v1/outreach/trigger:
@@ -2150,6 +2268,31 @@ components:
             isDefault: { type: boolean }
             version: { type: integer }
             usageCount: { type: integer }
+
+    Asset:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        tenantId: { type: string }
+        subTenantId: { type: [string, 'null'], format: uuid }
+        kind: { type: string, enum: [image, document, generated] }
+        url:
+          type: string
+          description: |
+            Where the object can be fetched. Built from `ASSET_PUBLIC_BASE_URL`
+            for local storage, or from `S3_PUBLIC_BASE_URL` / the bucket's
+            virtual host for S3. Stored on the row, so changing the setting does
+            not rewrite URLs already handed out.
+        mimeType: { type: [string, 'null'] }
+        size: { type: [integer, 'null'], description: Bytes. }
+        metadata:
+          type: object
+          additionalProperties: true
+          description: |
+            Carries `storageKey`, `storageProvider`, `filename` (as the client
+            sent it) and `uploadedBy`. A generated asset also carries `prompt`
+            and `model`.
+        createdAt: { type: string, format: date-time }
 
     OutreachTrigger:
       type: object
