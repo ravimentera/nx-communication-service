@@ -83,6 +83,20 @@ export class PlaybookRegistry {
       skipped: [],
     };
 
+    /**
+     * The config the tenant will end up with — existing values with this call's
+     * on top. Read before anything is written, because `requiredConfig` is
+     * checked against the *result* of the install, not against this call's body:
+     * an operator adding one setting to a pack that is already configured should
+     * not have to resend all of them.
+     */
+    const existingConfig = await this.currentPackConfig(scope, packId);
+    const mergedConfig = options.config
+      ? deepMerge(existingConfig, options.config)
+      : existingConfig;
+
+    this.assertRequiredConfig(pack, mergedConfig);
+
     // The global catalogue row. Not tenant-owned — `packs` is one of the two
     // documented tables with no tenant_id (D19).
     await this.deps.db
@@ -119,22 +133,74 @@ export class PlaybookRegistry {
       .values({
         tenantId: scope.tenantId,
         packId,
-        config: options.config ?? {},
+        config: mergedConfig,
         isActive: true,
       })
       .onConflictDoUpdate({
         target: [tenantPacks.tenantId, tenantPacks.packId],
         set: {
           isActive: true,
-          // Merge, do not replace: `config` holds operator-set values like
-          // emergencyContacts and the compliance-enforcement flip date (D41).
-          ...(options.config ? { config: options.config } : {}),
+          // Merge, do not replace. This said so before P12 and did the opposite:
+          // it assigned `options.config` wholesale, so re-installing with one
+          // setting dropped every other one the operator had set. `config` holds
+          // `emergencyContacts` and `slackChannels.staffAlerts`, and a playbook
+          // whose `$config.` reference is unset produces a SKIPPED run — so the
+          // symptom was a staff alert that silently stopped arriving, at the
+          // next deploy rather than at the edit. See D95.
+          config: mergedConfig,
           updatedAt: new Date(),
         },
       });
 
     this.deps.logger.info('pack installed', { tenantId: scope.tenantId, ...result });
     return result;
+  }
+
+  /** The config already recorded for this tenant and pack, or `{}`. */
+  private async currentPackConfig(
+    scope: TenantScope,
+    packId: string,
+  ): Promise<Record<string, unknown>> {
+    const [row] = await this.deps.db
+      .select({ config: tenantPacks.config })
+      .from(tenantPacks)
+      .where(and(eq(tenantPacks.tenantId, scope.tenantId), eq(tenantPacks.packId, packId)))
+      .limit(1);
+    return (row?.config ?? {}) as Record<string, unknown>;
+  }
+
+  /**
+   * Every key in the manifest's `requiredConfig` must resolve to a value.
+   *
+   * `requiredConfig` has been in the pack schema and in the medspa manifest
+   * since P7 and nothing has ever read it. Without this, installing the medspa
+   * pack with no `emergencyContacts` succeeds, and the first sign of trouble is
+   * an emergency notification producing a SKIPPED run — the failure mode
+   * docs/PACKS.md says the mechanism exists to prevent, discovered at 3am rather
+   * than at install.
+   *
+   * Refusing the install is the right end of that trade: a pack installed
+   * without its destinations is not "partly working", it is a pack whose alerts
+   * go nowhere.
+   */
+  private assertRequiredConfig(
+    pack: { id: string; manifest?: { requiredConfig?: string[] } | null },
+    config: Record<string, unknown>,
+  ): void {
+    const required = pack.manifest?.requiredConfig ?? [];
+    if (required.length === 0) return;
+
+    const missing = required.filter((path) => {
+      const value = readPath(config, path);
+      return value === undefined || value === null || value === '';
+    });
+
+    if (missing.length > 0) {
+      throw new ValidationError(
+        `Pack '${pack.id}' requires configuration that was not supplied: ${missing.join(', ')}`,
+        { packId: pack.id, missing, required },
+      );
+    }
   }
 
   /**
@@ -450,6 +516,44 @@ export class PlaybookRegistry {
     }
     return chosen.id;
   }
+}
+
+/** Read a dotted path, e.g. `slackChannels.staffAlerts`. */
+function readPath(source: Record<string, unknown>, path: string): unknown {
+  let current: unknown = source;
+  for (const segment of path.split('.')) {
+    if (current === null || typeof current !== 'object') return undefined;
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current;
+}
+
+/**
+ * Recursive merge for plain objects; anything else replaces.
+ *
+ * Deep rather than shallow because pack config nests — `slackChannels` holds
+ * `staffAlerts`, `emergencyAlerts` and `systemAlerts`, and a shallow merge of
+ * `{slackChannels: {staffAlerts: '#new'}}` would drop the other two, which is
+ * the same bug as the one being fixed, one level down.
+ *
+ * An array replaces rather than concatenating: `emergencyContacts` is a list of
+ * who to wake up, and an operator sending a shorter list means to shorten it.
+ */
+function deepMerge(
+  base: Record<string, unknown>,
+  patch: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...base };
+  for (const [key, value] of Object.entries(patch)) {
+    const existing = merged[key];
+    merged[key] =
+      isPlainObject(existing) && isPlainObject(value) ? deepMerge(existing, value) : value;
+  }
+  return merged;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 /** Used by the v1 router to widen a bulk lookup. */

@@ -20,6 +20,7 @@ import {
   createUnsubscribeRouter,
   type RecipientApiDeps,
 } from './api/v1/recipients.js';
+import { createTenancyRouter, type TenancyApiDeps } from './api/v1/tenancy.js';
 import type { Config } from './config/index.js';
 import type { Dispatcher } from './engine/delivery/dispatcher.js';
 import type { NotificationQueue } from './engine/delivery/notification-queue.js';
@@ -30,6 +31,15 @@ import { metricsHandler } from './platform/observability/metrics.js';
 import type { RedisHandle } from './platform/redis/index.js';
 
 export const VERSION = '0.1.0';
+
+/**
+ * A fixed window per key. The bucket is part of the key, so it expires on its
+ * own and there is nothing to sweep — the alternative, one counter reset by a
+ * timer, needs a process that owns the reset and gets it wrong across replicas.
+ */
+function rateLimitKey(keyId: string, windowSeconds: number): string {
+  return `apikey:rl:${keyId}:${Math.floor(Date.now() / (windowSeconds * 1000))}`;
+}
 
 export interface AppDeps {
   config: Config;
@@ -43,6 +53,8 @@ export interface AppDeps {
   content?: ContentApiDeps;
   /** Present from P12 onward — needs a storage adapter. */
   assets?: AssetApiDeps;
+  /** Present from P12 onward — API keys and per-tenant usage. */
+  tenancy?: TenancyApiDeps;
   /** Present from P5 onward. */
   recipients?: RecipientApiDeps;
   /** Present from P6 onward. */
@@ -155,7 +167,17 @@ export function createApp(deps: AppDeps): Express {
     );
   }
 
-  app.use(createAuthMiddleware({ config: config.auth, logger }));
+  app.use(
+    createAuthMiddleware({
+      config: config.auth,
+      logger,
+      // Both are unused in `gateway` mode, which is every Mentera deployment.
+      // They are what makes `apikey` mode work for a vendor with no gateway.
+      verifyApiKey: deps.tenancy ? (key) => deps.tenancy!.apiKeys.verify(key) : undefined,
+      countRequest: (keyId, windowSeconds) =>
+        deps.redis.store.incrWithTtl(rateLimitKey(keyId, windowSeconds), windowSeconds),
+    }),
+  );
 
   // P3 onward mount the business routers here.
   if (deps.content) {
@@ -163,6 +185,9 @@ export function createApp(deps: AppDeps): Express {
   }
   if (deps.assets) {
     app.use('/v1', createAssetRouter(deps.assets));
+  }
+  if (deps.tenancy) {
+    app.use('/v1', createTenancyRouter(deps.tenancy));
   }
   if (deps.recipients) {
     app.use('/v1', createRecipientRouter(deps.recipients));

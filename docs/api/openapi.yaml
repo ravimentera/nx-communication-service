@@ -57,6 +57,8 @@ tags:
     description: Templates, rendering and model-written drafts.
   - name: assets
     description: Images and documents a template embeds.
+  - name: tenancy
+    description: API keys and per-tenant usage.
   - name: playbooks
     description: What fires on which event, as data.
   - name: channels
@@ -953,6 +955,141 @@ paths:
       parameters: [{ $ref: '#/components/parameters/Id' }]
       responses:
         '204': { description: Deleted. }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ── tenancy ────────────────────────────────────────────────────────────────
+  /v1/usage:
+    get:
+      operationId: getUsage
+      tags: [tenancy]
+      summary: What this tenant consumed
+      description: |
+        Model spend and delivery volume for a period, defaulting to the current
+        calendar month. `to` is **exclusive**, so two consecutive reports across
+        a boundary do not count it twice.
+
+        Counts are of what the engine did, not of what was delivered: a message
+        counted as sent is one a provider accepted. A later bounce appears in
+        `byStatus` rather than decrementing the send count, because a provider
+        charges for the attempt.
+      parameters:
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+      responses:
+        '200':
+          description: The usage report.
+          content: { application/json: { schema: { $ref: '#/components/schemas/UsageReport' } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /v1/api-keys:
+    get:
+      operationId: getApiKeys
+      tags: [tenancy]
+      summary: List this tenant's API keys
+      description: Metadata only. A key's plaintext is never recoverable.
+      security: [{ gatewayIdentity: [outreach:admin] }]
+      responses:
+        '200':
+          description: The keys.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  keys: { type: array, items: { $ref: '#/components/schemas/ApiKey' } }
+                  count: { type: integer }
+    post:
+      operationId: postApiKeys
+      tags: [tenancy]
+      summary: Issue an API key
+      description: |
+        For `AUTH_MODE=apikey` — how a vendor runs this service with no Mentera
+        gateway in front of it.
+
+        **The plaintext key is in this response and nowhere else.** It is not
+        stored; only its SHA-256 digest is. A lost key is rotated, not recovered.
+
+        Scopes must be permissions the engine recognises. A key authenticates as
+        role `system` and cannot take the admin short-circuit unless
+        `outreach:admin` is among its scopes.
+      security: [{ gatewayIdentity: [outreach:admin] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, scopes]
+              properties:
+                name: { type: string, maxLength: 120 }
+                scopes:
+                  type: array
+                  minItems: 1
+                  items: { type: string }
+                expiresAt: { type: string, format: date-time }
+      responses:
+        '201':
+          description: The key, shown once.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiKey'
+                  - type: object
+                    properties:
+                      key: { type: string, description: The plaintext. Shown once. }
+                      warning: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /v1/api-keys/{id}/rotate:
+    post:
+      operationId: postApiKeysByIdRotate
+      tags: [tenancy]
+      summary: Replace a key, with an overlap
+      description: |
+        Issues a replacement carrying the same name and scopes, and expires the
+        old one after `graceSeconds` (one hour by default). The overlap is the
+        point: rotation without one means the caller must deploy the new key at
+        the same instant the old one dies.
+      security: [{ gatewayIdentity: [outreach:admin] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                graceSeconds: { type: integer, minimum: 0, maximum: 86400, default: 3600 }
+      responses:
+        '201':
+          description: The replacement key, shown once.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ApiKey'
+                  - type: object
+                    properties:
+                      key: { type: string }
+                      warning: { type: string }
+                      previousExpiresAt: { type: string, format: date-time }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/api-keys/{id}:
+    delete:
+      operationId: deleteApiKeysById
+      tags: [tenancy]
+      summary: Revoke a key
+      description: |
+        Sets `revokedAt`; the row is **not** deleted. It is the only record that
+        the key ever existed, which is what an incident review asks for after the
+        key is gone.
+      security: [{ gatewayIdentity: [outreach:admin] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: The revoked key.
+          content: { application/json: { schema: { $ref: '#/components/schemas/ApiKey' } } }
         '404': { $ref: '#/components/responses/NotFound' }
 
   # ── playbooks ──────────────────────────────────────────────────────────────
@@ -2293,6 +2430,73 @@ components:
             sent it) and `uploadedBy`. A generated asset also carries `prompt`
             and `model`.
         createdAt: { type: string, format: date-time }
+
+    ApiKey:
+      type: object
+      description: Metadata only — the plaintext appears once, in the create response.
+      properties:
+        id: { type: string, format: uuid }
+        tenantId: { type: string }
+        name: { type: string }
+        scopes: { type: array, items: { type: string } }
+        lastUsedAt:
+          type: [string, 'null']
+          format: date-time
+          description: Recorded at most once a minute, so this is accurate to the minute.
+        expiresAt: { type: [string, 'null'], format: date-time }
+        revokedAt: { type: [string, 'null'], format: date-time }
+        createdAt: { type: string, format: date-time }
+
+    UsageReport:
+      type: object
+      properties:
+        tenantId: { type: string }
+        period:
+          type: object
+          properties:
+            from: { type: string, format: date-time }
+            to: { type: string, format: date-time, description: Exclusive. }
+        ai:
+          type: object
+          properties:
+            calls: { type: integer }
+            failedCalls: { type: integer }
+            tokensIn:
+              type: integer
+              description: |
+                0 for rows written before P12 — `ai_interactions` stored only a
+                total, and the split was added to `metadata` when this endpoint
+                was built. `tokensTotal` is correct for every row.
+            tokensOut: { type: integer }
+            tokensTotal: { type: integer }
+            costUsd: { type: number }
+            byModel:
+              type: array
+              items:
+                type: object
+                properties:
+                  model: { type: string }
+                  calls: { type: integer }
+                  tokensTotal: { type: integer }
+                  costUsd: { type: number }
+        messages:
+          type: object
+          properties:
+            total: { type: integer }
+            byChannel:
+              type: array
+              items:
+                type: object
+                properties:
+                  channel: { type: string }
+                  count: { type: integer }
+            byStatus:
+              type: array
+              items:
+                type: object
+                properties:
+                  status: { type: string }
+                  count: { type: integer }
 
     OutreachTrigger:
       type: object

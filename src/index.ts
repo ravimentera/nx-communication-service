@@ -28,6 +28,8 @@ import { ConversationService } from './engine/messaging/conversation.service.js'
 import { MessageService } from './engine/messaging/message.service.js';
 import { ReceiptService } from './engine/messaging/receipt.service.js';
 import { RecipientService } from './engine/recipients/recipient.service.js';
+import { ApiKeyService } from './engine/tenancy/api-key.service.js';
+import { UsageService } from './engine/tenancy/usage.service.js';
 import { AssetService } from './engine/content/asset.service.js';
 import { ContentGenerator } from './engine/content/generator.js';
 import { PromptAssembler } from './engine/content/prompt-assembler.js';
@@ -334,6 +336,20 @@ async function main(): Promise<void> {
     maxBytes: config.storage.maxBytes,
   });
 
+  // P12. `tenant_api_keys` has existed since P2 with nothing reading it, and
+  // AUTH_MODE=apikey answered 501. This is what a vendor with no Mentera
+  // gateway in front of the service authenticates with.
+  const apiKeys = new ApiKeyService({
+    db,
+    logger,
+    cache: redis.store,
+    keyPrefix: config.redis.keyPrefix,
+  });
+
+  // Metered now because the pricing model is undecided: whatever it turns out
+  // to be will want to apply to a period that has already happened.
+  const usageService = new UsageService({ db, logger });
+
   const lintRules = mergeRules(...packs.compliance());
   const generator = new ContentGenerator({
     llm,
@@ -413,6 +429,8 @@ async function main(): Promise<void> {
     dispatcher,
     queue,
     content: { renderer, store: templateStore, generator, packs, assets: assetService, logger },
+    assets: { assets: assetService },
+    tenancy: { apiKeys, usage: usageService },
     recipients: {
       recipients: recipientService,
       preferences,
@@ -433,7 +451,11 @@ async function main(): Promise<void> {
       dispatcher,
       queue,
       logger,
-      authenticate: createAuthMiddleware({ config: config.auth, logger }),
+      authenticate: createAuthMiddleware({
+        config: config.auth,
+        logger,
+        verifyApiKey: (key) => apiKeys.verify(key),
+      }),
       render: createBodyResolver({ templates: templateStore, renderer }),
     },
     webhooks: {

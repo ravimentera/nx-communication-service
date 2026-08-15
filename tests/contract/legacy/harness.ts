@@ -30,6 +30,8 @@ import { ComplianceGate } from '../../../src/engine/compliance/gate.js';
 import { PreferenceService } from '../../../src/engine/compliance/preference.service.js';
 import { LocalStorageProvider } from '../../../src/adapters/storage/local.provider.js';
 import { AssetService } from '../../../src/engine/content/asset.service.js';
+import { ApiKeyService } from '../../../src/engine/tenancy/api-key.service.js';
+import { UsageService } from '../../../src/engine/tenancy/usage.service.js';
 import { ContentGenerator } from '../../../src/engine/content/generator.js';
 import { PromptAssembler } from '../../../src/engine/content/prompt-assembler.js';
 import { Renderer } from '../../../src/engine/content/renderer.js';
@@ -295,6 +297,10 @@ export async function startHarness(): Promise<Harness> {
     content: contentDeps,
     // P12, registered for the same reason as the campaign bundle below.
     assets: { assets },
+    tenancy: {
+      apiKeys: new ApiKeyService({ db, logger, cache: redis.store }),
+      usage: new UsageService({ db, logger }),
+    },
     recipients: recipientDeps,
     approvals: { approvals, policies },
     playbooks: playbookDeps,

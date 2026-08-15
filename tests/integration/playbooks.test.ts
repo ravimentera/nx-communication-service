@@ -22,6 +22,7 @@ import {
   playbooks,
   recipients,
   tenantPacks,
+  tenants,
 } from '../../src/db/schema.js';
 import { ApprovalService } from '../../src/engine/approvals/approval.service.js';
 import { PolicyService } from '../../src/engine/approvals/policy.service.js';
@@ -204,7 +205,10 @@ describe('installing the medspa pack', () => {
 
   it('writes playbooks, templates, policies and triggers as rows — and no DDL', async () => {
     const result = await registry.installPack(scope, 'medspa', {
-      config: { emergencyContacts: ['ops@clinic.test'] },
+      config: {
+        emergencyContacts: ['ops@clinic.test'],
+        slackChannels: { staffAlerts: '#staff', emergencyAlerts: '#urgent', systemAlerts: '#sys' },
+      },
     });
 
     expect(result.playbooks).toBeGreaterThanOrEqual(17);
@@ -230,10 +234,86 @@ describe('installing the medspa pack', () => {
   it('is idempotent, and does not revert a tenant’s edits', async () => {
     const before = await db.select().from(playbooks).where(eq(playbooks.tenantId, TENANT));
 
+    // No config on a re-install: `requiredConfig` is checked against the config
+    // the tenant ends up with, not against this call's body, so adding one
+    // setting later does not mean resending all of them.
     await registry.installPack(scope, 'medspa');
 
     const after = await db.select().from(playbooks).where(eq(playbooks.tenantId, TENANT));
     expect(after.length).toBe(before.length);
+  });
+
+  it('refuses an install missing the config the manifest requires', async () => {
+    // `requiredConfig` has been in the schema and the manifest since P7 with
+    // nothing reading it, so this install used to succeed — and the first sign
+    // of trouble was an emergency notification producing a SKIPPED run at 3am,
+    // which is the failure docs/PACKS.md says the mechanism exists to prevent.
+    const fresh = { tenantId: 'tenant-unconfigured' };
+    await db.insert(tenants).values({ id: fresh.tenantId, name: 'Unconfigured' });
+
+    await expect(registry.installPack(fresh, 'medspa')).rejects.toThrow(
+      /requires configuration that was not supplied/,
+    );
+
+    // And nothing was half-installed.
+    const rows = await db
+      .select()
+      .from(tenantPacks)
+      .where(eq(tenantPacks.tenantId, fresh.tenantId));
+    expect(rows).toHaveLength(0);
+  });
+
+  it('names every missing key, not just the first', async () => {
+    const fresh = { tenantId: 'tenant-partial' };
+    await db.insert(tenants).values({ id: fresh.tenantId, name: 'Partial' });
+
+    await expect(
+      registry.installPack(fresh, 'medspa', {
+        config: { emergencyContacts: ['ops@clinic.test'] },
+      }),
+    ).rejects.toThrow(/slackChannels.staffAlerts.*slackChannels.systemAlerts/);
+  });
+
+  it('merges config instead of replacing it', async () => {
+    // Before P12 this assigned the new object wholesale, so an operator setting
+    // one channel dropped `emergencyContacts` and the other two — and the
+    // playbooks that reference them began producing SKIPPED runs. See D95.
+    await registry.installPack(scope, 'medspa', {
+      config: { slackChannels: { staffAlerts: '#staff-v2' } },
+    });
+
+    const [row] = await db
+      .select({ config: tenantPacks.config })
+      .from(tenantPacks)
+      .where(and(eq(tenantPacks.tenantId, TENANT), eq(tenantPacks.packId, 'medspa')));
+
+    expect(row?.config).toEqual({
+      emergencyContacts: ['ops@clinic.test'],
+      slackChannels: {
+        staffAlerts: '#staff-v2',
+        // Deep, not shallow: these two live one level down and a shallow merge
+        // would have dropped them.
+        emergencyAlerts: '#urgent',
+        systemAlerts: '#sys',
+      },
+    });
+  });
+
+  it('replaces an array rather than concatenating it', async () => {
+    // `emergencyContacts` is a list of who to wake up; a shorter list means
+    // shorten it, not "add these too".
+    await registry.installPack(scope, 'medspa', {
+      config: { emergencyContacts: ['oncall@clinic.test'] },
+    });
+
+    const [row] = await db
+      .select({ config: tenantPacks.config })
+      .from(tenantPacks)
+      .where(and(eq(tenantPacks.tenantId, TENANT), eq(tenantPacks.packId, 'medspa')));
+
+    expect((row?.config as { emergencyContacts: string[] }).emergencyContacts).toEqual([
+      'oncall@clinic.test',
+    ]);
   });
 });
 

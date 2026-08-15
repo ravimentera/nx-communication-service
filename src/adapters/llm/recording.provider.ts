@@ -107,6 +107,13 @@ export class RecordingLlmProvider implements LlmProvider {
         input: req.prompt,
         output: renderOutput(response),
         tokensUsed: response.tokensIn + response.tokensOut,
+        // The column holds one total, and input and output tokens are priced
+        // differently by every provider — so a total cannot be re-costed if a
+        // rate changes, and cannot be checked against a vendor bill that itemises
+        // them. Kept on `metadata` rather than in two new columns: §0.10 tier 2,
+        // and P12's usage endpoint is the only reader.
+        tokensIn: response.tokensIn,
+        tokensOut: response.tokensOut,
         processingTime: response.latencyMs,
         costUsd: response.costUsd,
         success: true,
@@ -146,6 +153,8 @@ export class RecordingLlmProvider implements LlmProvider {
       input: string;
       output: string;
       tokensUsed?: number;
+      tokensIn?: number;
+      tokensOut?: number;
       processingTime: number;
       costUsd?: number;
       success: boolean;
@@ -170,6 +179,10 @@ export class RecordingLlmProvider implements LlmProvider {
         costUsd: row.costUsd?.toFixed(6),
         success: row.success,
         errorMessage: row.errorMessage,
+        metadata:
+          row.tokensIn === undefined && row.tokensOut === undefined
+            ? null
+            : { tokensIn: row.tokensIn ?? 0, tokensOut: row.tokensOut ?? 0 },
       });
     } catch (error) {
       this.logger.error('failed to write ai_interactions row', {

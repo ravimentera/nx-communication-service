@@ -43,6 +43,13 @@ export interface KeyValueStore {
    * as the same number. `get`-then-`set` would not do.
    */
   incr(key: string): Promise<number>;
+  /**
+   * Increment, and set the key to expire in `ttlSeconds` if it did not already
+   * have an expiry. Added in P12 for the per-API-key rate limiter, which needs a
+   * counter that expires on its own — plain `incr` leaves a key that grows
+   * forever and a window that never resets.
+   */
+  incrWithTtl(key: string, ttlSeconds: number): Promise<number>;
   ping(): Promise<boolean>;
 }
 
@@ -90,6 +97,20 @@ class MemoryStore implements KeyValueStore {
     return next;
   }
 
+  async incrWithTtl(key: string, ttlSeconds: number): Promise<number> {
+    const entry = this.entries.get(key);
+    const expired = entry?.expiresAt !== null && (entry?.expiresAt ?? 0) < Date.now();
+    const current = entry && !expired ? Number(entry.value) : 0;
+    const next = (Number.isFinite(current) ? current : 0) + 1;
+    // Keep the original expiry on a running window; start one on a new key.
+    const expiresAt =
+      entry && !expired && entry.expiresAt !== null
+        ? entry.expiresAt
+        : Date.now() + ttlSeconds * 1000;
+    this.entries.set(key, { value: String(next), expiresAt });
+    return next;
+  }
+
   async ping(): Promise<boolean> {
     return true;
   }
@@ -118,6 +139,22 @@ class RedisStore implements KeyValueStore {
 
   async incr(key: string): Promise<number> {
     return this.redis.incr(key);
+  }
+
+  /**
+   * `INCR` then `EXPIRE … NX`, in one pipeline. `NX` is what makes the window
+   * fixed rather than sliding-by-accident: refreshing the TTL on every hit would
+   * let a caller at the limit hold the key alive indefinitely and never get a
+   * fresh allowance.
+   */
+  async incrWithTtl(key: string, ttlSeconds: number): Promise<number> {
+    const results = await this.redis
+      .multi()
+      .incr(key)
+      .expire(key, ttlSeconds, 'NX')
+      .exec();
+    const value = results?.[0]?.[1];
+    return typeof value === 'number' ? value : Number(value ?? 1);
   }
 
   async ping(): Promise<boolean> {

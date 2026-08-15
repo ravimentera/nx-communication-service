@@ -73,6 +73,8 @@ const envSchema = z.object({
 
   // --- auth ---
   AUTH_MODE: z.enum(['gateway', 'apikey', 'jwt']).default('gateway'),
+  /** `apikey` mode: requests per key per minute. 0 disables the limit. */
+  API_KEY_RATE_LIMIT_PER_MINUTE: int(600),
   GATEWAY_ONLY: bool(true),
 
   // --- llm ---
@@ -197,6 +199,7 @@ function shape(env: Env) {
     auth: {
       mode: env.AUTH_MODE,
       gatewayOnly: env.GATEWAY_ONLY,
+      apiKeyRateLimitPerMinute: env.API_KEY_RATE_LIMIT_PER_MINUTE,
     },
     llm: {
       provider: env.LLM_PROVIDER,

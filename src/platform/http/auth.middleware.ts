@@ -19,7 +19,7 @@
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import type { Logger } from 'winston';
 
-import { AuthError, ForbiddenError, NotImplementedError } from './errors.js';
+import { AuthError, ForbiddenError, NotImplementedError, RateLimitError } from './errors.js';
 
 export enum UserRole {
   PROVIDER = 'provider',
@@ -70,6 +70,15 @@ export interface AuthConfig {
   mode: AuthMode;
   /** Reject anything that did not arrive through the gateway. Default true. */
   gatewayOnly?: boolean;
+  /** `apikey` mode: requests per key per minute. 0 disables the limit. */
+  apiKeyRateLimitPerMinute?: number;
+}
+
+/** What `apikey` mode gets back from a successful verification. */
+export interface VerifiedApiKey {
+  keyId: string;
+  tenantId: string;
+  scopes: string[];
 }
 
 export interface AuthMiddlewareOptions {
@@ -79,6 +88,21 @@ export interface AuthMiddlewareOptions {
   skipPaths?: string[];
   /** Per-route bypasses: path -> { method, param, value }. */
   bypassRules?: Record<string, { method: string; param: string; value: string }>;
+  /**
+   * `apikey` mode: verify a presented key. Injected rather than imported so the
+   * platform layer keeps knowing nothing about the database — the same reason
+   * every other adapter is constructed in the composition root (§0.9).
+   *
+   * Absent in `apikey` mode is a boot-time misconfiguration, and the middleware
+   * says so rather than letting requests through.
+   */
+  verifyApiKey?: (presented: string) => Promise<VerifiedApiKey | null>;
+  /**
+   * `apikey` mode: increment the per-key counter for the current minute and
+   * return the new value. Backed by Redis when it is up, per-replica when it is
+   * not — a degraded limiter is still a limiter.
+   */
+  countRequest?: (keyId: string, windowSeconds: number) => Promise<number>;
 }
 
 const DEFAULT_SKIP_PATHS = ['/health', '/docs', '/public'];
@@ -110,7 +134,7 @@ export function createAuthMiddleware(options: AuthMiddlewareOptions): RequestHan
   const bypassRules = options.bypassRules ?? {};
   const gatewayOnly = config.gatewayOnly ?? true;
 
-  return (req: Request, _res: Response, next: NextFunction) => {
+  return (req: Request, res: Response, next: NextFunction) => {
     try {
       const rule = bypassRules[req.path];
       if (rule && rule.method === req.method && req.query[rule.param] === rule.value) {
@@ -126,10 +150,10 @@ export function createAuthMiddleware(options: AuthMiddlewareOptions): RequestHan
       }
 
       if (config.mode === 'apikey') {
-        // The tenant_api_keys table lands in P2; the lookup is wired in P12.
-        return next(
-          new NotImplementedError('AUTH_MODE=apikey is not wired yet (planned for P12)'),
-        );
+        // Async, so it leaves the synchronous path entirely. Errors are routed
+        // through `next` inside, not thrown past this frame.
+        void authenticateApiKey(req, res, next, options);
+        return;
       }
       if (config.mode === 'jwt') {
         return next(new NotImplementedError('AUTH_MODE=jwt is not implemented'));
@@ -179,6 +203,100 @@ export function createAuthMiddleware(options: AuthMiddlewareOptions): RequestHan
       return next(error);
     }
   };
+}
+
+/**
+ * `AUTH_MODE=apikey`. The credential is the key; there is no gateway and no
+ * user, so the identity is synthesised from the key's own row.
+ *
+ * Three things are deliberately NOT taken from a header here:
+ *
+ *   - **the tenant.** It comes from the key's row and nowhere else. A key that
+ *     could name its own tenant is not a tenant boundary, it is a suggestion.
+ *   - **the permissions.** They are the key's `scopes`. In gateway mode the
+ *     gateway is trusted to have authenticated the user who owns them; there is
+ *     no such party here.
+ *   - **the role.** Fixed at `system`, so a key can never take the admin
+ *     short-circuit in `requirePermissions` by asserting `x-user-role: admin`.
+ *
+ * The sub-tenant and sender ARE read from headers: both are scoped inside the
+ * tenant the key already fixes, so neither widens what the key can reach.
+ */
+async function authenticateApiKey(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+  options: AuthMiddlewareOptions,
+): Promise<void> {
+  const { config, logger } = options;
+
+  try {
+    if (!options.verifyApiKey) {
+      // Boot-time misconfiguration. Failing closed, loudly.
+      next(
+        new NotImplementedError(
+          'AUTH_MODE=apikey is set but no key verifier was wired into the auth middleware',
+        ),
+      );
+      return;
+    }
+
+    const presented = readApiKey(req);
+    if (!presented) {
+      next(new AuthError('Provide an API key in Authorization: Bearer <key> or x-api-key'));
+      return;
+    }
+
+    const verified = await options.verifyApiKey(presented);
+    if (!verified) {
+      logger.warn('rejecting unknown, revoked or expired api key', {
+        path: req.path,
+        ip: req.ip,
+      });
+      // One message for unknown, revoked and expired alike: a caller holding a
+      // revoked key and a caller guessing should learn the same thing.
+      next(new AuthError('Invalid API key'));
+      return;
+    }
+
+    const limit = config.apiKeyRateLimitPerMinute ?? 0;
+    if (limit > 0 && options.countRequest) {
+      const used = await options.countRequest(verified.keyId, 60);
+      if (used > limit) {
+        logger.warn('api key rate limit exceeded', { keyId: verified.keyId, used, limit });
+        res.setHeader('Retry-After', '60');
+        next(
+          new RateLimitError(`API key rate limit of ${limit} requests per minute exceeded`, {
+            limit,
+          }),
+        );
+        return;
+      }
+    }
+
+    req.identity = {
+      userId: `apikey:${verified.keyId}`,
+      role: UserRole.SYSTEM,
+      tenantId: verified.tenantId,
+      subTenantId: firstHeader(req, 'x-sub-tenant-id', 'x-location-id'),
+      senderId: firstHeader(req, 'x-sender-id', 'x-provider-id'),
+      permissions: verified.scopes,
+    };
+
+    next();
+  } catch (error) {
+    next(error);
+  }
+}
+
+/** `Authorization: Bearer <key>` first, then `x-api-key`. */
+function readApiKey(req: Request): string | undefined {
+  const authorization = firstHeader(req, 'authorization');
+  if (authorization?.toLowerCase().startsWith('bearer ')) {
+    const value = authorization.slice(7).trim();
+    if (value) return value;
+  }
+  return firstHeader(req, 'x-api-key');
 }
 
 /**
