@@ -111,8 +111,14 @@ That is a `403`. To call a real route, send what the gateway sends:
 curl -s localhost:5007/v1/whatever -H 'x-gateway-request: true' -H 'x-tenant-id: demo-tenant' -H 'x-user-id: dev' -H 'x-user-role: ADMIN'
 ```
 
-`x-medspa-id` is accepted as a synonym for `x-tenant-id` and `x-location-id`
-for `x-sub-tenant-id` for the duration of the parallel run (§0.7).
+`x-tenant-id` and `x-sub-tenant-id` are the only tenancy headers this service
+reads. `x-medspa-id` and `x-location-id` were accepted as synonyms through the
+extraction and were **dropped in P12** — a request carrying only the medspa
+spelling has no tenant and fails, rather than being served against an empty
+string. The gateway sends both, so only a direct caller notices.
+
+`x-provider-id` is still accepted as a synonym for `x-sender-id`. That one is a
+sender identity rather than the tenancy boundary, and it was left alone.
 
 `CHANNEL_DRY_RUN=true` is set in `.env.example`, so channel adapters log instead
 of sending once P3 lands. Leave it on locally.
