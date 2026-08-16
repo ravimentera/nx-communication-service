@@ -344,6 +344,43 @@ export class ApprovalService {
     return row ? toView(row) : null;
   }
 
+  /**
+   * One approval, authorized for this actor.
+   *
+   * `getById` applies the tenant predicate and nothing else, which is right for
+   * an internal caller and was wrong for the route: `GET /v1/approvals/:id` used
+   * it directly, so any authenticated user in the tenant could read any
+   * approval by id — including the message body waiting for someone else's
+   * decision. The mutations have been authorized per row since P6; the read was
+   * simply missed, and the polarity is the same.
+   *
+   * NotFound rather than Forbidden when the actor may not see it. Answering 403
+   * would confirm that an approval with that id exists in this tenant, which is
+   * more than a caller who cannot read it should learn.
+   */
+  async getByIdFor(scope: TenantScope, id: string, actor: Actor): Promise<ApprovalView | null> {
+    const view = await this.getById(scope, id);
+    if (!view) return null;
+
+    // `outreach:approve` widens a READ to the whole tenant, and deliberately
+    // does not widen a write. The list route has always let a holder ask for
+    // another approver's queue (`approverRefFor`), so refusing them the row they
+    // can already see in that list would be incoherent — they would read a
+    // summary and get a 404 opening it.
+    //
+    // The asymmetry with the mutations is the point rather than an oversight:
+    // seeing a colleague's queue is what a clinic lead does; *deciding* on their
+    // behalf is what D45 exists to prevent, and `authorize` still refuses it.
+    if (this.isAdmin(actor) || actor.permissions?.includes(PERMISSION_APPROVE)) return view;
+
+    try {
+      await this.authorize(view, actor, 'read');
+    } catch {
+      return null;
+    }
+    return view;
+  }
+
   async getByMessageId(scope: TenantScope, messageId: string): Promise<Approval | null> {
     const [row] = await this.deps.db
       .select()
@@ -1098,7 +1135,14 @@ export class ApprovalService {
   }
 }
 
-type ApprovalRightsShape = { approve: true; edit: true; decline: true; reschedule: true };
+type ApprovalRightsShape = {
+  approve: true;
+  edit: true;
+  decline: true;
+  reschedule: true;
+  /** Reading one approval. Same polarity as the mutations — see `getByIdFor`. */
+  read: true;
+};
 
 type ApprovalRow = typeof approvals.$inferSelect;
 

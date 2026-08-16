@@ -246,6 +246,23 @@ describe('/approvals — 5', () => {
     expect(res.status).toBe(403);
   });
 
+  /**
+   * The check was `!isAdmin && senderId && senderId !== pathProviderId`, so a
+   * request that simply omitted the sender header short-circuited on the middle
+   * term and passed. Any caller could read any provider's queue — including the
+   * message bodies waiting for a decision — by sending one header fewer.
+   *
+   * A check that is satisfied by supplying less is not a check.
+   */
+  it('403s a request with no sender identity at all, rather than letting it through', async () => {
+    const headers = gatewayHeaders();
+    delete headers['x-provider-id'];
+    delete headers['x-sender-id'];
+
+    const res = await get(`/approvals/pending/${OTHER_PROVIDER}`, headers);
+    expect(res.status).toBe(403);
+  });
+
   it.each([
     ['post', '/approvals/approve/'],
     ['post', '/approvals/decline/'],

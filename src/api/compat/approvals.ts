@@ -52,9 +52,28 @@ function handle(
  * is the point of D45, so it lives here rather than being left to the service.
  */
 function assertOwnQueue(req: Request, pathProviderId: string): void {
-  const senderId = req.identity?.senderId;
+  // Admin only, deliberately narrower than the `/v1` read path — which also
+  // lets an `outreach:approve` holder widen to another queue. This is the
+  // legacy surface and D45's tightening is documented in BREAKING.md as "403
+  // outside the caller's queue"; widening it here would change a documented
+  // contract while fixing a bug, which are two different changes.
   const isAdmin = req.identity?.permissions?.includes(Permission.ADMIN);
-  if (!isAdmin && senderId && senderId !== pathProviderId) {
+  if (isAdmin) return;
+
+  const senderId = req.identity?.senderId;
+
+  // The missing-header case is the whole point. This used to read
+  // `!isAdmin && senderId && senderId !== pathProviderId`, so a request with no
+  // `x-sender-id` short-circuited on the middle term and passed — any caller
+  // could read any provider's queue by leaving a header off. A check that is
+  // satisfied by supplying less is not a check.
+  if (!senderId) {
+    throw new ForbiddenError(
+      'Access denied: reading an approval queue requires a sender identity (x-sender-id)',
+    );
+  }
+
+  if (senderId !== pathProviderId) {
     throw new ForbiddenError('Access denied: you can only access your own approval queue');
   }
 }

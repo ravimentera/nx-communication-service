@@ -687,6 +687,54 @@ describe('the inbox', () => {
   });
 });
 
+/**
+ * Reads are authorized the same way writes are.
+ *
+ * The mutations were tightened per row in P6 (D45) and the reads were missed —
+ * so `getById` applied the tenant predicate and nothing else, and the list
+ * filter was dropped entirely when the caller had no sender identity. Both
+ * failed OPEN, which is the one direction an access check must not fail.
+ */
+describe('reading an approval is authorized per row', () => {
+  it('hides another sender’s approval behind 404, not 403', async () => {
+    const { approval } = await service.submit(scope, draft({ senderId: 'provider-Owner' }), {
+      key: 'medspa.provider-always',
+    });
+
+    const owner: Actor = { type: 'user', ref: 'u-1', senderId: 'provider-Owner', role: 'provider', permissions: [] };
+    const other: Actor = { type: 'user', ref: 'u-2', senderId: 'provider-Other', role: 'provider', permissions: [] };
+
+    expect(await service.getByIdFor(scope, approval.id, owner)).not.toBeNull();
+
+    // Not 403: answering "forbidden" would confirm an approval with this id
+    // exists in the tenant, which is more than this caller should learn.
+    expect(await service.getByIdFor(scope, approval.id, other)).toBeNull();
+  });
+
+  it('lets an approve-permission holder read any queue', async () => {
+    const { approval } = await service.submit(scope, draft({ senderId: 'provider-Owner2' }), {
+      key: 'medspa.provider-always',
+    });
+
+    const lead: Actor = {
+      type: 'user',
+      ref: 'u-3',
+      senderId: 'provider-Lead',
+      role: 'provider',
+      permissions: ['outreach:approve'],
+    };
+    expect(await service.getByIdFor(scope, approval.id, lead)).not.toBeNull();
+  });
+
+  it('still hides it from another tenant', async () => {
+    const { approval } = await service.submit(scope, draft({ senderId: PROVIDER }), {
+      key: 'medspa.provider-always',
+    });
+    const admin: Actor = { type: 'user', ref: 'u-4', role: 'admin', permissions: ['outreach:admin'] };
+    expect(await service.getByIdFor({ tenantId: 'other-tenant' }, approval.id, admin)).toBeNull();
+  });
+});
+
 describe('the SLA sweeper', () => {
   it('expires and escalates a pending approval past its deadline', async () => {
     const [policy] = await db
