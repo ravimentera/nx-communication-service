@@ -104,7 +104,15 @@ export class RecordingLlmProvider implements LlmProvider {
 
       await this.write(req, {
         model: response.model,
-        input: req.prompt,
+        // ── THE SYSTEM BLOCK IS PART OF THE PROMPT ──────────────────────────
+        //
+        // Only `req.prompt` was recorded, so the stored input omitted the
+        // persona, the constraints, the channel rules and the tenant's house
+        // style — everything the pack contributes. `ai_interactions` exists so a
+        // prompt regression is diagnosable after the fact, and a record of half
+        // the prompt cannot answer "why did it write that?": the half it drops
+        // is the half a pack edit changes.
+        input: req.system ? `[system]\n${req.system}\n\n[prompt]\n${req.prompt}` : req.prompt,
         output: renderOutput(response),
         tokensUsed: response.tokensIn + response.tokensOut,
         // The column holds one total, and input and output tokens are priced
@@ -130,7 +138,15 @@ export class RecordingLlmProvider implements LlmProvider {
       // A failed generation is exactly the case someone will want to inspect.
       await this.write(req, {
         model,
-        input: req.prompt,
+        // ── THE SYSTEM BLOCK IS PART OF THE PROMPT ──────────────────────────
+        //
+        // Only `req.prompt` was recorded, so the stored input omitted the
+        // persona, the constraints, the channel rules and the tenant's house
+        // style — everything the pack contributes. `ai_interactions` exists so a
+        // prompt regression is diagnosable after the fact, and a record of half
+        // the prompt cannot answer "why did it write that?": the half it drops
+        // is the half a pack edit changes.
+        input: req.system ? `[system]\n${req.system}\n\n[prompt]\n${req.prompt}` : req.prompt,
         output: '',
         processingTime: latencyMs,
         success: false,

@@ -684,8 +684,26 @@ export class PlaybookRuntime {
           format: template.format as 'TEXT' | 'HTML' | 'MARKDOWN' | 'MJML',
           aliases,
         });
-        const subject = template.subject
-          ? await this.deps.renderer.render(template.subject, context, { format: 'TEXT', aliases })
+        // `contentSource.subjectTemplateKey` names a SEPARATE template whose
+        // body is the subject line. The schema has accepted it since P7 and
+        // nothing read it, so a pack declaring one got the body template's own
+        // `subject` field instead — silently, and for email that is the line the
+        // recipient sees first.
+        //
+        // Falls back to the body template's `subject`, which is what every
+        // playbook that does not declare one relies on.
+        const subjectSource = source.subjectTemplateKey
+          ? (await this.deps.templates.get(scope.tenantId, source.subjectTemplateKey))?.content
+          : template.subject;
+
+        if (source.subjectTemplateKey && subjectSource === undefined) {
+          throw new Error(
+            `Playbook '${playbook.key}' names subject template '${source.subjectTemplateKey}', which does not exist for this tenant`,
+          );
+        }
+
+        const subject = subjectSource
+          ? await this.deps.renderer.render(subjectSource, context, { format: 'TEXT', aliases })
           : undefined;
 
         return {

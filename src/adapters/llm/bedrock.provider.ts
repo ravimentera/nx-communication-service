@@ -223,7 +223,26 @@ export class BedrockProvider implements LlmProvider {
       prompt: `${req.prompt}\n\nYour previous response was not valid JSON (${parsedFirst.error}). Return only a valid JSON object.`,
     });
     const parsedSecond = tryParseJson<T>(second.content);
-    if (parsedSecond.ok) return { ...second, content: parsedSecond.value };
+    if (parsedSecond.ok) {
+      // ── BOTH ATTEMPTS' TOKENS, NOT THE SECOND'S ───────────────────────────
+      //
+      // The first call's usage was discarded on the retry path, so an
+      // `ai_interactions` row — and every cost report built on it, including
+      // `GET /v1/usage` — under-counted by exactly one whole invocation. AWS
+      // charged for it either way. Whether the model got it right first time is
+      // not something a spend report should be silently netting out.
+      return {
+        ...second,
+        content: parsedSecond.value,
+        tokensIn: first.tokensIn + second.tokensIn,
+        tokensOut: first.tokensOut + second.tokensOut,
+        ...(first.costUsd !== undefined || second.costUsd !== undefined
+          ? { costUsd: (first.costUsd ?? 0) + (second.costUsd ?? 0) }
+          : {}),
+        // The wall-clock a caller waited, which is both attempts.
+        latencyMs: first.latencyMs + second.latencyMs,
+      };
+    }
 
     throw new LlmError(
       `Model did not return valid JSON after a retry: ${parsedSecond.error}`,
@@ -300,3 +319,5 @@ function tryParseJson<T>(raw: string): { ok: true; value: T } | { ok: false; err
     return { ok: false, error: error instanceof Error ? error.message : 'parse failed' };
   }
 }
+
+
