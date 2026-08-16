@@ -1,20 +1,56 @@
-// DELETE IN P12
 /**
- * The legacy surface, kept alive so P10's cutover is an env-var change and
- * nothing else. Every file in this directory is temporary and says so.
+ * The legacy surface, **trimmed to what actually reaches it** (P12, D100).
  *
- * Paths are mounted exactly as `routes/index.ts` mounts them. The gateway
- * strips `/api/communication`, so these are root-mounted and a legacy caller's
- * URL is unchanged.
+ * Paths are mounted exactly as the source's `routes/index.ts` mounted them. The
+ * gateway strips `/api/communication`, so these are root-mounted and a legacy
+ * caller's URL is unchanged.
  *
- * Three things every compat response carries:
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHY THIS IS ~24 ENDPOINTS AND NOT 110
+ *
+ * The shim was built to carry all 110 so that unknown callers on live traffic
+ * would not break during a parallel run. There is no live traffic and there are
+ * no unknown callers (D99), so the ~86 nothing reaches are gone.
+ *
+ * **The set was established by inspection, not by measurement.** The plan's
+ * method was to read 30 days of `outreach_compat_hits_total` and delete every
+ * path with no hits. That cannot work here — a counter records what was called,
+ * and nothing is calling — and inspection is the better instrument anyway: it
+ * reports what *can* reach the surface, where a counter only reports what did.
+ *
+ * The six consumers, and what each one calls:
+ *
+ *   mentera_app (web)      /approvals/{approve,decline,edit,edit-approve}
+ *                          /communications/{create-communication,generate-message,
+ *                                           message,conversation/:p/:pt/read-all}
+ *                          /automated-messages/generate
+ *   mentera_app (mobile)   /approvals/{pending,approve,decline,edit-approve}
+ *                          /communications/{provider/:id/inbox,conversation/:p/:pt,
+ *                                           conversation/:p/:pt/read-all,message,
+ *                                           generate-message}
+ *                          /automated-messages/generate
+ *   providers-service      /email/send, /config/medspa[/:id],
+ *                          /templates[/:id][/render], POST /api/events
+ *   scheduling-service     POST /events
+ *   tera-orchestrator      /mcp/*      (its own mount, not here)
+ *   patient-service        /v1/recipients/by-external-ref/…   (already v1)
+ *
+ * ONE LIMIT OF THE METHOD, STATED RATHER THAN GLOSSED: provider callback URLs
+ * live in Twilio's and SendGrid's dashboards, not in any repository, so no grep
+ * can prove they are unused. `/messages/webhook/*` and `/ehr-webhook/*` are kept
+ * for that reason alone. Everything else was proven unreachable.
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * Two things every surviving compat response carries:
  *
  *  - `Deprecation: true` and `Link: </v1/…>; rel="successor-version"`, so a
  *    consumer can find the replacement without reading this repo.
- *  - a `outreach_compat_hits_total{path}` increment. **That counter is how P12
- *    decides what is safe to delete** — an endpoint with no hits for a release
- *    goes, one with hits does not, and neither judgement should be a guess.
  *  - the legacy vocabulary, both ways (`translate.ts`).
+ *
+ * `outreach_compat_hits_total` is still incremented. Its purpose has changed:
+ * it no longer decides deletions, it confirms that what survived is what is
+ * used — a mount that stays at zero after the cutover is one this trim should
+ * have caught.
  *
  * What is deliberately *not* preserved: the source's habit of answering 500
  * with `{success:false, message:'…'}` for every failure including bad input.
@@ -32,16 +68,13 @@ import type { ContextRegistry } from '../../engine/context/registry.js';
 import type { MessagingApiDeps } from '../v1/messaging.js';
 import type { PlaybookApiDeps } from '../v1/playbooks.js';
 import type { RecipientApiDeps } from '../v1/recipients.js';
-import { createLegacyAiRouter } from './ai.js';
 import { createLegacyApprovalRouter } from './approvals.js';
 import { createLegacyCommunicationsRouter } from './communications.js';
 import { createLegacyConfigRouter } from './config.js';
 import { createLegacyEventRouter } from './events.js';
 import { createLegacyGenerationRouters } from './generation.js';
 import { createLegacyMessagesRouter } from './messages.js';
-import { createLegacyPreferenceRouter } from './preferences.js';
 import { createLegacyPackRouters } from './packs.js';
-import { createLegacyQueueRouter } from './queue.js';
 import { createLegacySendRouters } from './send.js';
 import { createLegacyTemplateRouter } from './templates.js';
 import { CompatIdentity } from './translate.js';
@@ -68,6 +101,53 @@ export function deprecate(mount: string, successor: string): RequestHandler {
     res.setHeader('Link', `<${successor}>; rel="successor-version"`);
     next();
   };
+}
+
+/**
+ * Every legacy mount this shim used to carry and no longer does, with its
+ * successor. Mounted as a `410 Gone` so a caller the trim missed gets a sentence
+ * naming what happened, instead of a bare 404 indistinguishable from a typo.
+ *
+ * `410` and not `404` on purpose: it is the difference between "this never
+ * existed" and "this existed, it is gone, here is where it went". The inspection
+ * that produced this list (D100) is a complete answer for everything inside this
+ * repository and mentera_core; it cannot see a URL configured in a third party's
+ * dashboard, and this is the cheap insurance against that.
+ */
+export const RETIRED_MOUNTS: Record<string, string> = {
+  '/sms': 'POST /v1/messages with {channel:"sms"}',
+  '/slack': 'POST /v1/messages with {channel:"slack"}',
+  '/preferences': '/v1/recipients/:id/preferences, /v1/preferences/*',
+  '/queue': '/v1/queue/stats',
+  '/ai': 'POST /v1/content/generate with a mode discriminator',
+  '/ai-enhanced': 'POST /v1/outreach/generate and /v1/approvals',
+  '/leads': '/v1/recipients and POST /v1/outreach/trigger',
+  '/treatments': 'POST /v1/outreach/trigger',
+  '/patients': 'POST /v1/outreach/trigger',
+  '/providers': 'GET /v1/analytics/feedback',
+  '/promotions': 'POST /v1/outreach/trigger and /v1/campaigns',
+  '/gift-cards': 'POST /v1/outreach/trigger',
+};
+
+/** One router per retired mount, answering 410 with the successor named. */
+export function createRetiredMounts(): Array<{ path: string; router: Router }> {
+  return Object.entries(RETIRED_MOUNTS).map(([path, successor]) => {
+    const router = Router();
+    router.all(/.*/, (req: Request, res: Response) => {
+      // Counted, so a retired path that is somehow still being called shows up
+      // as a number rather than as a support ticket.
+      compatHitsTotal.inc({ path: `${path} (retired)`, method: req.method });
+      res.status(410).json({
+        success: false,
+        error: {
+          code: 'GONE',
+          message: `The legacy ${path} surface was retired. Use ${successor}.`,
+          successor,
+        },
+      });
+    });
+    return { path, router };
+  });
 }
 
 export interface CompatDeps {
@@ -110,42 +190,45 @@ export function createCompatMounts(deps: CompatDeps): Array<{ path: string; rout
   });
 
   return [
+    // providers-service, for verification / invitation / password-reset mail.
     { path: '/email', router: send.email },
-    { path: '/sms', router: send.sms },
-    { path: '/slack', router: send.slack },
+
+    // scheduling-service posts to `/events`; providers-service posts to
+    // `/api/events`, because `communication-service-client.ts` defaults its base
+    // URL to the gateway and keeps the `/api` prefix. Both mounts are required;
+    // the source only ever worked because the gateway happened to route it.
     {
       path: '/events',
       router: createLegacyEventRouter({ playbooks: deps.playbooks, identity }),
     },
-    // providers-service' event client posts to `/api/events`, not `/events`
-    // (`communication-service-client.ts` defaults its base URL to the gateway
-    // and keeps the `/api` prefix). Both mounts are required; the source only
-    // ever worked because the gateway happened to route it.
     {
       path: '/api/events',
       router: createLegacyEventRouter({ playbooks: deps.playbooks, identity }),
     },
-    {
-      path: '/preferences',
-      router: createLegacyPreferenceRouter({
-        ...deps.recipients,
-        configs: deps.channels.configs,
-        identity,
-      }),
-    },
+
+    // providers-service' integration-settings screen.
     { path: '/config', router: createLegacyConfigRouter(deps.channels) },
+
+    // The approvals inbox, web and mobile.
     { path: '/approvals', router: createLegacyApprovalRouter(deps.approvals) },
+
+    // The message inbox and composer, web and mobile.
     {
       path: '/communications',
       router: createLegacyCommunicationsRouter({
         ...deps.messaging,
         identity,
         receipts: deps.receipts,
-        // One drafting path, two URLs: `/communications/generate-message` and
-        // `/ai-enhanced/generate-communication` produce the same approval row.
         draft: generation.draft,
       }),
     },
+
+    // KEPT WITHOUT PROOF OF USE. Twilio and SendGrid hold their callback URLs in
+    // their own dashboards, so no grep over this repo or mentera_core can show
+    // whether these are configured. Deleting them would be a guess whose failure
+    // mode is silently losing every delivery receipt and inbound reply.
+    // `/v1/webhooks/*` is the successor; retire these once the provider consoles
+    // have been checked and repointed.
     {
       path: '/messages',
       router: createLegacyMessagesRouter({
@@ -155,19 +238,13 @@ export function createCompatMounts(deps: CompatDeps): Array<{ path: string; rout
         identity,
       }),
     },
-    { path: '/queue', router: createLegacyQueueRouter(deps.channels) },
-    { path: '/templates', router: createLegacyTemplateRouter(deps.content) },
-    { path: '/ai', router: createLegacyAiRouter(deps.content) },
-    { path: '/ai-enhanced', router: generation.aiEnhanced },
-    { path: '/automated-messages', router: generation.automated },
+    // Same reasoning: an EHR vendor posts here from its own configuration.
     { path: '/ehr-webhook', router: packRouters.ehrWebhook },
-    { path: '/leads', router: packRouters.leads },
-    { path: '/treatments', router: packRouters.treatments },
-    { path: '/patients', router: packRouters.patients },
-    { path: '/providers', router: packRouters.providers },
-    { path: '/promotions', router: packRouters.promotions },
-    // `routes/index.ts:96` mounts the promotion router twice and something
-    // depends on the alias. Same router, same instance.
-    { path: '/gift-cards', router: packRouters.promotions },
+
+    // providers-service proxies the template surface (Seam A).
+    { path: '/templates', router: createLegacyTemplateRouter(deps.content) },
+
+    // Web and mobile both call `/automated-messages/generate`.
+    { path: '/automated-messages', router: generation.automated },
   ];
 }

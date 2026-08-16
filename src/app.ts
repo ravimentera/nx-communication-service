@@ -5,7 +5,11 @@ import type pg from 'pg';
 import type { Logger } from 'winston';
 
 import { createHealthRouter } from './api/health.js';
-import { createCompatMounts, type CompatDeps } from './api/compat/index.js';
+import {
+  createCompatMounts,
+  createRetiredMounts,
+  type CompatDeps,
+} from './api/compat/index.js';
 import { createWebhookRouter, type WebhookDeps } from './api/webhooks/index.js';
 import { createMcpRouter, type McpDeps } from './mcp/index.js';
 import { createApprovalRouter, type ApprovalApiDeps } from './api/v1/approvals.js';
@@ -213,6 +217,12 @@ export function createApp(deps: AppDeps): Express {
   //     anything neither surface claims. Deleted in P12.
   if (deps.compat) {
     for (const { path, router } of createCompatMounts(deps.compat)) {
+      app.use(path, router);
+    }
+    // The legacy mounts that were retired in P12 (D100), answering 410 with the
+    // successor named. After the live ones, so a surviving path is never
+    // shadowed by the tombstone of a retired sibling.
+    for (const { path, router } of createRetiredMounts()) {
       app.use(path, router);
     }
   }

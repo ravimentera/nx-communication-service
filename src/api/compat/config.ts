@@ -16,7 +16,7 @@ import { Router, type NextFunction, type Request, type Response } from 'express'
 
 import type { ChannelApiDeps } from '../v1/channels.js';
 import { Permission, requirePermissions, requireTenant } from '../../platform/http/auth.middleware.js';
-import { ForbiddenError, NotFoundError, ValidationError } from '../../platform/http/errors.js';
+import { ForbiddenError, NotFoundError } from '../../platform/http/errors.js';
 import { maskTenantConfig } from '../v1/channels.js';
 import { deprecate } from './index.js';
 
@@ -86,100 +86,6 @@ export function createLegacyConfigRouter(deps: ChannelApiDeps): Router {
         message: 'Medspa configuration updated successfully',
         data: maskTenantConfig(config),
       });
-    }),
-  );
-
-  // ── agent ("provider") config ─────────────────────────────────────────────
-
-  router.get(
-    '/provider/:providerId/medspa/:medspaId',
-    handle(async (req, res) => {
-      const scope = assertPathTenant(req, req.params.medspaId);
-      const config = await deps.configs.getAgentConfig(
-        scope.tenantId,
-        req.params.providerId as string,
-      );
-      if (!config) throw new NotFoundError('Provider configuration not found');
-      res.json({ success: true, data: config });
-    }),
-  );
-
-  router.post(
-    '/provider',
-    requirePermissions(Permission.CONFIG_WRITE),
-    handle(async (req, res) => {
-      const scope = assertPathTenant(req, req.body?.medspaId);
-      const providerId = req.body?.providerId as string | undefined;
-      if (!providerId) throw new ValidationError('providerId is required');
-
-      const { medspaId: _t, providerId: _p, ...values } = req.body ?? {};
-      const config = await deps.configs.upsertAgentConfig(
-        scope.tenantId,
-        providerId,
-        values,
-        req.identity?.userId,
-      );
-      res.status(201).json({
-        success: true,
-        message: 'Provider configuration created successfully',
-        data: { id: config.id, providerId: config.senderId, medspaId: config.tenantId },
-      });
-    }),
-  );
-
-  router.put(
-    '/provider/:providerId/medspa/:medspaId',
-    requirePermissions(Permission.CONFIG_WRITE),
-    handle(async (req, res) => {
-      const scope = assertPathTenant(req, req.params.medspaId);
-      const config = await deps.configs.upsertAgentConfig(
-        scope.tenantId,
-        req.params.providerId as string,
-        req.body ?? {},
-        req.identity?.userId,
-      );
-      res.json({
-        success: true,
-        message: 'Provider configuration updated successfully',
-        data: config,
-      });
-    }),
-  );
-
-  router.get(
-    '/medspa/:medspaId/providers',
-    handle(async (req, res) => {
-      const scope = assertPathTenant(req, req.params.medspaId);
-      res.json({ success: true, data: await deps.configs.getAgentsByTenant(scope.tenantId) });
-    }),
-  );
-
-  router.get(
-    '/medspa/:medspaId/phone-numbers',
-    handle(async (req, res) => {
-      const scope = assertPathTenant(req, req.params.medspaId);
-      res.json({ success: true, data: await deps.configs.getSenderNumbers(scope.tenantId) });
-    }),
-  );
-
-  router.post(
-    '/test-sms',
-    requirePermissions(Permission.SEND),
-    handle(async (req, res) => {
-      const scope = assertPathTenant(req, req.body?.medspaId);
-      const to = req.body?.to as string | undefined;
-      if (!to) throw new ValidationError('to is required');
-
-      const result = await deps.dispatcher.dispatch({
-        tenantId: scope.tenantId,
-        channel: 'sms',
-        to: { type: 'phone', value: to },
-        rendered: { body: (req.body?.message as string) ?? 'Outreach test message' },
-        senderId: req.body?.providerId as string | undefined,
-        priority: 'HIGH',
-        transactional: true,
-      });
-      res.json({ success: true, message: 'Test SMS queued', ...result });
     }),
   );
 

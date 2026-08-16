@@ -50,7 +50,7 @@ afterAll(async () => {
   await h?.stop();
 });
 
-describe('/templates — 14', () => {
+describe('/templates — 6', () => {
   it('POST / creates and returns only the id, as providers-service expects', async () => {
     const res = await post('/templates/', {
       name: 'Reminder',
@@ -116,121 +116,6 @@ describe('/templates — 14', () => {
     expect((await del(`/templates/${templateId}`, otherHeaders)).body.success).toBe(false);
   });
 
-  it('POST /generate 404s when no prompt pack backs it', async () => {
-    const res = await post('/templates/generate', {
-      prompt: 'a reminder',
-      promptPackKey: 'nope.missing',
-    });
-    expect(res.status).toBe(404);
-  });
-
-  it('POST /generate stores the generated body as a template', async () => {
-    const res = await post('/templates/generate', {
-      prompt: 'a friendly appointment reminder',
-      format: 'TEXT',
-      promptPackKey: 'core.content-generate',
-    });
-    expect(res.status).toBe(201);
-    expect(res.body.templateId).toEqual(expect.any(String));
-    expect(res.body.content).toBeTruthy();
-  });
-
-  it('POST /generate resolves its default prompt pack', async () => {
-    // The default key was `core.template-author`, which no pack shipped until
-    // P12 — so this endpoint 404'd unless the caller named a pack, and
-    // providers-service proxies this router. See D93.
-    const res = await post('/templates/generate', { prompt: 'a reminder', format: 'TEXT' });
-    expect(res.status).toBe(201);
-    expect(res.body.templateId).toEqual(expect.any(String));
-  });
-
-  it.each([
-    ['/templates/campaigns', 'newsletter'],
-    ['/templates/campaigns/follow-up', 'follow_up'],
-    ['/templates/campaigns/educational', 'educational'],
-    ['/templates/campaigns/promotional', 'promotion'],
-  ])(
-    '%s generates campaign copy, and is not read as a template id',
-    async (path, expectedCategory) => {
-      // D92: these were recorded as blocked on an image model. They never were —
-      // the source generates copy with Bedrock text and every image attempt
-      // throws and is swallowed (campaign-template-generator.ts:232-238).
-      const res = await post(path, {
-        campaignType: path.endsWith('/campaigns') ? 'newsletter' : undefined,
-        audienceType: 'all_recipients',
-        tone: 'friendly',
-        purpose: 'announce the new opening hours',
-        keyPoints: ['open until 8pm', 'closed Sundays'],
-        callToAction: 'Book online',
-      });
-      expect(res.status).toBe(201);
-      expect(res.body).toMatchObject({
-        templateId: expect.any(String),
-        previewContent: expect.any(String),
-        emailConfig: { subjectLine: expect.any(String), preheader: expect.any(String) },
-      });
-      // No image provider is registered, so the source's always-empty result.
-      expect(res.body.imageAssets).toBeUndefined();
-
-      const stored = await get(`/templates/${res.body.templateId}`);
-      expect(stored.body.metadata.category).toBe(expectedCategory);
-    },
-  );
-
-  it('POST /campaigns requires the four fields the source requires', async () => {
-    expect((await post('/templates/campaigns', { campaignType: 'newsletter' })).status).toBe(400);
-  });
-
-  it('POST /generate-with-images generates the body and no images', async () => {
-    const res = await post('/templates/generate-with-images', {
-      prompt: 'a seasonal announcement',
-      format: 'TEXT',
-      imageSuggestions: ['a bunch of flowers'],
-    });
-    expect(res.status).toBe(201);
-    expect(res.body.templateId).toEqual(expect.any(String));
-    expect(res.body.content).toBeTruthy();
-    // The source's loop catches every failure and continues, and every attempt
-    // failed, so this has always been absent.
-    expect(res.body.imageAssets).toBeUndefined();
-  });
-
-  it('POST /assets/upload stores the file and reports where it went', async () => {
-    const res = await request(h.app)
-      .post('/templates/assets/upload')
-      .set(gatewayHeaders())
-      .attach('file', Buffer.from('a tiny png, honestly'), {
-        filename: 'logo.png',
-        contentType: 'image/png',
-      });
-
-    expect(res.status).toBe(201);
-    expect(res.body).toMatchObject({
-      originalName: 'logo.png',
-      mimeType: 'image/png',
-      size: 20,
-      // New: the source returned a bare filename, which nothing could fetch.
-      assetId: expect.any(String),
-      url: expect.stringContaining('http'),
-    });
-    // The key is service-assigned and tenant-prefixed — never the caller's name.
-    expect(res.body.filename).toMatch(new RegExp(`^${TENANT}/image/[0-9a-f-]+\\.png$`));
-    expect(res.body.filename).not.toContain('logo');
-  });
-
-  it('POST /assets/upload rejects a request with no file', async () => {
-    expect((await post('/templates/assets/upload', {})).status).toBe(400);
-  });
-
-  it('POST /assets/generate-image answers 501 — no image model has ever existed', async () => {
-    // The one endpoint that IS image-blocked, and the source could not serve it
-    // either: AIService.generateImage throws unconditionally, uncaught on this
-    // path, so it has answered 500 for its whole life (D92).
-    const res = await post('/templates/assets/generate-image', { prompt: 'a logo' });
-    expect(res.status).toBe(501);
-    expect(res.body.error.message).toMatch(/image model/i);
-  });
-
   it('DELETE /:id returns {success}', async () => {
     const res = await del(`/templates/${templateId}`);
     expect(res.status).toBe(200);
@@ -238,128 +123,9 @@ describe('/templates — 14', () => {
   });
 });
 
-describe('/ai — 8', () => {
-  it.each([
-    'generate',
-    'enhance',
-    'personalize',
-    'analyze',
-    'follow-up',
-    'promotional',
-    'educational',
-  ])('POST /ai/%s generates through the matching prompt pack', async (mode) => {
-    const res = await post(`/ai/${mode}`, { prompt: 'say hello', context: 'a returning customer' });
-    expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ success: true, content: expect.any(String) });
-    // New: real token accounting, which the source estimated by word count (D31).
-    expect(res.body.metadata).toMatchObject({
-      tokensIn: expect.any(Number),
-      tokensOut: expect.any(Number),
-    });
-  });
-
-  it('POST /ai/generate requires a prompt', async () => {
-    expect((await post('/ai/generate', {})).status).toBe(400);
-  });
-
-  it('POST /ai/multimodal returns copy plus image descriptions', async () => {
-    // Named for images, generates none: the source builds a text prompt asking
-    // for copy and N image *descriptions* and calls generateJsonContent
-    // (ai-content-controller.ts:406). It never needed an image model — D92.
-    const res = await post('/ai/multimodal', {
-      prompt: 'announce the spring hours',
-      textFormat: 'html',
-      imageCount: 1,
-    });
-    expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ success: true });
-    expect(res.body.multimodalContent).toMatchObject({
-      textContent: expect.any(String),
-      images: [{ description: expect.any(String), position: expect.any(String) }],
-    });
-    expect(res.body.metadata).toMatchObject({
-      tokensIn: expect.any(Number),
-      tokensOut: expect.any(Number),
-    });
-  });
-
-  it('POST /ai/multimodal requires a prompt', async () => {
-    expect((await post('/ai/multimodal', {})).status).toBe(400);
-  });
-});
-
-describe('/ai-enhanced — 6', () => {
-  let messageId: string;
-
-  it('POST /generate-communication drafts and opens an approval', async () => {
-    const res = await post('/ai-enhanced/generate-communication', {
-      patientId: PATIENT,
-      providerId: PROVIDER,
-      channel: 'EMAIL',
-      promptPackKey: 'core.content-generate',
-      goal: 'check in after a visit',
-    });
-    expect(res.status).toBe(201);
-    expect(res.body.data).toMatchObject({
-      status: 'PENDING_APPROVAL',
-      approvalId: expect.any(String),
-      messageId: expect.any(String),
-    });
-    messageId = res.body.data.messageId;
-  });
-
-  it('the draft appears in BOTH inboxes — under the source they are disjoint', async () => {
-    // D46: `/ai-enhanced` writes the status column, `/approvals` writes the
-    // JSONB, and neither list shows the other's rows.
-    const aiEnhanced = await get(`/ai-enhanced/pending-approvals/${PROVIDER}`);
-    const approvals = await get(`/approvals/pending/${PROVIDER}`);
-
-    expect(aiEnhanced.status).toBe(200);
-    expect(approvals.status).toBe(200);
-    expect(aiEnhanced.body.data.length).toBeGreaterThan(0);
-    expect(approvals.body.data.map((a: { id: string }) => a.id)).toEqual(
-      aiEnhanced.body.data.map((a: { id: string }) => a.id),
-    );
-  });
-
-  it('POST /approve/:messageId approves through the same state machine', async () => {
-    const res = await post(`/ai-enhanced/approve/${messageId}`, {});
-    expect(res.status).toBe(200);
-    expect(res.body.success).toBe(true);
-  });
-
-  it('403s another provider’s queue', async () => {
-    expect((await get('/ai-enhanced/pending-approvals/someone-else')).status).toBe(403);
-  });
-
-  it('POST /batch-generate reports per-recipient outcomes without aborting', async () => {
-    const res = await post('/ai-enhanced/batch-generate', {
-      patientIds: [PATIENT, 'no-such-patient'],
-      channel: 'EMAIL',
-      promptPackKey: 'core.content-generate',
-    });
-    expect(res.status).toBe(201);
-    expect(res.body.data).toHaveLength(2);
-    expect(res.body.summary).toMatchObject({ requested: 2, generated: 1, failed: 1 });
-  });
-
-  it('GET /patient/:id/suggested-communications lists what could fire', async () => {
-    const res = await get(`/ai-enhanced/patient/${PATIENT}/suggested-communications`);
-    expect(res.status).toBe(200);
-    expect(Array.isArray(res.body.data)).toBe(true);
-  });
-
-  it('POST /analyze-communication-style returns an analysis', async () => {
-    const res = await post('/ai-enhanced/analyze-communication-style', {
-      samples: ['Hi there!'],
-      promptPackKey: 'core.content-analyze',
-    });
-    expect(res.status).toBe(200);
-    expect(res.body.data.analysis).toEqual(expect.any(String));
-  });
-});
-
-describe('/automated-messages — 4', () => {
+describe('/automated-messages — 1', () => {
+  // `/bulk-generate`, `/trigger-from-event` and `/test-context/:p/:pr` were
+  // retired in P12 (D100) — the web and mobile clients call `/generate` only.
   it('POST /generate drafts one', async () => {
     const res = await post('/automated-messages/generate', {
       patientId: PATIENT,
@@ -370,31 +136,6 @@ describe('/automated-messages — 4', () => {
     expect(res.body.data.messageId).toEqual(expect.any(String));
   });
 
-  it('POST /bulk-generate does not abort on one failure', async () => {
-    const res = await post('/automated-messages/bulk-generate', {
-      patientIds: [PATIENT, 'unknown-person'],
-      promptPackKey: 'core.content-generate',
-    });
-    expect(res.status).toBe(201);
-    expect(res.body.data.filter((r: { success: boolean }) => r.success)).toHaveLength(1);
-  });
-
-  it('POST /trigger-from-event runs the playbook runtime', async () => {
-    const res = await post('/automated-messages/trigger-from-event', {
-      eventType: 'APPOINTMENT_REMINDER',
-      patientId: PATIENT,
-      data: { when: 'tomorrow' },
-    });
-    expect(res.status).toBe(200);
-    expect(res.body.success).toBe(true);
-  });
-
-  it('GET /test-context/:patientId/:providerId previews the render context', async () => {
-    const res = await get(`/automated-messages/test-context/${PATIENT}/${PROVIDER}`);
-    expect(res.status).toBe(200);
-    expect(res.body.data).toMatchObject({ resolved: true });
-    expect(res.body.data.recipient.displayName).toBe('Grace Hopper');
-  });
 });
 
 describe('/ehr-webhook — 3', () => {
@@ -468,91 +209,10 @@ describe('/ehr-webhook — 3', () => {
   });
 });
 
-describe('/leads — 3', () => {
-  it('POST /:leadId/profile stores the lead as a recipient with attributes', async () => {
-    const res = await post('/leads/lead-9/profile', {
-      name: 'Lead Nine',
-      email: 'nine@example.test',
-      source: 'instagram',
-    });
-    expect(res.status).toBe(201);
-    expect(res.body.data).toMatchObject({ leadId: 'lead-9' });
-  });
-
-  it('GET /:leadId/profile returns it', async () => {
-    const res = await get('/leads/lead-9/profile');
-    expect(res.status).toBe(200);
-    expect(res.body.data.source).toBe('instagram');
-  });
-
-  it('GET /:leadId/profile 404s an unknown lead', async () => {
-    expect((await get('/leads/nobody/profile')).status).toBe(404);
-  });
-
-  it('POST /:leadId/message triggers a playbook', async () => {
-    const res = await post('/leads/lead-9/message', { eventType: 'LEAD_NURTURE' });
-    expect(res.status).toBe(200);
-    expect(res.body.success).toBe(true);
-  });
-});
-
-describe('/treatments, /patients, /providers — 4', () => {
-  it('POST /treatments/:id/follow-up triggers', async () => {
-    const res = await post('/treatments/t-1/follow-up', { patientId: PATIENT });
-    expect(res.status).toBe(200);
-    expect(res.body.success).toBe(true);
-  });
-
-  it.each(['onboarding', 'farewell'])('POST /patients/:id/%s triggers', async (path) => {
-    const res = await post(`/patients/${PATIENT}/${path}`, {});
-    expect(res.status).toBe(200);
-    expect(res.body.success).toBe(true);
-  });
-
-  it('GET /providers/:id/feedback/adverse returns the adverse conversations', async () => {
-    // Sourced from message_analytics.metadata now; patient_feedback is a ghost
-    // table and has always been empty, so this has always returned nothing.
-    const res = await get(`/providers/${PROVIDER}/feedback/adverse`);
-    expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ success: true, count: 0 });
-  });
-});
-
-describe('/promotions and the /gift-cards alias', () => {
-  it('POST /promotions/ triggers with the promotion in the context', async () => {
-    const res = await post('/promotions/', {
-      patientId: PATIENT,
-      name: '20% off',
-      expiresAt: '2026-12-31',
-    });
-    expect(res.status).toBe(200);
-    expect(res.body.success).toBe(true);
-  });
-
-  it('POST /gift-cards/ reaches the same router', async () => {
-    // routes/index.ts:96 mounts it twice and something depends on the alias.
-    const res = await post('/gift-cards/', { patientId: PATIENT, code: 'GC-1' });
-    expect(res.status).toBe(200);
-  });
-
-  it('POST /:promotionId/campaign refuses rather than sending to stub data', async () => {
-    const res = await post('/promotions/p-1/campaign', {});
-    expect(res.status).toBe(400);
-    expect(res.body.error.message).toMatch(/findEligiblePatients/);
-  });
-
-  it('POST /patients/:patientId/feedback triggers', async () => {
-    const res = await post(`/promotions/patients/${PATIENT}/feedback`, {});
-    expect(res.status).toBe(200);
-  });
-});
-
 describe('deprecation contract', () => {
   it.each([
     ['/templates/', '/v1/templates'],
-    ['/ai-enhanced/pending-approvals/provider-1', '/v1/outreach/generate'],
     ['/ehr-webhook/mapping-preview/x', '/v1/outreach/trigger'],
-    ['/leads/lead-9/profile', '/v1/recipients'],
   ])('%s carries Deprecation and a successor Link', async (path, successor) => {
     const res = await get(path);
     expect(res.headers.deprecation).toBe('true');

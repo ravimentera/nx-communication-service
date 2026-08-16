@@ -94,22 +94,63 @@ afterAll(async () => {
 });
 
 describe('deprecation contract', () => {
-  it('marks every compat response deprecated and points at its successor', async () => {
-    const res = await get('/queue/stats');
-    expect(res.headers.deprecation).toBe('true');
-    expect(res.headers.link).toBe('</v1/queue/stats>; rel="successor-version"');
-  });
-
-  it('counts compat hits, so P12 can tell what is still in use', async () => {
-    await get('/queue/stats');
-    const metrics = await request(h.app).get('/metrics');
-    expect(metrics.text).toContain('outreach_compat_hits_total');
-    expect(metrics.text).toMatch(/outreach_compat_hits_total\{[^}]*path="\/queue"/);
-  });
-
   it('still refuses a request that did not come through the gateway', async () => {
-    const res = await request(h.app).get('/queue/stats');
+    const res = await request(h.app).get('/config/medspa/anything');
     expect(res.status).toBe(403);
+  });
+
+  it('marks every surviving compat response deprecated and points at its successor', async () => {
+    const res = await get('/approvals/pending/provider-1');
+    expect(res.headers.deprecation).toBe('true');
+    expect(res.headers.link).toBe('</v1/approvals>; rel="successor-version"');
+  });
+
+  it('counts compat hits, so a mount that stays at zero can be spotted', async () => {
+    // The counter no longer *decides* deletions — that was the parallel-run plan
+    // and it could never have worked with no traffic (D99). It now confirms the
+    // trim was right: a surviving mount at zero after the cutover is one this
+    // should have caught.
+    await get('/approvals/pending/provider-1');
+    const metrics = await request(h.app).get('/metrics');
+    expect(metrics.text).toMatch(/outreach_compat_hits_total\{[^}]*path="\/approvals"/);
+  });
+});
+
+/**
+ * The mounts P12 removed (D100). Each answers **410 Gone** naming its successor
+ * rather than 404, so a caller the inspection missed learns what happened
+ * instead of seeing something indistinguishable from a typo.
+ */
+describe('retired mounts', () => {
+  it.each([
+    ['/sms/send', '/v1/messages'],
+    ['/slack/message', '/v1/messages'],
+    ['/preferences/user-1', '/v1/recipients'],
+    ['/queue/stats', '/v1/queue'],
+    ['/ai/generate', '/v1/content/generate'],
+    ['/ai-enhanced/pending-approvals/provider-1', '/v1/outreach/generate'],
+    ['/leads/lead-1/profile', '/v1/recipients'],
+    ['/treatments/t-1/follow-up', '/v1/outreach/trigger'],
+    ['/patients/p-1/onboarding', '/v1/outreach/trigger'],
+    ['/providers/provider-1/feedback/adverse', '/v1/analytics'],
+    ['/promotions/', '/v1/outreach/trigger'],
+    ['/gift-cards/', '/v1/outreach/trigger'],
+  ])('%s answers 410 naming %s', async (path, successor) => {
+    const res = await get(path);
+    expect(res.status).toBe(410);
+    expect(res.body.error.code).toBe('GONE');
+    expect(res.body.error.successor).toContain(successor);
+  });
+
+  it('answers 410 whatever the method', async () => {
+    expect((await post('/sms/send', { to: '+15550000000' })).status).toBe(410);
+    expect((await put('/preferences/user-1', {})).status).toBe(410);
+  });
+
+  it('does not shadow a surviving sibling', async () => {
+    // `/messages/webhook/*` survives while `/messages/generate-reply` does not,
+    // and `/templates` survives entirely — a retired mount must not swallow them.
+    expect((await get('/templates/')).status).toBe(200);
   });
 });
 
@@ -130,54 +171,13 @@ describe('/email — 1', () => {
   });
 });
 
-describe('/sms — 2', () => {
-  it('POST /sms/send accepts a plain message', async () => {
-    const res = await post('/sms/send', { to: '+15550000001', message: 'See you at 3' });
-    expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ success: true, messageType: 'plain', medspaId: TENANT });
-  });
-
-  it('POST /sms/send rejects a body with neither message nor templateId', async () => {
-    const res = await post('/sms/send', { to: '+15550000001' });
-    expect(res.status).toBe(400);
-  });
-
-  it('POST /sms/send rejects a templateId with no variables', async () => {
-    const res = await post('/sms/send', { to: '+15550000001', templateId: 'password-reset' });
-    expect(res.status).toBe(400);
-  });
-
-  it('POST /sms/send-direct answers the same shape', async () => {
-    const res = await post('/sms/send-direct', { to: '+15550000001', message: 'now' });
-    expect(res.status).toBe(200);
-    expect(res.body.success).toBe(true);
-  });
-});
-
-describe('/slack — 2', () => {
-  it('POST /slack/message requires an explicit channel', async () => {
-    // The source defaults to a hardcoded channel name shared across tenants (D55).
-    const res = await post('/slack/message', { text: 'hello' });
-    expect(res.status).toBe(400);
-  });
-
-  it('POST /slack/message accepts a channel', async () => {
-    const res = await post('/slack/message', { channel: '#ops', text: 'hello' });
-    expect(res.status).toBe(200);
-    expect(res.body.success).toBe(true);
-  });
-
-  it('POST /slack/urgent sends without a channel', async () => {
-    const res = await post('/slack/urgent', { message: 'page someone' });
-    expect(res.status).toBe(200);
-    expect(res.body.message).toMatch(/urgent/i);
-  });
-});
-
-describe('/events — 5, mounted twice', () => {
+describe('/events — 1, mounted twice', () => {
   const event = { id: 'evt-1', type: 'APPOINTMENT_REMINDER', data: { when: 'tomorrow' } };
 
-  it.each(['/events/', '/events/legacy', '/events/process'])(
+  // `/events/legacy` and `/events/process` were retired in P12 (D100): the two
+  // callers post to the root path. scheduling-service to `/events`,
+  // providers-service to `/api/events`.
+  it.each(['/events/'])(
     'POST %s accepts an event',
     async (path) => {
       const res = await post(path, { ...event, id: `evt-${path}` });
@@ -192,113 +192,13 @@ describe('/events — 5, mounted twice', () => {
     expect(res.body.success).toBe(true);
   });
 
-  it('POST /events/batch rejects a non-array body', async () => {
-    const res = await post('/events/batch', { not: 'an array' });
-    expect(res.status).toBe(400);
-  });
-
-  it('POST /events/batch reports per-event outcomes', async () => {
-    const res = await post('/events/batch', [
-      { ...event, id: 'evt-b1' },
-      { ...event, id: 'evt-b2' },
-    ]);
-    expect(res.status).toBe(200);
-    expect(res.body.results).toHaveLength(2);
-  });
-
   it('GET /events/:eventId/status 404s an event nobody sent', async () => {
     const res = await get('/events/never-happened/status');
     expect(res.status).toBe(404);
   });
 });
 
-describe('/preferences — 9', () => {
-  it('POST /preferences creates a row keyed by the legacy patient id', async () => {
-    const res = await post('/preferences/', { userId: PATIENT, allowCommunications: true });
-    expect(res.status).toBe(201);
-    expect(res.body.success).toBe(true);
-  });
-
-  it('GET /preferences/:userId returns them without the unsubscribe token', async () => {
-    const res = await get(`/preferences/${PATIENT}`);
-    expect(res.status).toBe(200);
-    // The token is a credential — it is what makes the unauthenticated
-    // unsubscribe route safe (D43) — and must never appear in a plain read.
-    expect(res.body.preferences).not.toHaveProperty('unsubscribeToken');
-  });
-
-  it('PUT /preferences/:userId updates them', async () => {
-    const res = await put(`/preferences/${PATIENT}`, { preferredLanguage: 'fr' });
-    expect(res.status).toBe(200);
-    expect(res.body.preferences.preferredLanguage).toBe('fr');
-  });
-
-  it('GET /preferences/:userId 404s an unknown patient', async () => {
-    const res = await get('/preferences/nobody');
-    expect(res.status).toBe(404);
-  });
-
-  it('GET /preferences/:userId/unsubscribe-url returns a URL', async () => {
-    const res = await get(`/preferences/${PATIENT}/unsubscribe-url`);
-    expect(res.status).toBe(200);
-    expect(res.body.unsubscribeUrl).toMatch(/^https:\/\//);
-  });
-
-  it('GET /preferences/quiet-hours is not swallowed by /:userId', async () => {
-    const res = await get('/preferences/quiet-hours');
-    expect(res.status).toBe(200);
-    expect(res.body).toHaveProperty('quietHours');
-  });
-
-  it('PUT /preferences/quiet-hours stores them per tenant, not globally', async () => {
-    const quietHours = { startTime: '22:00', endTime: '06:00', timezone: 'America/New_York' };
-    const res = await put('/preferences/quiet-hours', quietHours);
-    expect(res.status).toBe(200);
-    expect(res.body.quietHours).toEqual(quietHours);
-
-    // A second tenant sees its own window, not this one. The source's was a
-    // single process-wide value any caller could overwrite.
-    const other = await get(
-      '/preferences/quiet-hours',
-      gatewayHeaders({ 'x-medspa-id': OTHER_TENANT }),
-    );
-    expect(other.body.quietHours).toBeNull();
-  });
-
-  it('PUT /preferences/quiet-hours rejects an incomplete window', async () => {
-    const res = await put('/preferences/quiet-hours', { startTime: '22:00' });
-    expect(res.status).toBe(400);
-  });
-
-  it('POST /preferences/check reports whether a send is allowed', async () => {
-    const res = await post('/preferences/check', {
-      userId: PATIENT,
-      channels: ['EMAIL'],
-      priority: 'MEDIUM',
-    });
-    expect(res.status).toBe(200);
-    expect(res.body).toHaveProperty('allowed');
-  });
-
-  it('POST /preferences/check allows an unknown recipient', async () => {
-    const res = await post('/preferences/check', { userId: 'unknown-person' });
-    expect(res.body).toMatchObject({ allowed: true });
-  });
-
-  it('GET /preferences/unsubscribe does not mutate — mail clients prefetch links', async () => {
-    const res = await get('/preferences/unsubscribe?token=whatever');
-    expect(res.status).toBe(200);
-    expect(res.body.message).toMatch(/POST/);
-  });
-
-  it('POST /preferences/unsubscribe by userId unsubscribes', async () => {
-    const res = await post('/preferences/unsubscribe', { userId: PATIENT });
-    expect(res.status).toBe(200);
-    expect(res.body.success).toBe(true);
-  });
-});
-
-describe('/config — 9', () => {
+describe('/config — 3', () => {
   it('POST /config/medspa creates the tenant config', async () => {
     const res = await post('/config/medspa', {
       medspaId: TENANT,
@@ -331,68 +231,13 @@ describe('/config — 9', () => {
     expect(res.status).toBe(403);
   });
 
-  it('POST /config/provider creates an agent config', async () => {
-    const res = await post('/config/provider', {
-      medspaId: TENANT,
-      providerId: PROVIDER,
-      name: 'Dr Ada',
-      twilioPhoneNumber: '+15550000009',
-      twilioEnabled: true,
-    });
-    expect(res.status).toBe(201);
-    expect(res.body.data).toMatchObject({ providerId: PROVIDER, medspaId: TENANT });
-  });
-
-  it('GET /config/provider/:providerId/medspa/:medspaId returns it', async () => {
-    const res = await get(`/config/provider/${PROVIDER}/medspa/${TENANT}`);
-    expect(res.status).toBe(200);
-    expect(res.body.data.senderId).toBe(PROVIDER);
-  });
-
-  it('PUT /config/provider/:providerId/medspa/:medspaId updates it', async () => {
-    const res = await put(`/config/provider/${PROVIDER}/medspa/${TENANT}`, {
-      emailFromName: 'Ada L',
-    });
-    expect(res.status).toBe(200);
-    expect(res.body.data.emailFromName).toBe('Ada L');
-  });
-
-  it('GET /config/medspa/:medspaId/providers lists agents', async () => {
-    const res = await get(`/config/medspa/${TENANT}/providers`);
-    expect(res.status).toBe(200);
-    expect(Array.isArray(res.body.data)).toBe(true);
-  });
-
-  it('GET /config/medspa/:medspaId/phone-numbers lists sending numbers', async () => {
-    const res = await get(`/config/medspa/${TENANT}/phone-numbers`);
-    expect(res.status).toBe(200);
-    expect(res.body.data).toHaveProperty('agentNumbers');
-  });
-
-  it('POST /config/test-sms requires a destination', async () => {
-    expect((await post('/config/test-sms', { medspaId: TENANT })).status).toBe(400);
-    const res = await post('/config/test-sms', { medspaId: TENANT, to: '+15550000001' });
-    expect(res.status).toBe(200);
-  });
 });
 
-describe('/approvals — 9', () => {
+describe('/approvals — 5', () => {
   it('GET /approvals/pending/:providerId lists the queue', async () => {
     const res = await get(`/approvals/pending/${PROVIDER}`);
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ success: true });
-    expect(Array.isArray(res.body.data)).toBe(true);
-  });
-
-  it('GET /approvals/dashboard/:providerId returns counts', async () => {
-    const res = await get(`/approvals/dashboard/${PROVIDER}`);
-    expect(res.status).toBe(200);
-    expect(res.body.success).toBe(true);
-  });
-
-  it('GET /approvals/history/:providerId returns a page', async () => {
-    const res = await get(`/approvals/history/${PROVIDER}`);
-    expect(res.status).toBe(200);
     expect(Array.isArray(res.body.data)).toBe(true);
   });
 
@@ -414,63 +259,15 @@ describe('/approvals — 9', () => {
     expect(res.status).toBe(404);
   });
 
-  it('POST /approvals/bulk-action reports per-row outcomes without aborting', async () => {
-    const res = await post('/approvals/bulk-action', {
-      messageIds: [messageId],
-      action: 'approve',
-    });
-    expect(res.status).toBe(200);
-    expect(res.body.results).toHaveLength(1);
-    expect(res.body.results[0]).toMatchObject({ messageId, success: false });
-  });
 });
 
-describe('/communications — 16', () => {
-  it('GET /communications/medspa/:medspaId returns {success, data[], pagination}', async () => {
-    const res = await get(`/communications/medspa/${TENANT}`);
-    expect(res.status).toBe(200);
-    expect(Array.isArray(res.body.data)).toBe(true);
-    expect(res.body.pagination).toMatchObject({ page: 1, hasPrev: false });
-
-    // The legacy vocabulary, both ways. Located by id rather than by position:
-    // earlier tests in this file send messages of their own, so the top of a
-    // sentAt-desc page is not stable.
-    const seeded = res.body.data.find((m: { id: string }) => m.id === messageId);
-    expect(seeded).toMatchObject({ patientId: PATIENT, providerId: PROVIDER, medspaId: TENANT });
-    expect(seeded).not.toHaveProperty('recipientId');
-    expect(seeded).not.toHaveProperty('senderId');
-  });
-
+describe('/communications — 6', () => {
   /**
    * The legacy `?channel=` filter had no coverage at all, which is how a
    * casing mismatch between the writer and the reader survived from P3 to P9
    * (D80). It is the FE's filter, so it is worth testing on the FE's endpoint
    * rather than only on the service beneath it.
    */
-  it('GET /communications/medspa/:medspaId?channel= filters, in either spelling', async () => {
-    for (const spelling of ['EMAIL', 'email']) {
-      const res = await get(`/communications/medspa/${TENANT}?channel=${spelling}`);
-      expect(res.status).toBe(200);
-      const seeded = res.body.data.find((m: { id: string }) => m.id === messageId);
-      expect(seeded).toBeDefined();
-      // The legacy vocabulary is upper case on the way out, whatever is stored.
-      expect(seeded.channel).toBe('EMAIL');
-    }
-  });
-
-  it('GET /communications/medspa/:medspaId?channel= excludes other channels', async () => {
-    const res = await get(`/communications/medspa/${TENANT}?channel=SLACK`);
-    expect(res.status).toBe(200);
-    expect(res.body.data.find((m: { id: string }) => m.id === messageId)).toBeUndefined();
-  });
-
-  it('GET /communications/provider/:providerId is double-nested', async () => {
-    const res = await get(`/communications/provider/${PROVIDER}`);
-    expect(res.status).toBe(200);
-    expect(Array.isArray(res.body.data.data)).toBe(true);
-    expect(res.body.data.pagination).toMatchObject({ page: 1 });
-  });
-
   it('GET /communications/provider/:providerId/inbox is not shadowed by /provider/:providerId', async () => {
     const res = await get(`/communications/provider/${PROVIDER}/inbox`);
     expect(res.status).toBe(200);
@@ -495,64 +292,11 @@ describe('/communications — 16', () => {
     expect(res.body.data[0].latestMessage.content.endsWith('...')).toBe(true);
   });
 
-  it('GET /communications/patient/:patientId resolves the legacy id', async () => {
-    const res = await get(`/communications/patient/${PATIENT}`);
-    expect(res.status).toBe(200);
-    expect(res.body.data.length).toBeGreaterThan(0);
-  });
-
-  it('GET /communications/patient/:patientId returns an empty page for an unknown patient', async () => {
-    // Not a 404: "no messages yet" is the normal state for a new patient.
-    const res = await get('/communications/patient/who-dis');
-    expect(res.status).toBe(200);
-    expect(res.body.data).toEqual([]);
-  });
-
   it('GET /communications/conversation/:providerId/:patientId returns the thread', async () => {
     const res = await get(`/communications/conversation/${PROVIDER}/${PATIENT}`);
     expect(res.status).toBe(200);
     expect(res.body.data).toMatchObject({ providerId: PROVIDER, patientId: PATIENT });
     expect(res.body.data.messages[0]).toHaveProperty('messageClass');
-  });
-
-  it('GET /communications/patient/:patientId/conversation falls back to the header sender', async () => {
-    // `?providerId=` wins; absent it, `x-provider-id` from the gateway is used.
-    // 400 only when neither is present, which the gateway makes unlikely.
-    const explicit = await get(
-      `/communications/patient/${PATIENT}/conversation?providerId=${PROVIDER}`,
-    );
-    expect(explicit.status).toBe(200);
-
-    const implicit = await get(`/communications/patient/${PATIENT}/conversation`);
-    expect(implicit.status).toBe(200);
-    expect(implicit.body.data.providerId).toBe(PROVIDER);
-
-    const neither = await get(
-      `/communications/patient/${PATIENT}/conversation`,
-      gatewayHeaders({ 'x-provider-id': '' }),
-    );
-    expect(neither.status).toBe(400);
-  });
-
-  it('GET /communications/analytics/medspa/:medspaId works with no date range', async () => {
-    // The source 500s here: it builds "undefined 00:00:00" and casts it (D63).
-    const res = await get(`/communications/analytics/medspa/${TENANT}`);
-    expect(res.status).toBe(200);
-    expect(res.body.data).toMatchObject({ byChannel: expect.any(Object) });
-  });
-
-  it('GET /communications/analytics/medspa/:medspaId accepts a date range', async () => {
-    const res = await get(
-      `/communications/analytics/medspa/${TENANT}?dateFrom=2020-01-01&dateTo=2030-01-01`,
-    );
-    expect(res.status).toBe(200);
-    expect(res.body.data.totalCommunications).toBeGreaterThan(0);
-  });
-
-  it('GET /communications/:id returns one message, last so it shadows nothing', async () => {
-    const res = await get(`/communications/${messageId}`);
-    expect(res.status).toBe(200);
-    expect(res.body.data).toMatchObject({ id: messageId, patientId: PATIENT });
   });
 
   it('GET /communications/:id 404s another tenant’s message', async () => {
@@ -561,16 +305,6 @@ describe('/communications — 16', () => {
       gatewayHeaders({ 'x-medspa-id': OTHER_TENANT }),
     );
     expect(res.status).toBe(404);
-  });
-
-  it('PUT /communications/:messageId/read marks it read, twice without failing', async () => {
-    const first = await put(`/communications/${messageId}/read`, {});
-    expect(first.status).toBe(200);
-    expect(first.body.data.isRead).toBe(true);
-
-    const second = await put(`/communications/${messageId}/read`, {});
-    expect(second.status).toBe(200);
-    expect(second.body.data.isRead).toBe(true);
   });
 
   it('PUT /communications/conversation/:providerId/:patientId/read-all', async () => {
@@ -593,37 +327,9 @@ describe('/communications — 16', () => {
     },
   );
 
-  it('POST /communications/response records an inbound reply', async () => {
-    const res = await post('/communications/response', {
-      patientId: PATIENT,
-      providerId: PROVIDER,
-      channel: 'EMAIL',
-      content: 'Thanks, see you then',
-    });
-    expect(res.status).toBe(201);
-    expect(res.body.data).toMatchObject({ patientId: PATIENT });
-  });
-
-  it('GET /communications/patient/:id/conversation/summary returns counted facts', async () => {
-    // The source asks a model to summarise on every page load. Counts can be
-    // cited; generated prose cannot, and costs a model call per render.
-    const res = await get(`/communications/patient/${PATIENT}/conversation/summary`);
-    expect(res.status).toBe(200);
-    expect(res.body.data.summary).toMatchObject({ totalMessages: expect.any(Number) });
-  });
-
-  it('GET /communications/patient/:id/info reads through the context registry', async () => {
-    const res = await get(`/communications/patient/${PATIENT}/info`);
-    expect(res.status).toBe(200);
-    expect(res.body.data).toMatchObject({ patientId: PATIENT, patientName: 'Ada Lovelace' });
-  });
-
-  it('GET /communications/patient/:id/info 404s a patient this tenant has never seen', async () => {
-    expect((await get('/communications/patient/stranger/info')).status).toBe(404);
-  });
 });
 
-describe('/messages — 3, and they are not provider webhooks', () => {
+describe('/messages — 2 provider webhooks', () => {
   it('POST /messages/webhook/sms records a reply', async () => {
     const res = await post('/messages/webhook/sms', {
       patientId: PATIENT,
@@ -660,41 +366,5 @@ describe('/messages — 3, and they are not provider webhooks', () => {
     expect(res.status).toBe(200);
   });
 
-  it('POST /messages/generate-reply 404s a message from another tenant', async () => {
-    const res = await post(
-      '/messages/generate-reply',
-      { messageId, patientReply: 'ok' },
-      gatewayHeaders({ 'x-medspa-id': OTHER_TENANT }),
-    );
-    expect(res.status).toBe(404);
-  });
-
-  it('POST /messages/generate-reply runs the reply playbook', async () => {
-    const res = await post('/messages/generate-reply', { messageId, patientReply: 'ok' });
-    expect(res.status).toBe(200);
-    expect(res.body.data).toMatchObject({ patientId: PATIENT, providerId: PROVIDER });
-  });
 });
 
-describe('/queue — 2', () => {
-  it('GET /queue/stats keeps the {stats:{notification,event}} shape', async () => {
-    const res = await get('/queue/stats');
-    expect(res.status).toBe(200);
-    expect(res.body.stats).toHaveProperty('notification');
-    expect(res.body.stats).toHaveProperty('event');
-  });
-
-  it('POST /queue/maintenance needs the admin permission', async () => {
-    expect((await post('/queue/maintenance')).status).toBe(403);
-  });
-
-  it('POST /queue/maintenance reports what it actually did', async () => {
-    const res = await post(
-      '/queue/maintenance',
-      {},
-      gatewayHeaders({ 'x-user-permissions': JSON.stringify(['outreach:admin']) }),
-    );
-    expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ success: true, performed: [] });
-  });
-});

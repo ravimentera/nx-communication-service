@@ -29,7 +29,6 @@ import { z } from 'zod';
 import type { ReceiptService } from '../../engine/messaging/receipt.service.js';
 import type { PlaybookApiDeps } from '../v1/playbooks.js';
 import { requireTenant } from '../../platform/http/auth.middleware.js';
-import { NotFoundError } from '../../platform/http/errors.js';
 import type { MessageService } from '../../engine/messaging/message.service.js';
 import { deprecate } from './index.js';
 import type { CompatIdentity } from './translate.js';
@@ -44,11 +43,6 @@ const replySchema = z.object({
   providerId: z.string().optional(),
   medspaId: z.string().optional(),
   patientId: z.string().min(1),
-});
-
-const generateSchema = z.object({
-  messageId: z.string().uuid(),
-  patientReply: z.string().min(1),
 });
 
 export interface MessagesCompatDeps {
@@ -125,41 +119,6 @@ export function createLegacyMessagesRouter(deps: MessagesCompatDeps): Router {
 
   router.post('/webhook/sms', ingest('SMS'));
   router.post('/webhook/email', ingest('EMAIL'));
-
-  router.post(
-    '/generate-reply',
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      const body = generateSchema.parse(req.body);
-
-      const original = await deps.messages.getById(scope, body.messageId);
-      // The source looks this up with a bare `eq(id)` and no tenant predicate
-      // (`webhooks-controller.ts:368`) — the same shape as D62.
-      if (!original) throw new NotFoundError('Original message not found');
-
-      const results = await deps.playbooks.runtime.run({
-        type: 'manual',
-        tenantId: scope.tenantId,
-        subTenantId: scope.subTenantId,
-        eventType: 'PATIENT_REPLY',
-        correlationId: `manual-reply:${body.messageId}`,
-        recipientId: original.recipientId ?? undefined,
-        senderId: original.senderId ?? undefined,
-        payload: { context: { reply: body.patientReply, channel: original.channel } },
-      });
-
-      const patientIds = await deps.identity.patientIds(scope, [original.recipientId]);
-      res.json({
-        success: true,
-        data: {
-          patientId: original.recipientId ? (patientIds.get(original.recipientId) ?? null) : null,
-          providerId: original.senderId,
-          medspaId: scope.tenantId,
-          results,
-        },
-      });
-    }),
-  );
 
   return router;
 }

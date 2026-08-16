@@ -26,20 +26,10 @@ import { Router, type NextFunction, type Request, type Response } from 'express'
 import { z } from 'zod';
 
 import { actorOf, type ApprovalApiDeps } from '../v1/approvals.js';
-import {
-  Permission,
-  requirePermissions,
-  requireTenant,
-} from '../../platform/http/auth.middleware.js';
-import { ForbiddenError, NotFoundError, ValidationError } from '../../platform/http/errors.js';
+import { Permission, requireTenant } from '../../platform/http/auth.middleware.js';
+import { ForbiddenError, NotFoundError } from '../../platform/http/errors.js';
 import type { TenantScope } from '../../platform/db/tenant-scope.js';
 import { deprecate } from './index.js';
-
-const bulkSchema = z.object({
-  messageIds: z.array(z.string().uuid()).min(1),
-  action: z.enum(['approve', 'decline', 'cancel']),
-  reason: z.string().optional(),
-});
 
 const contentSchema = z.object({
   content: z.string().min(1),
@@ -95,92 +85,6 @@ export function createLegacyApprovalRouter(deps: ApprovalApiDeps): Router {
       });
 
       res.json({ success: true, data: page.approvals, pagination: page });
-    }),
-  );
-
-  router.get(
-    '/dashboard/:providerId',
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      assertOwnQueue(req, req.params.providerId as string);
-      res.json({
-        success: true,
-        data: await deps.approvals.dashboard(scope, req.params.providerId as string),
-      });
-    }),
-  );
-
-  router.get(
-    '/history/:providerId',
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      assertOwnQueue(req, req.params.providerId as string);
-      const page = await deps.approvals.history(scope, {
-        approverRef: req.params.providerId as string,
-        page: req.query.page ? Number(req.query.page) : 1,
-        pageSize: req.query.limit ? Number(req.query.limit) : 50,
-      });
-      res.json({ success: true, data: page.approvals, pagination: page });
-    }),
-  );
-
-  /**
-   * Declared before `/approve/:messageId` and friends only for readability —
-   * they do not collide. It is `/bulk-action` in the source and stays so.
-   */
-  router.post(
-    '/bulk-action',
-    requirePermissions(Permission.APPROVE_BULK),
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      const body = bulkSchema.parse(req.body);
-
-      // Per-row outcomes without aborting the batch — the one thing the
-      // source's bulk path gets right. Its failure mode is worth avoiding
-      // though: it dereferences `currentMessage[0].providerId` before checking
-      // the array is non-empty (:794 vs :801), so a bad id reports "Cannot read
-      // properties of undefined" as the row's error.
-      const resolved = await Promise.all(
-        body.messageIds.map(async (messageId) => {
-          try {
-            return { messageId, approvalId: await approvalIdFor(scope, messageId) };
-          } catch (error) {
-            return {
-              messageId,
-              error: error instanceof Error ? error.message : String(error),
-            };
-          }
-        }),
-      );
-
-      const actionable = resolved.filter(
-        (r): r is { messageId: string; approvalId: string } => 'approvalId' in r,
-      );
-      // Every id failed to resolve: report that per row rather than calling
-      // `bulk` with an empty list, which is a caller error the service is right
-      // to reject and which would lose the per-row reasons.
-      const outcome = actionable.length
-        ? await deps.approvals.bulk(
-            scope,
-            actionable.map((r) => r.approvalId),
-            body.action,
-            actorOf(req),
-            body.reason,
-          )
-        : { results: [] as Array<Record<string, unknown>> };
-
-      res.json({
-        success: true,
-        results: [
-          ...outcome.results.map((result, i) => ({
-            messageId: actionable[i]?.messageId,
-            ...result,
-          })),
-          ...resolved
-            .filter((r) => 'error' in r)
-            .map((r) => ({ messageId: r.messageId, success: false, error: (r as { error: string }).error })),
-        ],
-      });
     }),
   );
 
@@ -240,22 +144,6 @@ export function createLegacyApprovalRouter(deps: ApprovalApiDeps): Router {
         body.subject,
       );
       res.json({ success: true, message: 'Message edited and approved', data: result });
-    }),
-  );
-
-  router.post(
-    '/schedule/:messageId',
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      const sendAt = (req.body?.scheduledFor ?? req.body?.sendAt) as string | undefined;
-      if (!sendAt) throw new ValidationError('scheduledFor is required');
-
-      const id = await approvalIdFor(scope, req.params.messageId as string);
-      const result = await deps.approvals.schedule(scope, id, actorOf(req), new Date(sendAt));
-      // The source writes a `scheduledFor` string that no scheduler consumes
-      // (`:1003-1025`). This becomes a delayed BullMQ job, so the wait survives
-      // a restart and the message actually goes out.
-      res.json({ success: true, message: 'Message scheduled successfully', data: result });
     }),
   );
 

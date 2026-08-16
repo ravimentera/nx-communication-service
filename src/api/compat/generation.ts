@@ -33,8 +33,7 @@ import {
   requirePermissions,
   requireTenant,
 } from '../../platform/http/auth.middleware.js';
-import { actorOf } from '../v1/approvals.js';
-import { ForbiddenError, NotFoundError, ValidationError } from '../../platform/http/errors.js';
+import { NotFoundError, ValidationError } from '../../platform/http/errors.js';
 import { toChannelType } from '../../ports/channel.js';
 import { deprecate } from './index.js';
 import type { CompatIdentity } from './translate.js';
@@ -48,23 +47,6 @@ const generateSchema = z.object({
   goal: z.string().optional(),
   context: z.record(z.string(), z.unknown()).optional(),
   priority: z.enum(['LOW', 'MEDIUM', 'HIGH', 'URGENT']).default('MEDIUM'),
-});
-
-const batchSchema = z.object({
-  patientIds: z.array(z.string().min(1)).min(1).max(200),
-  providerId: z.string().optional(),
-  channel: z.string().default('EMAIL'),
-  promptPackKey: z.string().optional(),
-  goal: z.string().optional(),
-  context: z.record(z.string(), z.unknown()).optional(),
-});
-
-const triggerSchema = z.object({
-  eventType: z.string().min(1),
-  patientId: z.string().optional(),
-  providerId: z.string().optional(),
-  data: z.record(z.string(), z.unknown()).optional(),
-  channels: z.array(z.string()).optional(),
 });
 
 export interface GenerationCompatDeps {
@@ -90,7 +72,6 @@ function toAiEnhancedStatus(status: string): string {
 }
 
 export function createLegacyGenerationRouters(deps: GenerationCompatDeps): {
-  aiEnhanced: Router;
   automated: Router;
   /** Exposed so `/communications/generate-message` shares the same path. */
   draft: (
@@ -195,153 +176,13 @@ export function createLegacyGenerationRouters(deps: GenerationCompatDeps): {
   }
 
   // ── /ai-enhanced ──────────────────────────────────────────────────────────
-  const aiEnhanced = Router();
-  aiEnhanced.use(deprecate('/ai-enhanced', '/v1/outreach/generate'));
+  // `/ai-enhanced` was retired in P12 (D100): nothing calls any of its six
+  // endpoints. `POST /v1/outreach/generate` and `/v1/approvals` replace them,
+  // and the mount answers 410 naming both — see RETIRED_MOUNTS in index.ts.
+  //
+  // `draftFor` above survives: `/communications/generate-message` uses it, and
+  // it is the one drafting path both legacy URLs shared.
 
-  aiEnhanced.post(
-    '/generate-communication',
-    requirePermissions(Permission.SEND),
-    handle(async (req, res) => {
-      const body = generateSchema.parse(req.body);
-      res.status(201).json({ success: true, data: await draftFor(req, body) });
-    }),
-  );
-
-  aiEnhanced.post(
-    '/batch-generate',
-    requirePermissions(Permission.SEND),
-    handle(async (req, res) => {
-      const body = batchSchema.parse(req.body);
-
-      // Per-recipient outcomes without aborting the batch. The source's
-      // `Promise.all` rejects the whole run on the first failure, so one
-      // recipient with no email address loses every other draft in the batch.
-      const results = [];
-      for (const patientId of body.patientIds) {
-        try {
-          results.push({
-            patientId,
-            success: true,
-            ...(await draftFor(req, { ...body, patientId, priority: 'MEDIUM' })),
-          });
-        } catch (error) {
-          results.push({
-            patientId,
-            success: false,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-      }
-
-      res.status(201).json({
-        success: results.some((r) => r.success),
-        data: results,
-        summary: {
-          requested: body.patientIds.length,
-          generated: results.filter((r) => r.success).length,
-          failed: results.filter((r) => !r.success).length,
-        },
-      });
-    }),
-  );
-
-  aiEnhanced.get(
-    '/pending-approvals/:providerId',
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      const providerId = req.params.providerId as string;
-      const senderId = req.identity?.senderId;
-      const isAdmin = req.identity?.permissions?.includes(Permission.ADMIN);
-      if (!isAdmin && senderId && senderId !== providerId) {
-        throw new ForbiddenError('Access denied: you can only access your own approval queue');
-      }
-
-      const page = await deps.approvals.approvals.list(scope, {
-        approverRef: providerId,
-        status: 'PENDING_APPROVAL',
-        page: req.query.page ? Number(req.query.page) : 1,
-        pageSize: req.query.limit ? Number(req.query.limit) : 50,
-      });
-
-      // The same rows `/approvals/pending/:providerId` returns. Under the
-      // source these two lists are disjoint (D46).
-      res.json({
-        success: true,
-        data: page.approvals.map((a) => ({ ...a, status: toAiEnhancedStatus(a.status) })),
-        pagination: page,
-      });
-    }),
-  );
-
-  aiEnhanced.post(
-    '/approve/:messageId',
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      const approval = await deps.approvals.approvals.getByMessageId(
-        scope,
-        req.params.messageId as string,
-      );
-      if (!approval) throw new NotFoundError(`No approval found for message '${req.params.messageId}'`);
-
-      const result = await deps.approvals.approvals.approve(scope, approval.id, actorOf(req));
-      res.json({
-        success: true,
-        message: 'Communication approved',
-        data: { ...result, approval: { ...result.approval, status: toAiEnhancedStatus(result.approval.status) } },
-      });
-    }),
-  );
-
-  aiEnhanced.get(
-    '/patient/:patientId/suggested-communications',
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      const recipientId = await deps.identity.lookup(scope, req.params.patientId as string);
-      if (!recipientId) throw new NotFoundError('Patient not found');
-
-      // The source asks the model which messages a provider *might* send. That
-      // is a playbook question now: what would fire for this recipient. Listing
-      // the tenant's active playbooks answers it without an LLM call, and
-      // without the source's habit of inventing suggestions from thin context.
-      const playbooks = await deps.playbooks.registry.listPlaybooks(scope, { active: true });
-      res.json({
-        success: true,
-        data: playbooks.map((p) => ({
-          playbookKey: p.key,
-          name: p.name,
-          channels: p.channelPlan,
-          requiresApproval: Boolean(p.approvalPolicyId),
-        })),
-      });
-    }),
-  );
-
-  aiEnhanced.post(
-    '/analyze-communication-style',
-    requirePermissions(Permission.SEND),
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      const packKey = (req.body?.promptPackKey as string) ?? 'core.content-analyze';
-      const pack = deps.content.packs.prompt(packKey);
-      if (!pack) throw new NotFoundError(`Prompt pack '${packKey}' not found`);
-
-      const draft = await deps.content.generator.generate({
-        tenantId: scope.tenantId,
-        subTenantId: scope.subTenantId,
-        pack,
-        channel: 'email',
-        playbookGoal: 'analyse communication style',
-        context: {
-          ...emptyContext(scope.tenantId),
-          context: { samples: req.body?.samples ?? [], ...(req.body?.context ?? {}) },
-        },
-      });
-
-      res.json({ success: true, data: { analysis: draft.content, model: draft.model } });
-    }),
-  );
-
-  // ── /automated-messages ───────────────────────────────────────────────────
   const automated = Router();
   automated.use(deprecate('/automated-messages', '/v1/outreach/generate'));
 
@@ -354,90 +195,9 @@ export function createLegacyGenerationRouters(deps: GenerationCompatDeps): {
     }),
   );
 
-  automated.post(
-    '/bulk-generate',
-    requirePermissions(Permission.SEND),
-    handle(async (req, res) => {
-      const body = batchSchema.parse(req.body);
-      const results = [];
-      for (const patientId of body.patientIds) {
-        try {
-          results.push({
-            patientId,
-            success: true,
-            ...(await draftFor(req, { ...body, patientId, priority: 'MEDIUM' })),
-          });
-        } catch (error) {
-          results.push({
-            patientId,
-            success: false,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-      }
-      res.status(201).json({ success: results.some((r) => r.success), data: results });
-    }),
-  );
-
-  automated.post(
-    '/trigger-from-event',
-    requirePermissions(Permission.SEND),
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      const body = triggerSchema.parse(req.body);
-      const results = await deps.playbooks.runtime.run({
-        type: 'event',
-        tenantId: scope.tenantId,
-        subTenantId: scope.subTenantId,
-        eventType: body.eventType,
-        correlationId: `automated:${body.eventType}:${body.patientId ?? 'none'}`,
-        recipientId: body.patientId
-          ? ((await deps.identity.lookup(scope, body.patientId)) ?? undefined)
-          : undefined,
-        senderId: body.providerId ?? req.identity?.senderId,
-        payload: { context: body.data ?? {} },
-      });
-      res.json({ success: true, matched: results.length, data: results });
-    }),
-  );
-
-  /**
-   * `GET /test-context/:patientId/:providerId` — what context would this
-   * message be rendered against? A debugging endpoint, and a genuinely useful
-   * one; the source builds it by calling patient-service and provider-service
-   * directly. It goes through the pack-gated context registry here, so a tenant
-   * without the medspa pack gets a 403 rather than another vertical's records
-   * (D37).
-   */
-  automated.get(
-    '/test-context/:patientId/:providerId',
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      const recipient = await deps.messaging.recipients.getOrResolve(scope, {
-        kind: 'mentera-patient',
-        id: req.params.patientId as string,
-      });
-
-      res.json({
-        success: true,
-        data: {
-          patientId: req.params.patientId,
-          providerId: req.params.providerId,
-          resolved: Boolean(recipient),
-          recipient: recipient
-            ? {
-                id: recipient.id,
-                displayName: recipient.displayName,
-                timezone: recipient.timezone,
-                locale: recipient.locale,
-                contactPoints: recipient.contactPoints,
-                status: recipient.status,
-              }
-            : null,
-        },
-      });
-    }),
-  );
-
-  return { aiEnhanced, automated, draft: draftFor };
+  // `/bulk-generate`, `/trigger-from-event` and `/test-context/:p/:pr` were
+  // retired with it — the web and mobile clients call `/generate` and nothing
+  // else. `POST /v1/campaigns`, `POST /v1/outreach/trigger` and
+  // `GET /v1/context/preview` are their successors.
+  return { automated, draft: draftFor };
 }

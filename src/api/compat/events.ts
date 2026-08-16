@@ -22,7 +22,6 @@ import { z } from 'zod';
 
 import type { PlaybookApiDeps } from '../v1/playbooks.js';
 import { requireTenant } from '../../platform/http/auth.middleware.js';
-import { NotFoundError, ValidationError } from '../../platform/http/errors.js';
 import { CHANNEL_TYPES } from '../../ports/channel.js';
 import { deprecate } from './index.js';
 import { fromLegacyChannel } from './translate.js';
@@ -111,54 +110,12 @@ export function createLegacyEventRouter(deps: EventCompatDeps): Router {
     });
   });
 
-  router.post('/legacy', runOne);
-  router.post('/process', runOne);
   router.post('/', runOne);
 
-  router.post(
-    '/batch',
-    handle(async (req, res) => {
-      if (!Array.isArray(req.body)) {
-        throw new ValidationError('Request body must be an array of events');
-      }
-      const events = z.array(eventSchema).parse(req.body);
 
-      // Per-event outcomes without aborting the batch — the one thing the
-      // source's batch paths get right, preserved here and in bulk approvals.
-      const results = [];
-      for (const event of events) {
-        try {
-          results.push({
-            eventId: event.id ?? event.eventId,
-            success: true,
-            results: await deps.playbooks.runtime.run(await toTrigger(req, event)),
-          });
-        } catch (error) {
-          results.push({
-            eventId: event.id ?? event.eventId,
-            success: false,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-      }
-
-      res.json({
-        success: results.every((r) => r.success),
-        message: 'Batch event subscription processed successfully',
-        results,
-      });
-    }),
-  );
-
-  router.get(
-    '/:eventId/status',
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      const runs = await deps.playbooks.runtime.findRuns(scope, req.params.eventId as string);
-      if (runs.length === 0) throw new NotFoundError('Event not found');
-      res.json({ success: true, status: runs[0]!.status, metadata: { runs } });
-    }),
-  );
-
+  // `/legacy`, `/process`, `/batch` and `/:eventId/status` were retired in P12
+  // (D100). Both callers post to the root path: scheduling-service to `/events`,
+  // providers-service to `/api/events`. `POST /v1/outreach/trigger/batch` is the
+  // successor for the batch form.
   return router;
 }

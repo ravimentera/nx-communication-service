@@ -43,23 +43,6 @@ const emailSchema = z.object({
   priority: z.enum(['LOW', 'MEDIUM', 'HIGH', 'URGENT']).default('MEDIUM'),
 });
 
-const smsSchema = z.object({
-  to: z.string().min(1),
-  message: z.string().optional(),
-  templateId: z.string().optional(),
-  variables: z.record(z.string(), z.unknown()).optional(),
-  patientId: z.string().optional(),
-  providerId: z.string().optional(),
-  priority: z.enum(['LOW', 'MEDIUM', 'HIGH', 'URGENT']).default('MEDIUM'),
-});
-
-const slackSchema = z.object({
-  channel: z.string().optional(),
-  text: z.string().optional(),
-  message: z.string().optional(),
-  blocks: z.array(z.unknown()).optional(),
-});
-
 export interface SendCompatDeps {
   dispatcher: Dispatcher;
   identity: CompatIdentity;
@@ -144,8 +127,6 @@ export function createBodyResolver(deps: {
 
 export function createLegacySendRouters(deps: SendCompatDeps): {
   email: Router;
-  sms: Router;
-  slack: Router;
 } {
   const resolveBody = createBodyResolver(deps);
 
@@ -195,102 +176,7 @@ export function createLegacySendRouters(deps: SendCompatDeps): {
     }),
   );
 
-  // ── /sms ──────────────────────────────────────────────────────────────────
-  const sms = Router();
-  sms.use(deprecate('/sms', '/v1/messages'));
-
-  const sendSms = (transactional: boolean) =>
-    handle(async (req: Request, res: Response) => {
-      const scope = requireTenant(req);
-      const body = smsSchema.parse(req.body);
-      if (body.templateId && !body.variables) {
-        throw new ValidationError('Template variables are required when using templateId');
-      }
-      const rendered = await resolveBody(scope.tenantId, body);
-      const senderId = body.providerId ?? req.identity?.senderId;
-
-      const result = await deps.dispatcher.dispatch({
-        tenantId: scope.tenantId,
-        subTenantId: scope.subTenantId,
-        channel: 'sms',
-        to: { type: 'phone', value: body.to },
-        rendered: { body: rendered.body },
-        templateId: rendered.templateId,
-        recipientId: body.patientId
-          ? await deps.identity.ensure(scope, body.patientId, { phone: body.to })
-          : undefined,
-        senderId,
-        priority: body.priority,
-        transactional,
-      });
-
-      res.json({
-        success: true,
-        message: 'SMS notification queued successfully',
-        jobId: result.jobId,
-        messageId: result.messageId,
-        messageType: body.templateId ? 'templated' : 'plain',
-        medspaId: scope.tenantId,
-        providerId: senderId,
-      });
-    });
-
-  sms.post('/send', sendSms(false));
-  /**
-   * `send-direct` "bypasses the queue for immediate sending". It no longer
-   * does: the worker is what holds the provider credentials and the retry
-   * policy, and a synchronous send would have neither. It is marked
-   * transactional instead, which is the property callers of `-direct` were
-   * actually reaching for — do not make me wait behind a rate limit.
-   */
-  sms.post('/send-direct', sendSms(true));
-
-  // ── /slack ────────────────────────────────────────────────────────────────
-  const slack = Router();
-  slack.use(deprecate('/slack', '/v1/messages'));
-
-  const sendSlack = (priority: 'MEDIUM' | 'URGENT', defaultChannelRequired: boolean) =>
-    handle(async (req: Request, res: Response) => {
-      const scope = requireTenant(req);
-      const body = slackSchema.parse(req.body);
-      const text = body.text ?? body.message;
-      if (!text) throw new ValidationError('text is required');
-      if (!body.channel && defaultChannelRequired) {
-        // The source defaults to the literal `urgent-alerts`
-        // (`slack.service.ts:109`) — a cross-tenant destination (D55). The
-        // tenant's configured default is resolved by the adapter; if it has
-        // none, saying so beats posting into another tenant's channel.
-        throw new ValidationError(
-          'channel is required, or configure slackDefaultChannel for this tenant',
-        );
-      }
-
-      const result = await deps.dispatcher.dispatch({
-        tenantId: scope.tenantId,
-        subTenantId: scope.subTenantId,
-        channel: 'slack',
-        to: { type: 'slack', value: body.channel ?? '' },
-        rendered: {
-          body: text,
-          // Blocks pass through untouched — a channel adapter does not know
-          // what a treatment is (D25).
-          ...(body.blocks ? { metadata: { blocks: body.blocks } } : {}),
-        },
-        priority,
-        transactional: true,
-      });
-
-      res.json({
-        success: true,
-        message:
-          priority === 'URGENT' ? 'Urgent alert sent successfully' : 'Slack message sent successfully',
-        jobId: result.jobId,
-        messageId: result.messageId,
-      });
-    });
-
-  slack.post('/message', sendSlack('MEDIUM', true));
-  slack.post('/urgent', sendSlack('URGENT', false));
-
-  return { email, sms, slack };
+  // `/sms` and `/slack` were retired in P12 (D100): nothing calls them. Both
+  // answer 410 naming `POST /v1/messages` — see RETIRED_MOUNTS in index.ts.
+  return { email };
 }

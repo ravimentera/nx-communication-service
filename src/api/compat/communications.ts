@@ -24,14 +24,13 @@ import { Router, type NextFunction, type Request, type Response } from 'express'
 import type { MessagingApiDeps } from '../v1/messaging.js';
 import { Permission, requirePermissions, requireTenant } from '../../platform/http/auth.middleware.js';
 import type { ReceiptService } from '../../engine/messaging/receipt.service.js';
-import { ForbiddenError, NotFoundError, ValidationError } from '../../platform/http/errors.js';
+import { NotFoundError, ValidationError } from '../../platform/http/errors.js';
 import { deprecate } from './index.js';
 import {
   fromLegacyChannel,
   legacyPagination,
   toLegacyChannel,
   toLegacyDirection,
-  toLegacyMessage,
 } from './translate.js';
 import type { CompatIdentity } from './translate.js';
 
@@ -60,17 +59,6 @@ function handle(
   };
 }
 
-/** The path's medspa id must be the caller's tenant. */
-function assertPathTenant(req: Request, pathTenantId: string | undefined): { tenantId: string } {
-  const scope = requireTenant(req);
-  if (pathTenantId && pathTenantId !== scope.tenantId) {
-    throw new ForbiddenError(
-      'Access denied: You can only access communications for your own medspa',
-    );
-  }
-  return scope;
-}
-
 /** `:1327` — a 100-character preview, ellipsised. */
 function preview(content: string): string {
   return content.length > 100 ? `${content.slice(0, 100)}...` : content;
@@ -79,44 +67,6 @@ function preview(content: string): string {
 export function createLegacyCommunicationsRouter(deps: CommunicationsCompatDeps): Router {
   const router = Router();
   router.use(deprecate('/communications', '/v1/messages'));
-
-  function filtersFrom(req: Request) {
-    return {
-      channel: req.query.channel ? fromLegacyChannel(req.query.channel as string) : undefined,
-      status: req.query.status as string | undefined,
-      dateFrom: req.query.dateFrom as string | undefined,
-      dateTo: req.query.dateTo as string | undefined,
-      eventType: req.query.eventType as string | undefined,
-      page: req.query.page ? Number(req.query.page) : 1,
-      limit: req.query.limit ? Math.min(Number(req.query.limit), 200) : 50,
-      sort: (req.query.sort as string | undefined) ?? 'sentAt:desc',
-    };
-  }
-
-  async function legacyPage(
-    scope: { tenantId: string },
-    page: Awaited<ReturnType<MessagingApiDeps['messages']['list']>>,
-  ) {
-    const patientIds = await deps.identity.patientIds(
-      scope,
-      page.data.map((m) => m.recipientId),
-    );
-    return {
-      data: page.data.map((m) => toLegacyMessage(m, patientIds)),
-      pagination: legacyPagination(page.page, page.limit, page.total),
-    };
-  }
-
-  // ── lists ─────────────────────────────────────────────────────────────────
-
-  router.get(
-    '/medspa/:medspaId',
-    handle(async (req, res) => {
-      const scope = assertPathTenant(req, req.params.medspaId);
-      const page = await deps.messages.list(scope, filtersFrom(req));
-      res.json({ success: true, ...(await legacyPage(scope, page)) });
-    }),
-  );
 
   router.get(
     '/provider/:providerId/inbox',
@@ -174,50 +124,6 @@ export function createLegacyCommunicationsRouter(deps: CommunicationsCompatDeps)
           followupRequired: data.filter((c) => c.alerts.requiresFollowup).length,
         },
       });
-    }),
-  );
-
-  // Declared after `/provider/:providerId/inbox`, which is a longer path and
-  // would otherwise never match.
-  router.get(
-    '/provider/:providerId',
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      const page = await deps.messages.list(scope, {
-        ...filtersFrom(req),
-        senderId: req.params.providerId as string,
-        // `:242` hides AI drafts from this list.
-        excludeAiGenerated: true,
-      });
-      // Double-nested, deliberately — see the file header.
-      res.status(200).json({ success: true, data: await legacyPage(scope, page) });
-    }),
-  );
-
-  router.get(
-    '/patient/:patientId',
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      const recipientId = await deps.identity.lookup(scope, req.params.patientId as string);
-      if (!recipientId) {
-        res.json({ success: true, data: [], pagination: legacyPagination(1, 50, 0) });
-        return;
-      }
-      const page = await deps.messages.list(scope, { ...filtersFrom(req), recipientId });
-      res.json({ success: true, ...(await legacyPage(scope, page)) });
-    }),
-  );
-
-  router.get(
-    '/patient/:patientId/conversation',
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      const senderId = (req.query.providerId as string) ?? req.identity?.senderId;
-      if (!senderId) throw new ValidationError('providerId is required');
-
-      const recipientId = await deps.identity.lookup(scope, req.params.patientId as string);
-      if (!recipientId) throw new NotFoundError('Patient not found');
-      res.json({ success: true, data: await thread(scope, senderId, recipientId) });
     }),
   );
 
@@ -295,21 +201,6 @@ export function createLegacyCommunicationsRouter(deps: CommunicationsCompatDeps)
     };
   }
 
-  router.get(
-    '/analytics/medspa/:medspaId',
-    handle(async (req, res) => {
-      const scope = assertPathTenant(req, req.params.medspaId);
-      res.json({
-        success: true,
-        data: await deps.analytics.summary(scope, {
-          // Optional again — the source 500s when both are omitted (D63).
-          dateFrom: req.query.dateFrom as string | undefined,
-          dateTo: req.query.dateTo as string | undefined,
-        }),
-      });
-    }),
-  );
-
   // ── writes ────────────────────────────────────────────────────────────────
 
   /** `/message` and `/create-communication` are the same handler. */
@@ -348,24 +239,6 @@ export function createLegacyCommunicationsRouter(deps: CommunicationsCompatDeps)
   router.post('/create-communication', createMessage, sendHandler);
 
   router.put(
-    '/:messageId/read',
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      const isRead = req.body?.isRead === undefined ? true : Boolean(req.body.isRead);
-      const result = await deps.messages.markRead(
-        scope,
-        req.params.messageId as string,
-        isRead,
-      );
-      res.json({
-        success: true,
-        message: `Message marked as ${isRead ? 'read' : 'unread'}`,
-        data: result,
-      });
-    }),
-  );
-
-  router.put(
     '/conversation/:providerId/:patientId/read-all',
     handle(async (req, res) => {
       const scope = requireTenant(req);
@@ -391,35 +264,6 @@ export function createLegacyCommunicationsRouter(deps: CommunicationsCompatDeps)
 
   // ── the four that waited for the content plane ────────────────────────────
 
-  /**
-   * Record an inbound reply. Same shape as `/messages/webhook/*`, reached from
-   * the FE rather than from an integration.
-   */
-  router.post(
-    '/response',
-    requirePermissions(Permission.SEND),
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      const { patientId, providerId, content, channel } = (req.body ?? {}) as Record<
-        string,
-        string | undefined
-      >;
-      if (!patientId || !content) throw new ValidationError('patientId and content are required');
-
-      const recipientId = await deps.identity.ensure(scope, patientId);
-      const result = await deps.receipts.recordInboundFor({
-        tenantId: scope.tenantId,
-        subTenantId: scope.subTenantId,
-        recipientId,
-        senderId: providerId ?? req.identity?.senderId,
-        channel: channel ?? 'EMAIL',
-        content,
-        at: new Date(),
-      });
-      res.status(201).json({ success: true, data: { id: result.messageId, patientId } });
-    }),
-  );
-
   /** Draft a message for a recipient. The same path `/ai-enhanced` takes. */
   router.post(
     '/generate-message',
@@ -434,77 +278,6 @@ export function createLegacyCommunicationsRouter(deps: CommunicationsCompatDeps)
         priority: 'MEDIUM',
       });
       res.status(201).json({ success: true, data: draft });
-    }),
-  );
-
-  /**
-   * The conversation roll-up. The source asks a model to summarise the thread
-   * (`getConversationSummary`, :1922-2175, including a `analyzeSentiment` call);
-   * this returns the counted facts and leaves the prose to
-   * `POST /v1/content/generate` with the thread as context. A summary that is
-   * generated on every page load costs a model call per render and cannot be
-   * cited — the numbers can.
-   */
-  router.get(
-    '/patient/:patientId/conversation/summary',
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      const senderId = (req.query.providerId as string) ?? req.identity?.senderId;
-      if (!senderId) throw new ValidationError('providerId is required');
-
-      const recipientId = await deps.identity.lookup(scope, req.params.patientId as string);
-      if (!recipientId) throw new NotFoundError('Patient not found');
-
-      const thread = await deps.conversations.thread(scope, senderId, recipientId, { limit: 1 });
-      res.json({
-        success: true,
-        data: {
-          patientId: req.params.patientId,
-          providerId: senderId,
-          patientName: thread.displayName ?? 'Unknown Patient',
-          summary: { ...thread.summary, conversationStarted: thread.summary.firstMessage },
-        },
-      });
-    }),
-  );
-
-  router.get(
-    '/patient/:patientId/info',
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      // Read-through the pack-gated context registry, replacing the raw
-      // `SELECT ... FROM patients` at :1669 (Seam C).
-      const recipient = await deps.recipients.getOrResolve(scope, {
-        kind: 'mentera-patient',
-        id: req.params.patientId as string,
-      });
-      if (!recipient) throw new NotFoundError('Patient not found');
-
-      res.json({
-        success: true,
-        data: {
-          patientId: req.params.patientId,
-          patientName: recipient.displayName ?? 'Unknown Patient',
-          firstName: recipient.firstName,
-          lastName: recipient.lastName,
-          timezone: recipient.timezone,
-          locale: recipient.locale,
-          contactPoints: recipient.contactPoints,
-          status: recipient.status,
-        },
-      });
-    }),
-  );
-
-  // Declared last: `/:id` would otherwise swallow every path above it.
-  router.get(
-    '/:id',
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      const message = await deps.messages.getById(scope, req.params.id as string);
-      if (!message) throw new NotFoundError('Communication not found');
-      const patientIds = await deps.identity.patientIds(scope, [message.recipientId]);
-      res.json({ success: true, data: toLegacyMessage(message, patientIds) });
     }),
   );
 

@@ -30,7 +30,7 @@ import {
   requirePermissions,
   requireTenant,
 } from '../../platform/http/auth.middleware.js';
-import { NotFoundError, ValidationError } from '../../platform/http/errors.js';
+import { NotFoundError } from '../../platform/http/errors.js';
 import { toChannelType } from '../../ports/channel.js';
 import { deprecate } from './index.js';
 import type { CompatIdentity } from './translate.js';
@@ -65,11 +65,6 @@ function handle(
 
 export function createLegacyPackRouters(deps: PackCompatDeps): {
   ehrWebhook: Router;
-  leads: Router;
-  treatments: Router;
-  patients: Router;
-  providers: Router;
-  promotions: Router;
 } {
   /** Fire a playbook for a legacy patient id and report the runs. */
   async function trigger(
@@ -225,192 +220,11 @@ export function createLegacyPackRouters(deps: PackCompatDeps): {
       });
     }),
   );
-
-  // ── /leads ────────────────────────────────────────────────────────────────
-  const leads = Router();
-  leads.use(deprecate('/leads', '/v1/recipients'));
-
-  /**
-   * `lead_profiles` is a ghost table (D11) — empty, tenant-blind, absent from
-   * the migrations. §0.7 folds it into `recipients.attributes`, so a lead
-   * profile is a recipient with attributes and nothing else changes.
-   */
-  leads.post(
-    '/:leadId/profile',
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      const recipient = await deps.messaging.recipients.upsertByExternalRef(
-        scope,
-        { system: 'lead', id: req.params.leadId as string },
-        {
-          displayName: req.body?.name as string | undefined,
-          attributes: (req.body ?? {}) as Record<string, unknown>,
-          ...(req.body?.email || req.body?.phone
-            ? {
-                contactPoints: [
-                  ...(req.body.email
-                    ? [{ type: 'email', value: req.body.email as string, primary: true }]
-                    : []),
-                  ...(req.body.phone
-                    ? [{ type: 'phone', value: req.body.phone as string, primary: !req.body.email }]
-                    : []),
-                ],
-              }
-            : {}),
-        },
-      );
-      res.status(201).json({ success: true, data: { leadId: req.params.leadId, id: recipient.id } });
-    }),
-  );
-
-  leads.get(
-    '/:leadId/profile',
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      const recipient = await deps.messaging.recipients.getByExternalRef(scope, {
-        system: 'lead',
-        id: req.params.leadId as string,
-      });
-      if (!recipient) throw new NotFoundError('Lead profile not found');
-      res.json({
-        success: true,
-        data: { leadId: req.params.leadId, ...recipient.attributes as object, id: recipient.id },
-      });
-    }),
-  );
-
-  leads.post(
-    '/:leadId/message',
-    requirePermissions(Permission.SEND),
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      const recipient = await deps.messaging.recipients.getByExternalRef(scope, {
-        system: 'lead',
-        id: req.params.leadId as string,
-      });
-      if (!recipient) throw new NotFoundError('Lead profile not found');
-
-      const results = await deps.playbooks.runtime.run({
-        type: 'event',
-        tenantId: scope.tenantId,
-        subTenantId: scope.subTenantId,
-        eventType: (req.body?.eventType as string) ?? 'LEAD_NURTURE',
-        correlationId: `lead:${req.params.leadId}`,
-        recipientId: recipient.id,
-        senderId: req.identity?.senderId,
-        payload: { context: (req.body ?? {}) as Record<string, unknown> },
-      });
-      res.json({ success: true, matched: results.length, data: results });
-    }),
-  );
-
-  // ── /treatments, /patients, /providers ────────────────────────────────────
-  const treatments = Router();
-  treatments.use(deprecate('/treatments', '/v1/outreach/trigger'));
-  treatments.post(
-    '/:treatmentId/follow-up',
-    requirePermissions(Permission.SEND),
-    handle(async (req, res) => {
-      const results = await trigger(req, {
-        eventType: 'TREATMENT_FOLLOWUP',
-        patientId: req.body?.patientId as string | undefined,
-        providerId: req.body?.providerId as string | undefined,
-        correlationId: `treatment:${req.params.treatmentId}`,
-        context: { treatmentId: req.params.treatmentId, ...(req.body ?? {}) },
-      });
-      res.json({ success: true, matched: results.length, data: results });
-    }),
-  );
-
-  const patients = Router();
-  patients.use(deprecate('/patients', '/v1/outreach/trigger'));
-
-  for (const [path, eventType] of [
-    ['onboarding', 'PATIENT_REGISTRATION'],
-    ['farewell', 'PATIENT_FAREWELL'],
-  ] as const) {
-    patients.post(
-      `/:patientId/${path}`,
-      requirePermissions(Permission.SEND),
-      handle(async (req, res) => {
-        const results = await trigger(req, {
-          eventType,
-          patientId: req.params.patientId as string,
-          providerId: req.body?.providerId as string | undefined,
-          correlationId: `${path}:${req.params.patientId}`,
-          context: (req.body ?? {}) as Record<string, unknown>,
-        });
-        res.json({ success: true, matched: results.length, data: results });
-      }),
-    );
-  }
-
-  const providers = Router();
-  providers.use(deprecate('/providers', '/v1/analytics/messages'));
-
-  /**
-   * `GET /providers/:providerId/feedback/adverse` read `patient_feedback`,
-   * which is empty and always was (D11), so this has always returned nothing.
-   * The concept lives on `message_analytics.metadata` now (§0.7) — the same
-   * substitution the inbox alerts use — so the answer is unchanged today and
-   * becomes real once the webhooks write sentiment.
-   */
-  providers.get(
-    '/:providerId/feedback/adverse',
-    handle(async (req, res) => {
-      const scope = requireTenant(req);
-      const page = await deps.messaging.conversations.inbox(
-        scope,
-        req.params.providerId as string,
-        { limit: 200 },
-      );
-      const adverse = page.conversations.filter((c) => c.alerts.hasAdverse);
-      res.json({ success: true, data: adverse, count: adverse.length });
-    }),
-  );
-
-  // ── /promotions, aliased as /gift-cards ───────────────────────────────────
-  const promotions = Router();
-  promotions.use(deprecate('/promotions', '/v1/outreach/trigger'));
-
-  /**
-   * `promotions` and `gift_cards` are **not engine tables** (§0.10 tier 3, D12):
-   * a gift card balance is a ledger and belongs with commerce. The engine needs
-   * the promotion's *fields at render time*, and those arrive with the event.
-   *
-   * `createTargetedCampaign` — the reason promotions lived in this service — is
-   * built on `findEligiblePatients()`, which returns a hardcoded `Jane Smith`
-   * and `John Doe` and is commented *"For demo purposes, we'll return stub
-   * data"* (`promotion.service.ts:169`). There is nothing behind it to port.
-   */
-  const promotionTrigger = (eventType: string) =>
-    handle(async (req: Request, res: Response) => {
-      const results = await trigger(req, {
-        eventType,
-        patientId: (req.body?.patientId ?? req.params.patientId) as string | undefined,
-        providerId: req.body?.providerId as string | undefined,
-        correlationId: `promotion:${req.params.promotionId ?? 'adhoc'}`,
-        context: { promotion: req.body ?? {} },
-      });
-      res.json({ success: true, matched: results.length, data: results });
-    });
-
-  promotions.post('/', requirePermissions(Permission.SEND), promotionTrigger('PROMOTION'));
-  promotions.post('/create', requirePermissions(Permission.SEND), promotionTrigger('PROMOTION'));
-  promotions.post(
-    '/:promotionId/campaign',
-    requirePermissions(Permission.SEND),
-    handle(async () => {
-      throw new ValidationError(
-        'Targeted promotion campaigns are not ported: the source builds them on findEligiblePatients(), which returns hardcoded stub data. Send the audience with POST /v1/outreach/trigger, or wait for campaigns in P11.',
-      );
-    }),
-  );
-  promotions.post(
-    '/patients/:patientId/feedback',
-    requirePermissions(Permission.SEND),
-    promotionTrigger('PATIENT_FEEDBACK_REQUEST'),
-  );
-
-  return { ehrWebhook, leads, treatments, patients, providers, promotions };
+  // `/leads`, `/treatments`, `/patients`, `/providers`, `/promotions` and its
+  // `/gift-cards` alias were retired in P12 (D100): nothing calls any of them.
+  // They answer 410 naming their successor — see RETIRED_MOUNTS in index.ts.
+  //
+  // `/ehr-webhook` survives for a different reason: an EHR vendor posts to it
+  // from its own configuration, which no grep over this repo can see.
+  return { ehrWebhook };
 }
