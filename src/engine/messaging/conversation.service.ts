@@ -84,7 +84,6 @@ export interface ThreadMessage {
   direction: string;
   aiGenerated: boolean;
   metadata: Record<string, unknown> | null;
-  queuedMessage: Record<string, unknown> | null;
   eventType: string | null;
   engagementScore: number | null;
   openedAt: Date | null;
@@ -314,7 +313,6 @@ export class ConversationService {
                m.delivered_at AS "deliveredAt", m.read_at AS "readAt",
                m.created_at AS "createdAt", m.direction,
                m.ai_generated AS "aiGenerated", m.metadata,
-               m.queued_message AS "queuedMessage",
                e.type AS "eventType",
                a.engagement_score AS "engagementScore",
                a.opened_at AS "openedAt",
@@ -336,11 +334,25 @@ export class ConversationService {
                MAX(m.sent_at)                                               AS "lastMessage",
                COUNT(*) FILTER (WHERE m.ai_generated)::int                   AS "aiGeneratedCount",
                COUNT(*) FILTER (WHERE m.status = 'QUEUED')::int              AS "queuedCount",
+               -- Reads approvals.status, where approval state has lived since
+               -- P6. It used to read queued_message->>'approvalStatus' -- a
+               -- column this engine has never written, so the predicate could
+               -- only ever have matched a migrated row. Dropped with the
+               -- column in P12 (D103).
+               --
+               -- The m.status = 'QUEUED' term STAYS, and keeps this
+               -- structurally zero exactly as the docblock above says.
+               -- Dropping it would change a number the front end renders,
+               -- inside a commit whose job was removing a dead column. If this
+               -- count should start being real, that is its own change with
+               -- its own entry in BREAKING.md.
                COUNT(*) FILTER (
-                 WHERE m.status = 'QUEUED'
-                   AND m.queued_message ->> 'approvalStatus' = 'PENDING_APPROVAL'
+                 WHERE m.status = 'QUEUED' AND ap.status = 'PENDING_APPROVAL'
                )::int                                                       AS "pendingApprovalCount"
         FROM messages m
+        -- At most one approval per message: approvals.message_id is UNIQUE
+        -- (0002), so this join cannot multiply the counts above.
+        LEFT JOIN approvals ap ON ap.message_id = m.id AND ap.tenant_id = m.tenant_id
         ${where}
       `),
       this.deps.db.execute(sql`
@@ -371,7 +383,6 @@ export class ConversationService {
         direction: (row.direction as string | null) ?? 'outbound',
         aiGenerated: Boolean(row.aiGenerated),
         metadata: (row.metadata as Record<string, unknown> | null) ?? null,
-        queuedMessage: (row.queuedMessage as Record<string, unknown> | null) ?? null,
         eventType: (row.eventType as string | null) ?? null,
         engagementScore: (row.engagementScore as number | null) ?? null,
         openedAt: (row.openedAt as Date | null) ?? null,

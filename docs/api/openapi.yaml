@@ -1213,6 +1213,83 @@ paths:
                   matched: { type: integer }
                   results: { type: array, items: { $ref: '#/components/schemas/PlaybookRunResult' } }
 
+  /v1/outreach/generate:
+    post:
+      operationId: postOutreachGenerate
+      tags: [content]
+      summary: Write a message with the model and queue it for approval
+      description: |
+        Generate-then-review, in one call. `POST /v1/content/generate` writes
+        copy and stores nothing; `/v1/approvals` reviews a draft that already
+        exists. This is the path that does both, and until P12 it existed only
+        inside the compat shim — which is why the retired `/ai-enhanced` and
+        `/automated-messages` mounts name it as their successor.
+
+        **The message is not sent.** It is submitted under the tenant's
+        review-everything fallback, so it waits for a person. Naming
+        `policyKey` overrides that, including with a `none`-mode policy that
+        dispatches immediately — the response's `status` always says which
+        happened.
+
+        Exactly one of `recipientId` and `externalRef` is required. An
+        `externalRef` for someone this tenant has never messaged is resolved
+        through the installed context provider; if none can resolve them the
+        answer is 404, because a draft for a recipient with no contact point is
+        an approval a reviewer would approve and then watch fail.
+      security: [{ gatewayIdentity: [outreach:send] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [channel]
+              properties:
+                channel: { $ref: '#/components/schemas/Channel' }
+                recipientId: { type: string, format: uuid }
+                externalRef:
+                  type: object
+                  required: [system, id]
+                  properties:
+                    system: { type: string, example: mentera-patient }
+                    id: { type: string }
+                senderId: { type: string }
+                promptPackKey: { type: string, default: core.content-generate }
+                goal: { type: string }
+                context: { type: object, additionalProperties: true }
+                priority: { $ref: '#/components/schemas/Priority' }
+                overrides:
+                  type: object
+                  properties:
+                    tone: { type: string }
+                    language: { type: string }
+                    model: { type: string }
+                policyKey:
+                  type: string
+                  description: Review under this policy instead of the review-everything fallback.
+      responses:
+        '201':
+          description: The draft, and the approval opened on it.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [content, status, aiConfidence, lintWarnings, promptPackKey, recipientId]
+                properties:
+                  approvalId: { type: string, format: uuid }
+                  messageId: { type: string, format: uuid }
+                  content: { type: string }
+                  subject: { type: string }
+                  status:
+                    type: string
+                    description: PENDING_APPROVAL unless a named policy auto-approved.
+                  aiConfidence: { type: number }
+                  lintWarnings: { type: array, items: { type: string } }
+                  promptPackKey: { type: string }
+                  recipientId: { type: string, format: uuid }
+        '404':
+          description: No such prompt pack, or no recipient that could be resolved.
+
   /v1/playbooks:
     get:
       operationId: getPlaybooks

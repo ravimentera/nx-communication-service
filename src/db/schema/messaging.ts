@@ -135,11 +135,10 @@ export const messages = pgTable(
      * why it is a column rather than the `metadata.retryAt` it duplicates.
      */
     deferredUntil: ts('deferred_until'),
-    /**
-     * The legacy approval blob. Kept so the P9 backfill has a source to read
-     * and to compare against; DROPPED in P12 once the approvals table is proven.
-     */
-    queuedMessage: jsonb('queued_message'),
+    // `queuedMessage` was here until P12 — the source's approval blob, which
+    // this engine never wrote. `approvals` has held approval state since P6, so
+    // the column only ever carried migrated values. Removed from `0001` rather
+    // than dropped in a later migration: nothing had applied it. See D103.
     metadata: jsonb('metadata'),
     engagementData: jsonb('engagement_data'),
     conversationId: uuid('conversation_id'),

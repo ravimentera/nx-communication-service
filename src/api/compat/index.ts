@@ -65,6 +65,7 @@ import type { ChannelApiDeps } from '../v1/channels.js';
 import type { ContentApiDeps } from '../v1/content.js';
 import type { ReceiptService } from '../../engine/messaging/receipt.service.js';
 import type { ContextRegistry } from '../../engine/context/registry.js';
+import type { DraftService } from '../../engine/outreach/draft.service.js';
 import type { MessagingApiDeps } from '../v1/messaging.js';
 import type { PlaybookApiDeps } from '../v1/playbooks.js';
 import type { RecipientApiDeps } from '../v1/recipients.js';
@@ -159,6 +160,8 @@ export interface CompatDeps {
   content: ContentApiDeps;
   receipts: ReceiptService;
   context: ContextRegistry;
+  /** P12: shared with `POST /v1/outreach/generate` and the MCP tool (D101). */
+  drafts: DraftService;
 }
 
 /**
@@ -181,6 +184,7 @@ export function createCompatMounts(deps: CompatDeps): Array<{ path: string; rout
     playbooks: deps.playbooks,
     context: deps.context,
     identity,
+    drafts: deps.drafts,
   });
   const packRouters = createLegacyPackRouters({
     playbooks: deps.playbooks,

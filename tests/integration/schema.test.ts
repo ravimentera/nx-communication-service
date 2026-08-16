@@ -25,7 +25,7 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { baselineMigrations } from '../helpers/migrations.js';
+import { NON_BASELINE_MIGRATIONS, baselineMigrations } from '../helpers/migrations.js';
 
 import { getTableName, getTableColumns, is } from 'drizzle-orm';
 import { PgTable } from 'drizzle-orm/pg-core';
@@ -355,6 +355,36 @@ describe('indexes carried forward from the source', () => {
     const { rows } = await client.query(
       `SELECT 1 FROM pg_indexes WHERE schemaname = 'public'
          AND indexname LIKE '%queued_approval%'`,
+    );
+    expect(rows).toHaveLength(0);
+  });
+
+  it('does not carry over the queued_message column either', async () => {
+    // P12 (D103). It held the source's approval blob; `approvals` has been the
+    // only home for approval state since P6 and this engine never wrote it. Out
+    // of the baseline rather than dropped later, because nothing had applied
+    // `0001` — so the model and the SQL agree with no exception anywhere.
+    const { rows } = await client.query(
+      `SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'messages'
+          AND column_name = 'queued_message'`,
+    );
+    expect(rows).toHaveLength(0);
+  });
+
+  it('0014 is a no-op against this schema, and is applied by nothing', async () => {
+    // It exists for a development database built before the column left `0001`.
+    // Applying it to a current one must succeed and change nothing — if it ever
+    // starts erroring here, the baseline and the cleanup have disagreed.
+    expect(NON_BASELINE_MIGRATIONS.has('0014_drop_queued_message.sql')).toBe(true);
+
+    const sql = readFileSync(join(MIGRATIONS_DIR, '0014_drop_queued_message.sql'), 'utf8');
+    await expect(client.query(sql)).resolves.toBeDefined();
+
+    const { rows } = await client.query(
+      `SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'messages'
+          AND column_name = 'queued_message'`,
     );
     expect(rows).toHaveLength(0);
   });

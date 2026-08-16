@@ -28,7 +28,14 @@ import { readdirSync } from 'node:fs';
  * to this set is a decision worth arguing for in the decision record — the
  * default for a schema migration is that everyone gets it.
  */
-export const NON_BASELINE_MIGRATIONS = new Set(['0013_encrypt_credentials.sql']);
+export const NON_BASELINE_MIGRATIONS = new Set([
+  '0013_encrypt_credentials.sql',
+  // A no-op against the current `0001`, which no longer creates the column it
+  // drops. It exists for a development database built from the older file, so
+  // applying it in a harness would prove nothing and hide the fact that the
+  // baseline is already clean. See D103.
+  '0014_drop_queued_message.sql',
+]);
 
 /** The schema a fresh environment starts with, in apply order. */
 export function baselineMigrations(dir: string): string[] {

@@ -36,6 +36,7 @@ import { AssetService } from '../../../src/engine/content/asset.service.js';
 import { ApiKeyService } from '../../../src/engine/tenancy/api-key.service.js';
 import { UsageService } from '../../../src/engine/tenancy/usage.service.js';
 import { ContentGenerator } from '../../../src/engine/content/generator.js';
+import { DraftService } from '../../../src/engine/outreach/draft.service.js';
 import { PromptAssembler } from '../../../src/engine/content/prompt-assembler.js';
 import { Renderer } from '../../../src/engine/content/renderer.js';
 import { DrizzleTemplateStore } from '../../../src/engine/content/store.js';
@@ -286,10 +287,13 @@ export async function startHarness(): Promise<Harness> {
   // campaign routes — a harness that omits a dep bundle makes
   // "documents every registered /v1 route" pass by having nothing to document.
   const audiences = new AudienceService({ db, logger, recipients });
-  const campaignDeps = {
-    audiences,
-    campaigns: new CampaignOrchestrator({ db, logger, runtime, audiences }),
-  };
+  const campaigns = new CampaignOrchestrator({ db, logger, runtime, audiences });
+  const campaignDeps = { audiences, campaigns };
+
+  // P12 (D101). The compat shim's `/communications/generate-message` and
+  // `/automated-messages/generate` both delegate here now, and so does
+  // `POST /v1/outreach/generate` and the `generateDraft` MCP tool.
+  const drafts = new DraftService({ generator, packs, recipients, approvals });
 
   const app = createApp({
     config,
@@ -308,6 +312,7 @@ export async function startHarness(): Promise<Harness> {
     recipients: recipientDeps,
     approvals: { approvals, policies },
     playbooks: playbookDeps,
+    outreach: { drafts },
     messaging,
     channels,
     campaigns: campaignDeps,
@@ -317,6 +322,10 @@ export async function startHarness(): Promise<Harness> {
       logger,
       authenticate: createAuthMiddleware({ config: config.auth, logger }),
       render: createBodyResolver({ templates: templateStore, renderer }),
+      drafts,
+      approvals,
+      conversations: messaging.conversations,
+      campaigns,
     },
     webhooks: {
       receipts,
@@ -334,6 +343,7 @@ export async function startHarness(): Promise<Harness> {
       content: contentDeps,
       receipts,
       context: contextRegistry,
+      drafts,
     },
   });
 

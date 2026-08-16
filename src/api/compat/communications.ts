@@ -182,19 +182,31 @@ export function createLegacyCommunicationsRouter(deps: CommunicationsCompatDeps)
           clickedAt: m.clickedAt,
           repliedAt: m.repliedAt,
         },
-        queuedMessage: m.queuedMessage
-          ? { ...m.queuedMessage, isQueue: m.status === 'QUEUED' }
-          : null,
+        // ── the four fields `messages.queued_message` used to feed ──────────
+        //
+        // The column is dropped in P12 (D103, migration 0014). It was the
+        // source's approval blob, this engine never wrote it, and every message
+        // the new service creates has answered `null` here since P9 — so these
+        // four have been constant for every non-migrated row for three phases.
+        //
+        // **The key stays, at null.** The web app reads
+        // `message.queuedMessage.content` (`inbox.utils.ts:301`) and the mobile
+        // app reads it too (`ApprovalsScreen.tsx:133`); both guard on the object
+        // being present, so `null` is a path they already take and removing the
+        // key is not. The migrated rows that did carry a value were all
+        // cancelled by `mig.finalize_cutover()` (D99), so nothing renderable is
+        // lost with it.
+        //
+        // Approval state for a live draft comes from `/approvals/*`, which reads
+        // the `approvals` table — the same one both legacy inboxes have shared
+        // since P6 (D46).
+        queuedMessage: null,
         timestamp: m.sentAt,
         avatar: m.direction === 'inbound' ? null : 'provider-avatar.png',
         messageClass: m.direction === 'inbound' ? 'message-received' : 'message-sent',
-        isPendingApproval:
-          (m.queuedMessage as { approvalStatus?: string } | null)?.approvalStatus ===
-          'PENDING_APPROVAL',
-        isApproved:
-          (m.queuedMessage as { approvalStatus?: string } | null)?.approvalStatus === 'APPROVED',
-        isDeclined:
-          (m.queuedMessage as { approvalStatus?: string } | null)?.approvalStatus === 'DECLINED',
+        isPendingApproval: false,
+        isApproved: false,
+        isDeclined: false,
       })),
       summary: { ...t.summary, conversationStarted: t.summary.firstMessage },
       pagination: legacyPagination(t.page, t.limit, t.total),

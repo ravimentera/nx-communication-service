@@ -414,7 +414,6 @@ BEGIN
       delivered_at    = mig.to_tz(s.delivered_at),
       read_at         = mig.to_tz(s.read_at),
       engagement_data = s.engagement_data::jsonb,
-      queued_message  = s.queued_message,
       updated_at      = now()
   FROM src.message_history s
   WHERE s.id = m.id

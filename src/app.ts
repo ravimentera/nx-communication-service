@@ -18,6 +18,7 @@ import { createCampaignRouter, type CampaignApiDeps } from './api/v1/campaigns.j
 import { createChannelRouter, type ChannelApiDeps } from './api/v1/channels.js';
 import { createContentRouter, type ContentApiDeps } from './api/v1/content.js';
 import { createMessagingRouter, type MessagingApiDeps } from './api/v1/messaging.js';
+import { createOutreachRouter, type OutreachApiDeps } from './api/v1/outreach.js';
 import { createPlaybookRouter, type PlaybookApiDeps } from './api/v1/playbooks.js';
 import {
   createRecipientRouter,
@@ -65,6 +66,8 @@ export interface AppDeps {
   approvals?: ApprovalApiDeps;
   /** Present from P7 onward. */
   playbooks?: PlaybookApiDeps;
+  /** Present from P12 onward — `POST /v1/outreach/generate` (D101). */
+  outreach?: OutreachApiDeps;
   /** Present from P8 onward. */
   messaging?: MessagingApiDeps;
   /** Present from P11 onward. */
@@ -201,6 +204,9 @@ export function createApp(deps: AppDeps): Express {
   }
   if (deps.playbooks) {
     app.use('/v1', createPlaybookRouter(deps.playbooks));
+  }
+  if (deps.outreach) {
+    app.use('/v1', createOutreachRouter(deps.outreach));
   }
   if (deps.messaging) {
     app.use('/v1', createMessagingRouter(deps.messaging));

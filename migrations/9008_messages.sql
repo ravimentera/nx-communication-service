@@ -77,7 +77,7 @@ BEGIN
     INSERT INTO messages (
       id, tenant_id, sub_tenant_id, notification_id, event_id, recipient_id,
       sender_id, channel, direction, content, status, sent_at, delivered_at,
-      read_at, ai_generated, queued_message, metadata, engagement_data,
+      read_at, ai_generated, metadata, engagement_data,
       conversation_id, thread_id, sender_name, participant_phone,
       created_at, updated_at
     )
@@ -104,7 +104,6 @@ BEGIN
       -- Written as a JSON boolean or a string depending on the path; neither
       -- casts cleanly, so read it as text and compare.
       COALESCE(lower(s.metadata->>'aiGenerated') IN ('true', 't', '1'), false),
-      s.queued_message,
       -- Stamped on EVERY migrated row, not only the ones whose status changed
       -- (D99). Two readers depend on it:
       --

@@ -57,6 +57,7 @@ import { createPlaybookEventProcessor } from './engine/playbooks/event-processor
 import { PlaybookMatcher } from './engine/playbooks/matcher.js';
 import { AudienceService } from './engine/campaigns/audience.service.js';
 import { CampaignOrchestrator } from './engine/campaigns/orchestrator.js';
+import { DraftService } from './engine/outreach/draft.service.js';
 import { PlaybookRegistry } from './engine/playbooks/registry.js';
 import { PlaybookRuntime } from './engine/playbooks/runtime.js';
 import {
@@ -435,6 +436,15 @@ async function main(): Promise<void> {
     queue,
   });
 
+  // Generate-then-review, in engine vocabulary. Three callers: the v1 route,
+  // the MCP `generateDraft` tool, and the compat shim's
+  // `/communications/generate-message` — which used to own this logic (D101).
+  const draftService = new DraftService({
+    generator,
+    packs,
+    recipients: recipientService,
+    approvals,
+  });
 
   // A pack that failed validation means some playbook silently does not exist.
   // Say so at boot, once, with the paths — not at 3am when a reminder does not
@@ -465,6 +475,7 @@ async function main(): Promise<void> {
     },
     approvals: { approvals, policies },
     playbooks: { runtime: runtimeRef.current, registry: playbookRegistry, packs },
+    outreach: { drafts: draftService },
     messaging: {
       messages: messageService,
       conversations: conversationService,
@@ -484,6 +495,12 @@ async function main(): Promise<void> {
         verifyApiKey: (key) => apiKeys.verify(key),
       }),
       render: createBodyResolver({ templates: templateStore, renderer }),
+      // P12 workstream 5. Tera's half of the surface: draft, review, decide,
+      // read the conversation, start a campaign.
+      drafts: draftService,
+      approvals,
+      conversations: conversationService,
+      campaigns: campaignOrchestrator,
     },
     webhooks: {
       receipts: receiptService,
@@ -507,6 +524,7 @@ async function main(): Promise<void> {
       content: { renderer, store: templateStore, generator, packs, assets: assetService, logger },
       receipts: receiptService,
       context: contextRegistry,
+      drafts: draftService,
     },
   });
 

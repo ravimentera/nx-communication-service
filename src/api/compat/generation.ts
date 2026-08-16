@@ -27,16 +27,16 @@ import type { ContentApiDeps } from '../v1/content.js';
 import type { MessagingApiDeps } from '../v1/messaging.js';
 import type { PlaybookApiDeps } from '../v1/playbooks.js';
 import type { ContextRegistry } from '../../engine/context/registry.js';
-import { emptyContext, type RenderContext } from '../../engine/content/render-context.js';
+import type { DraftService } from '../../engine/outreach/draft.service.js';
 import {
   Permission,
   requirePermissions,
   requireTenant,
 } from '../../platform/http/auth.middleware.js';
-import { NotFoundError, ValidationError } from '../../platform/http/errors.js';
+import { ValidationError } from '../../platform/http/errors.js';
 import { toChannelType } from '../../ports/channel.js';
 import { deprecate } from './index.js';
-import type { CompatIdentity } from './translate.js';
+import { MEDSPA_RECIPIENT_SYSTEM, type CompatIdentity } from './translate.js';
 
 const generateSchema = z.object({
   patientId: z.string().min(1),
@@ -56,6 +56,8 @@ export interface GenerationCompatDeps {
   playbooks: PlaybookApiDeps;
   context: ContextRegistry;
   identity: CompatIdentity;
+  /** P12: the drafting logic this file used to own (D101). */
+  drafts: DraftService;
 }
 
 function handle(
@@ -87,6 +89,12 @@ export function createLegacyGenerationRouters(deps: GenerationCompatDeps): {
    * (`ai-enhanced-communication.controller.ts:108-130`). Here it goes through
    * `approvals.submit`, which writes the message row *and* an `approvals` row —
    * so the draft is visible from both inboxes and carries an audit trail.
+   *
+   * **The work moved out in P12.** `DraftService` owns it now and
+   * `POST /v1/outreach/generate` is the first-class route, so what is left here
+   * is the vocabulary bridge this file exists to be: `patientId` becomes an
+   * external ref, `providerId` becomes a sender, and `DECLINED` goes back out as
+   * `REJECTED`. See D101.
    */
   async function draftFor(
     req: Request,
@@ -96,82 +104,28 @@ export function createLegacyGenerationRouters(deps: GenerationCompatDeps): {
     const channel = toChannelType(input.channel);
     if (!channel) throw new ValidationError(`Unknown channel '${input.channel}'`);
 
-    const packKey = input.promptPackKey ?? 'core.content-generate';
-    const pack = deps.content.packs.prompt(packKey);
-    if (!pack) {
-      throw new NotFoundError(`Prompt pack '${packKey}' not found`, {
-        available: deps.content.packs.list(),
-      });
-    }
+    // Resolve-or-create BEFORE drafting. `DraftService` resolves through the
+    // context provider but will not invent a recipient, and a legacy caller may
+    // be naming a patient this tenant has never messaged — which the source
+    // handled by creating one (D37, translate.ts).
+    await deps.identity.ensure(scope, input.patientId);
 
-    // Resolve-or-create, and pull whatever the installed context provider
-    // knows. The source builds URLs to patient-service inline
-    // (`ai-enhanced-communication.controller.ts:32-33`); the provider is
-    // pack-gated here (D37).
-    const recipientId = await deps.identity.ensure(scope, input.patientId);
-    const recipient = await deps.messaging.recipients.getOrResolve(scope, {
-      kind: 'mentera-patient',
-      id: input.patientId,
-    });
-
-    const renderContext: RenderContext = {
-      ...emptyContext(scope.tenantId),
-      recipient: {
-        id: recipientId,
-        displayName: recipient?.displayName ?? undefined,
-        firstName: recipient?.firstName ?? undefined,
-        lastName: recipient?.lastName ?? undefined,
-        timezone: recipient?.timezone ?? undefined,
-        locale: recipient?.locale ?? undefined,
-      },
-      sender: { id: input.providerId ?? req.identity?.senderId },
-      context: { communicationType: input.communicationType, ...(input.context ?? {}) },
-    };
-
-    const draft = await deps.content.generator.generate({
-      tenantId: scope.tenantId,
-      subTenantId: scope.subTenantId,
-      pack,
+    const draft = await deps.drafts.draft(scope, {
       channel,
-      playbookGoal: input.goal ?? input.communicationType,
-      context: renderContext,
-    });
-
-    const contactPoints = (recipient?.contactPoints ?? []) as Array<{
-      type: string;
-      value: string;
-      primary?: boolean;
-    }>;
-    const wanted = channel === 'sms' ? 'phone' : channel;
-    const to =
-      contactPoints.find((p) => p.type === wanted && p.primary) ??
-      contactPoints.find((p) => p.type === wanted);
-    if (!to) {
-      throw new ValidationError(
-        `No ${wanted} contact point for this recipient; add one before generating a ${channel} draft`,
-      );
-    }
-
-    const submitted = await deps.approvals.approvals.submit(scope, {
-      channel,
-      to,
-      rendered: { subject: draft.subject, body: draft.content },
-      recipientId,
+      externalRef: { system: MEDSPA_RECIPIENT_SYSTEM, id: input.patientId },
       senderId: input.providerId ?? req.identity?.senderId,
+      promptPackKey: input.promptPackKey,
+      goal: input.goal ?? input.communicationType,
+      context: { communicationType: input.communicationType, ...(input.context ?? {}) },
       priority: input.priority,
-      aiGenerated: true,
-      aiConfidence: draft.aiConfidence,
-      // The policy's `threshold` mode counts errors; the generator reports the
-      // warnings themselves. Passing the count is what P6 expects.
-      lintErrors: draft.lintWarnings.length,
     });
 
     return {
-      approvalId: submitted.approval?.id,
-      messageId: submitted.approval?.messageId,
+      approvalId: draft.approvalId,
+      messageId: draft.messageId,
       content: draft.content,
       subject: draft.subject,
-      status: toAiEnhancedStatus(submitted.approval?.status ?? 'PENDING_APPROVAL'),
+      status: toAiEnhancedStatus(draft.status),
     };
   }
 

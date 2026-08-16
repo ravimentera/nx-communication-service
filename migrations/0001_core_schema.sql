@@ -577,7 +577,6 @@ CREATE TABLE IF NOT EXISTS messages (
   approval_id         uuid,
   ai_generated        boolean NOT NULL DEFAULT false,
   provider_message_id text,
-  queued_message      jsonb,
   metadata            jsonb,
   engagement_data     jsonb,
   conversation_id     uuid,
@@ -601,7 +600,16 @@ CREATE INDEX IF NOT EXISTS idx_messages_tenant_subtenant  ON messages (tenant_id
 -- New: delivery webhooks join on the provider's own message id.
 CREATE INDEX IF NOT EXISTS idx_messages_provider_message_id ON messages (tenant_id, provider_message_id);
 -- NOT carried forward: message_history_queued_approval_idx on
--- (queued_message->>'approvalStatus'). The approvals table (0002) replaces it.
+-- (queued_message->>'approvalStatus') — nor the `queued_message` column itself.
+--
+-- The column was here until P12. It held the source's approval blob, which the
+-- P9 load copied across; this engine never wrote it, and `approvals` (0002) has
+-- been the only home for approval state since P6. Nothing was reading it but
+-- the legacy envelope and one structurally-zero count. Removed from baseline
+-- rather than dropped later, because no environment has applied this file yet
+-- and a column that exists only to be dropped is worse than one that never
+-- shipped. `0014_drop_queued_message.sql` cleans up a database created from the
+-- older version of this file. See D103.
 
 CREATE TABLE IF NOT EXISTS message_analytics (
   id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
