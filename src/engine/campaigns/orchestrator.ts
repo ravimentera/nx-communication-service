@@ -482,6 +482,13 @@ export class CampaignOrchestrator {
     campaignId: string,
     options: { status?: string; limit?: number; offset?: number } = {},
   ) {
+    // Every other campaign read starts here, and this one did not: it queried
+    // `campaign_recipients` directly, so it answered for a campaign belonging to
+    // another sub-tenant with an empty list rather than a 404 — and, worse, for
+    // one belonging to a sub-tenant the caller is not scoped to with its actual
+    // recipients. `require` applies the same predicate as `getById`.
+    await this.require(scope, campaignId);
+
     const clauses: SQL[] = [
       tenantWhere(campaignRecipients, scope),
       eq(campaignRecipients.campaignId, campaignId),

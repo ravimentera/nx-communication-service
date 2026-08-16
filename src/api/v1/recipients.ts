@@ -115,6 +115,7 @@ export function createRecipientRouter(deps: RecipientApiDeps): Router {
 
   router.post(
     '/recipients',
+    requirePermissions(Permission.CONFIG_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       const body = recipientSchema.parse(req.body);
@@ -179,6 +180,7 @@ export function createRecipientRouter(deps: RecipientApiDeps): Router {
 
   router.put(
     '/recipients/:id/preferences',
+    requirePermissions(Permission.CONFIG_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       const body = preferenceSchema.parse(req.body);
@@ -200,6 +202,7 @@ export function createRecipientRouter(deps: RecipientApiDeps): Router {
 
   router.post(
     '/recipients/:id/unsubscribe',
+    requirePermissions(Permission.SEND),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       const id = req.params.id as string;

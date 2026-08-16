@@ -37,7 +37,11 @@ import { z } from 'zod';
 import type { AudienceService, ImportRow } from '../../engine/campaigns/audience.service.js';
 import { CONSENT_SOURCES } from '../../engine/compliance/consent.service.js';
 import type { CampaignOrchestrator } from '../../engine/campaigns/orchestrator.js';
-import { requireTenant } from '../../platform/http/auth.middleware.js';
+import {
+  Permission,
+  requirePermissions,
+  requireTenant,
+} from '../../platform/http/auth.middleware.js';
 import { NotFoundError } from '../../platform/http/errors.js';
 import { CHANNEL_TYPES } from '../../ports/channel.js';
 
@@ -133,6 +137,7 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
 
   router.post(
     '/audiences',
+    requirePermissions(Permission.CONFIG_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       const body = audienceSchema.parse(req.body);
@@ -152,6 +157,7 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
 
   router.post(
     '/audiences/:id/members',
+    requirePermissions(Permission.CONFIG_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       const body = membersSchema.parse(req.body);
@@ -163,6 +169,7 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
 
   router.delete(
     '/audiences/:id/members',
+    requirePermissions(Permission.CONFIG_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       const body = membersSchema.parse(req.body);
@@ -172,6 +179,7 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
 
   router.post(
     '/audiences/:id/import',
+    requirePermissions(Permission.CONFIG_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       const body = importSchema.parse(req.body);
@@ -220,6 +228,7 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
 
   router.post(
     '/audiences/:id/materialize',
+    requirePermissions(Permission.CONFIG_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       res.json(await deps.audiences.materialize(scope, req.params.id as string));
@@ -237,6 +246,7 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
 
   router.post(
     '/campaigns',
+    requirePermissions(Permission.CONFIG_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       const body = campaignSchema.parse(req.body);
@@ -275,6 +285,7 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
   // 202, not 200: the work outlives the request. See the header.
   router.post(
     '/campaigns/:id/launch',
+    requirePermissions(Permission.SEND),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       const result = await deps.campaigns.launch(scope, req.params.id as string);
@@ -284,6 +295,7 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
 
   router.post(
     '/campaigns/:id/pause',
+    requirePermissions(Permission.CONFIG_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       await deps.campaigns.pause(scope, req.params.id as string);
@@ -293,6 +305,7 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
 
   router.post(
     '/campaigns/:id/resume',
+    requirePermissions(Permission.SEND),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       await deps.campaigns.resume(scope, req.params.id as string);
@@ -312,6 +325,7 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
    */
   router.post(
     '/campaigns/:id/cancel',
+    requirePermissions(Permission.CONFIG_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       const result = await deps.campaigns.cancel(scope, req.params.id as string);

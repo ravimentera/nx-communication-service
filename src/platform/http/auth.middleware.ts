@@ -315,7 +315,12 @@ function readApiKey(req: Request): string | undefined {
  * Require permissions. Admins always pass, by role or by the admin permission.
  */
 export function requirePermissions(...required: (Permission | string)[]): RequestHandler {
-  return (req: Request, _res: Response, next: NextFunction) => {
+  // Named, not anonymous, and that is load-bearing: `tests/contract/
+  // permissions.test.ts` walks the live router stack and identifies the gate by
+  // this name. Two whole routers shipped without a permission check because the
+  // convention was enforced by memory; the test is what replaced the memory, and
+  // inlining this as an arrow would blind it.
+  return function permissionGate(req: Request, _res: Response, next: NextFunction) {
     const identity = req.identity;
     if (!identity) return next(new AuthError());
 
