@@ -20,9 +20,10 @@ import { PolicyService } from './engine/approvals/policy.service.js';
 import { TenantConfigAuthorizationProvider } from './engine/approvals/authorization.js';
 import { ApprovalSlaWorker } from './engine/approvals/sla.worker.js';
 import { DeferralWorker } from './engine/delivery/deferral.worker.js';
+import { RetentionWorker } from './engine/compliance/retention.job.js';
 import { ConsentService } from './engine/compliance/consent.service.js';
 import { ComplianceGate } from './engine/compliance/gate.js';
-import { lintContent, mergeRules } from './engine/compliance/lint.js';
+import { lintContent, mergeRules, type LintRules } from './engine/compliance/lint.js';
 import { ErasureService } from './engine/compliance/erasure.service.js';
 import { PreferenceService } from './engine/compliance/preference.service.js';
 import { CORE_PACK, ContextRegistry } from './engine/context/registry.js';
@@ -192,9 +193,45 @@ async function main(): Promise<void> {
   const preferences = new PreferenceService({
     db,
     logger,
+    enforceQuietHours: config.compliance.enforceQuietHours,
     defaultTimezone: config.compliance.defaultTimezone,
     unsubscribeBaseUrl: config.compliance.unsubscribeBaseUrl,
   });
+  /**
+   * The lint rules for ONE tenant: the engine defaults, plus the rules of the
+   * packs that tenant actually installed.
+   *
+   * It was `mergeRules(...packs.compliance())` — every pack on disk, merged
+   * once at boot, applied to everybody. A law firm running the lead-generation
+   * pack inherited medspa's HIPAA patterns, which is the harmless half. The
+   * harmful half is `allowedDomains`: the lists concatenate, so one pack's
+   * link allow-list silently widened every other pack's, and a rule that was
+   * meant to constrain became one that permits.
+   *
+   * `docs/PACKS.md` argued the merge was fine because a false warning costs one
+   * human glance. That is true of a phrase check and false of an allow-list,
+   * and the document is corrected alongside this.
+   *
+   * Cached briefly: this is on the send path via the gate's PHI check, and the
+   * set of installed packs changes at install time, not per message.
+   */
+  const packRulesCache = new Map<string, { at: number; rules: LintRules }>();
+  const PACK_RULES_TTL_MS = 30_000;
+
+  const rulesFor = async (tenantId: string): Promise<LintRules> => {
+    const hit = packRulesCache.get(tenantId);
+    if (hit && Date.now() - hit.at < PACK_RULES_TTL_MS) return hit.rules;
+
+    const rows = await db
+      .select({ packId: tenantPacks.packId })
+      .from(tenantPacks)
+      .where(and(eq(tenantPacks.tenantId, tenantId), eq(tenantPacks.isActive, true)));
+
+    const rules = mergeRules(...rows.flatMap((row) => packs.compliance(row.packId)));
+    packRulesCache.set(tenantId, { at: Date.now(), rules });
+    return rules;
+  };
+
   const complianceGate = new ComplianceGate({
     db,
     logger,
@@ -207,8 +244,38 @@ async function main(): Promise<void> {
     // P12: the `hipaa` profile's PHI rule. Runs only for that profile, on the
     // channels it applies to — see engine/compliance/profiles.ts.
     lint: async ({ content, channel, tenantId }) =>
-      lintContent({ content, channel, tenantId }, lintRules),
+      lintContent({ content, channel, tenantId }, await rulesFor(tenantId)),
   });
+
+  // ── context plane ─────────────────────────────────────────────────────────
+  // Ahead of the dispatcher, because the dispatcher now resolves a recipient
+  // from a bare address: without one, the compliance gate skips consent,
+  // per-channel preference, per-playbook opt-out and every throttle.
+  const contextRegistry = new ContextRegistry({
+    installedPacks: async (tenantId) => {
+      const rows = await db
+        .select({ packId: tenantPacks.packId })
+        .from(tenantPacks)
+        .where(and(eq(tenantPacks.tenantId, tenantId), eq(tenantPacks.isActive, true)));
+      return rows.map((r) => r.packId);
+    },
+  });
+  // Available to every tenant: the caller supplied the data themselves.
+  contextRegistry.register(new InlineContextProvider(), CORE_PACK);
+  // Pack-gated: reaching patient-service requires the medspa pack. A tenant
+  // without it cannot resolve this kind even by crafting a ContextRef.
+  contextRegistry.register(
+    new MenteraContextProvider({
+      config: {
+        patientServiceUrl: config.context.patientServiceUrl,
+        providerServiceUrl: config.context.providerServiceUrl,
+      },
+      logger,
+    }),
+    'medspa',
+  );
+
+  const recipientService = new RecipientService({ db, logger, context: contextRegistry });
 
   const dispatcher = new Dispatcher({
     db,
@@ -217,6 +284,7 @@ async function main(): Promise<void> {
     queue,
     logger,
     compliance: complianceGate,
+    recipients: recipientService,
   });
 
   // ── approvals plane ───────────────────────────────────────────────────────
@@ -292,32 +360,19 @@ async function main(): Promise<void> {
   });
   await deferralWorker.start();
 
-  // ── context plane ─────────────────────────────────────────────────────────
-  const contextRegistry = new ContextRegistry({
-    installedPacks: async (tenantId) => {
-      const rows = await db
-        .select({ packId: tenantPacks.packId })
-        .from(tenantPacks)
-        .where(and(eq(tenantPacks.tenantId, tenantId), eq(tenantPacks.isActive, true)));
-      return rows.map((r) => r.packId);
-    },
+  // The retention purge. Shipped in P12 and never instantiated — no cron, no
+  // route, nothing — so `tenant_channel_configs.retention_days` remained a
+  // column that read like a promise nobody kept. `RETENTION_DRY_RUN` defaults
+  // to true, so what this starts doing today is counting and reporting; the
+  // deletion an operator has to sign off on now has numbers behind it.
+  const retentionWorker = new RetentionWorker({
+    db,
+    logger,
+    dryRun: config.compliance.retentionDryRun,
+    connection: redis.connection,
   });
-  // Available to every tenant: the caller supplied the data themselves.
-  contextRegistry.register(new InlineContextProvider(), CORE_PACK);
-  // Pack-gated: reaching patient-service requires the medspa pack. A tenant
-  // without it cannot resolve this kind even by crafting a ContextRef.
-  contextRegistry.register(
-    new MenteraContextProvider({
-      config: {
-        patientServiceUrl: config.context.patientServiceUrl,
-        providerServiceUrl: config.context.providerServiceUrl,
-      },
-      logger,
-    }),
-    'medspa',
-  );
+  await retentionWorker.start();
 
-  const recipientService = new RecipientService({ db, logger, context: contextRegistry });
 
   // ── messaging plane ───────────────────────────────────────────────────────
   const messageService = new MessageService({ db, logger });
@@ -395,13 +450,12 @@ async function main(): Promise<void> {
   // blank to the recipient and to the model.
   const identity = new IdentityResolver({ db, logger });
 
-  const lintRules = mergeRules(...packs.compliance());
   const generator = new ContentGenerator({
     llm,
     assembler: new PromptAssembler(renderer),
     logger,
     lint: async ({ content, channel, tenantId }) =>
-      lintContent({ content, channel, tenantId }, lintRules),
+      lintContent({ content, channel, tenantId }, await rulesFor(tenantId)),
   });
 
   // ── playbook plane ────────────────────────────────────────────────────────
@@ -581,6 +635,7 @@ async function main(): Promise<void> {
         await eventQueue.close();
         await slaWorker.close();
         await deferralWorker.close();
+        await retentionWorker.close();
         await redis.close();
         await closeDb(pool, logger);
         process.exit(0);

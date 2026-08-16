@@ -38,6 +38,23 @@ const sendSchema = z.object({
   metadata: z.record(z.string(), z.unknown()).optional(),
 });
 
+/**
+ * May this caller mark a message transactional?
+ *
+ * Not `requirePermissions` on the route: an ordinary send with the flag absent
+ * must still work for a plain `outreach:send` holder. The claim is what needs
+ * the extra permission, not the endpoint.
+ */
+function canSendTransactional(req: Request): boolean {
+  const identity = req.identity;
+  if (!identity) return false;
+  return (
+    identity.role === 'admin' ||
+    identity.permissions.includes(Permission.ADMIN) ||
+    identity.permissions.includes(Permission.CONFIG_WRITE)
+  );
+}
+
 const listSchema = z.object({
   channel: z.string().optional(),
   status: z.string().optional(),
@@ -100,7 +117,18 @@ export function createMessagingRouter(deps: MessagingApiDeps): Router {
         playbookKey: body.playbookKey,
         templateId: body.templateId,
         correlationId: body.correlationId,
-        transactional: body.transactional,
+        // ── transactional IS A PRIVILEGE, NOT A FIELD ────────────────────────
+        //
+        // It exempts a message from the global opt-out when URGENT and from the
+        // CAN-SPAM footer always (`gate.ts`). Any holder of `outreach:send`
+        // could set it, so the flag that says "this is a password reset, not
+        // marketing" was assertable by whoever was sending the marketing.
+        //
+        // Now it needs `outreach:config:write` on top — the permission a
+        // tenant grants to an integration it configures, not to everything that
+        // can send. A caller without it gets a marketing message, which is the
+        // safe reading of an unproven claim.
+        transactional: body.transactional === true && canSendTransactional(req),
         sendAt: body.sendAt,
       });
 

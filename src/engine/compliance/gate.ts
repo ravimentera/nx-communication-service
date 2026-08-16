@@ -232,6 +232,11 @@ export class ComplianceGate {
       const quiet = this.deps.preferences.quietHoursFor(
         prefs,
         recipient?.timezone ?? tenantRow?.timezone ?? undefined,
+        // The tenant's own default window, which applies when the recipient has
+        // expressed nothing. Almost nobody has — a freshly imported lead list
+        // has no preference rows at all — so without this the courtesy window
+        // was off for exactly the audiences most likely to get a bulk send.
+        tenantQuietHours(tenantRow?.settings),
       );
       if (quiet.configured && quiet.inQuietHours) {
         return { allow: false, reason: 'QUIET_HOURS', deferrable: true, retryAt: quiet.endsAt };
@@ -363,7 +368,11 @@ export class ComplianceGate {
 
   private async loadTenant(tenantId: string) {
     const [row] = await this.deps.db
-      .select({ timezone: tenants.timezone, complianceProfile: tenants.complianceProfile })
+      .select({
+        timezone: tenants.timezone,
+        complianceProfile: tenants.complianceProfile,
+        settings: tenants.settings,
+      })
       .from(tenants)
       .where(eq(tenants.id, tenantId))
       .limit(1);
@@ -470,4 +479,29 @@ export class ComplianceGate {
 
     return false;
   }
+}
+
+/**
+ * `tenants.settings.quietHours` — the tenant's default window.
+ *
+ * Read defensively: `settings` is free-form JSONB an operator edits, and a
+ * malformed window must not throw on the send path. A partial or unparseable
+ * value means "no default", which is the behaviour every tenant had before.
+ */
+function tenantQuietHours(
+  settings: unknown,
+): { start?: string; end?: string; timezone?: string } | null {
+  const quiet = (settings as { quietHours?: unknown } | null)?.quietHours;
+  if (!quiet || typeof quiet !== 'object') return null;
+
+  const { start, end, timezone } = quiet as Record<string, unknown>;
+  const isTime = (v: unknown): v is string =>
+    typeof v === 'string' && /^([01]?\d|2[0-3]):[0-5]\d$/.test(v);
+
+  if (!isTime(start) || !isTime(end)) return null;
+  return {
+    start,
+    end,
+    ...(typeof timezone === 'string' && timezone ? { timezone } : {}),
+  };
 }

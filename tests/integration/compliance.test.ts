@@ -13,7 +13,13 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testconta
 import winston from 'winston';
 
 import { createDb, type Db } from '../../src/db/index.js';
-import { consentRecords, messages, recipients, tenantChannelConfigs } from '../../src/db/schema.js';
+import {
+  consentRecords,
+  messages,
+  recipients,
+  tenantChannelConfigs,
+  tenants,
+} from '../../src/db/schema.js';
 import { ConsentService } from '../../src/engine/compliance/consent.service.js';
 import { ComplianceGate } from '../../src/engine/compliance/gate.js';
 import { PreferenceService } from '../../src/engine/compliance/preference.service.js';
@@ -382,6 +388,99 @@ describe('check 5 — quiet hours DEFER, they do not block', () => {
       quietHoursTimezone: 'UTC',
     });
     expect((await gate(false).check(input(recipient.id, { priority: 'URGENT' }))).allow).toBe(true);
+  });
+});
+
+/**
+ * The tenant's default window.
+ *
+ * Quiet hours applied only when the RECIPIENT had personally configured one,
+ * and almost nobody has — a freshly imported lead list has no preference rows
+ * at all. So the check that exists to stop a message arriving at 3am was, in
+ * practice, off for exactly the audiences most likely to get a bulk send.
+ */
+describe('check 5 — tenant-level quiet hours', () => {
+  async function withTenantQuietHours<T>(
+    quietHours: Record<string, string> | null,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    await db
+      .update(tenants)
+      .set({ settings: quietHours ? { quietHours } : {} })
+      .where(eq(tenants.id, TENANT));
+    try {
+      return await run();
+    } finally {
+      await db.update(tenants).set({ settings: {} }).where(eq(tenants.id, TENANT));
+    }
+  }
+
+  it('defers a recipient who has expressed no preference of their own', async () => {
+    await withTenantQuietHours(
+      // A window covering the whole day, so the test does not depend on when it
+      // runs. Cross-midnight arithmetic has its own unit tests.
+      { start: '00:00', end: '23:59', timezone: 'UTC' },
+      async () => {
+        const recipient = await makeRecipient();
+        const verdict = await gate(false).check(input(recipient.id));
+        expect(verdict.allow).toBe(false);
+        if (!verdict.allow) {
+          expect(verdict.reason).toBe('QUIET_HOURS');
+          expect(verdict.deferrable).toBe(true);
+        }
+      },
+    );
+  });
+
+  it('lets the recipient’s own window win over the tenant’s', async () => {
+    await withTenantQuietHours(
+      { start: '00:00', end: '23:59', timezone: 'UTC' },
+      async () => {
+        const recipient = await makeRecipient();
+        // A personal preference is more specific than an organisational
+        // default; overriding it would be the opposite of what it is for.
+        await preferences.upsert(scope, recipient.id, {
+          quietHoursStart: '03:00',
+          quietHoursEnd: '03:01',
+          quietHoursTimezone: 'UTC',
+        });
+        expect((await gate(false).check(input(recipient.id))).allow).toBe(true);
+      },
+    );
+  });
+
+  it('ignores a malformed window rather than throwing on the send path', async () => {
+    await withTenantQuietHours({ start: 'not-a-time', end: '09:00' }, async () => {
+      const recipient = await makeRecipient();
+      expect((await gate(false).check(input(recipient.id))).allow).toBe(true);
+    });
+  });
+
+  it('is off entirely when ENFORCE_QUIET_HOURS is false', async () => {
+    // The flag sat in the config schema for six phases with no consumer, so a
+    // deployment that set it got quiet hours anyway.
+    const relaxed = new PreferenceService({
+      db,
+      logger,
+      enforceQuietHours: false,
+      defaultTimezone: 'UTC',
+      unsubscribeBaseUrl: 'https://example.test/unsubscribe',
+    });
+
+    await withTenantQuietHours(
+      { start: '00:00', end: '23:59', timezone: 'UTC' },
+      async () => {
+        const recipient = await makeRecipient();
+        const relaxedGate = new ComplianceGate({
+          db,
+          logger,
+          preferences: relaxed,
+          shadowMode: false,
+          unsubscribeUrl: async () => 'https://example.test/unsubscribe/tok',
+        });
+        expect((await relaxedGate.check(input(recipient.id))).allow).toBe(true);
+      },
+    );
   });
 });
 

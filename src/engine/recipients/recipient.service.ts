@@ -26,6 +26,13 @@ import type { ContextRegistry } from '../context/registry.js';
 
 export type Recipient = typeof recipients.$inferSelect;
 
+/**
+ * The `external_ref.system` for a recipient the engine minted from an address
+ * alone, because a caller sent to one without naming a person. Distinct from a
+ * real system's ids so it is obvious in the table which rows those are.
+ */
+export const CONTACT_POINT_SYSTEM = 'contact-point';
+
 export interface ExternalRef {
   system: string;
   id: string;
@@ -46,6 +53,61 @@ export interface RecipientServiceDeps {
 
 export class RecipientService {
   constructor(private readonly deps: RecipientServiceDeps) {}
+
+  /**
+   * The recipient holding this address, created if there is none.
+   *
+   * ───────────────────────────────────────────────────────────────────────────
+   * WHY THE ENGINE NEEDS THIS AT ALL
+   *
+   * The compliance gate is keyed on `recipientId`. Without one it skips
+   * consent, per-channel preference, per-playbook opt-out and every throttle —
+   * so a send with an address but no recipient faced none of them. The MCP
+   * tools, `POST /v1/messages` with a bare address, the compat test-SMS route
+   * and `compat/send.ts` without a `patientId` were all in that state: an agent
+   * could text a number that had unsubscribed, and nothing would stop it.
+   *
+   * Resolving here rather than requiring callers to is deliberate. There are
+   * eight paths and a ninth will be written; making the DISPATCHER answer
+   * "who is this going to?" is what stops the ninth from arriving unguarded.
+   *
+   * ───────────────────────────────────────────────────────────────────────────
+   * THE external_ref IT MINTS
+   *
+   * `{system: 'contact-point', id: '<type>:<value>'}` — deterministic, so the
+   * same address always resolves to the same recipient and their opt-out is
+   * found on the second send as well as the first. It also means the row merges
+   * naturally if a context provider later attaches a real external ref.
+   */
+  async resolveByContactPoint(
+    scope: TenantScope,
+    point: { type: string; value: string },
+  ): Promise<Recipient | null> {
+    const value = point.value?.trim();
+    if (!value) return null;
+
+    // Match an existing recipient who already lists this address, whatever
+    // system they came from — a patient resolved from mentera-patient must not
+    // acquire a second row because one send happened to omit their id.
+    const [existing] = await this.deps.db
+      .select()
+      .from(recipients)
+      .where(
+        and(
+          eq(recipients.tenantId, scope.tenantId),
+          sql`${recipients.contactPoints} @> ${JSON.stringify([{ value }])}::jsonb`,
+        ),
+      )
+      .limit(1);
+
+    if (existing) return existing;
+
+    return this.upsertByExternalRef(
+      scope,
+      { system: CONTACT_POINT_SYSTEM, id: `${point.type}:${value}` },
+      { contactPoints: [{ type: point.type, value, primary: true }] },
+    );
+  }
 
   /**
    * Idempotent on `recipients_tenant_external_ref_unique`. Two workers handling

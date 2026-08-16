@@ -51,11 +51,25 @@ export interface PreferenceServiceDeps {
   logger: Logger;
   /** Used when a recipient has no timezone of their own. */
   defaultTimezone: string;
+  /**
+   * `ENFORCE_QUIET_HOURS`. Read by nothing until P13, when the flag had been in
+   * the config schema for six phases with no consumer — so a deployment that
+   * set it to `false` got quiet hours anyway, and one that assumed it was doing
+   * something was wrong in the other direction.
+   *
+   * Defaults true, which is the behaviour every deployment already had.
+   */
+  enforceQuietHours?: boolean;
   unsubscribeBaseUrl: string;
 }
 
 export class PreferenceService {
-  constructor(private readonly deps: PreferenceServiceDeps) {}
+  private readonly deps: PreferenceServiceDeps & { enforceQuietHours: boolean };
+
+  constructor(deps: PreferenceServiceDeps) {
+    // Default true: it is what every deployment had while the flag was unread.
+    this.deps = { enforceQuietHours: true, ...deps };
+  }
 
   async get(scope: TenantScope, recipientId: string): Promise<RecipientPreference | null> {
     const [row] = await this.deps.db
@@ -259,18 +273,51 @@ export class PreferenceService {
   }
 
   /** Resolve the effective quiet-hours window, or null when none applies. */
+  /**
+   * The recipient's own quiet hours, falling back to the tenant's.
+   *
+   * ───────────────────────────────────────────────────────────────────────────
+   * THE TENANT-LEVEL WINDOW IS THE POINT
+   *
+   * This used to apply only when the RECIPIENT had personally configured a
+   * window, and almost nobody has: a freshly imported lead list has no
+   * preference rows at all. So the check that exists to stop a message arriving
+   * at 3am was, in practice, off for exactly the audiences most likely to
+   * receive a bulk send.
+   *
+   * `tenants.settings.quietHours` is the tenant's default and the engine
+   * applies it when the recipient has expressed nothing. A recipient who HAS
+   * set a window still wins — a personal preference is more specific than an
+   * organisational default, and overriding it would be the opposite of what a
+   * preference is for.
+   *
+   * This is not TCPA. Check 5b in the gate is the statutory window and is not
+   * opt-in; this is a courtesy window a tenant chooses, and `ENFORCE_QUIET_HOURS`
+   * turns it off for a deployment that does not want it.
+   */
   quietHoursFor(
     prefs: RecipientPreference | null,
     fallbackTimezone?: string,
+    tenantDefault?: { start?: string; end?: string; timezone?: string } | null,
   ): QuietHoursVerdict & { configured: boolean } {
-    if (!prefs?.quietHoursStart || !prefs.quietHoursEnd) {
+    if (!this.deps.enforceQuietHours) {
       return { configured: false, inQuietHours: false };
     }
+
+    const start = prefs?.quietHoursStart ?? tenantDefault?.start;
+    const end = prefs?.quietHoursEnd ?? tenantDefault?.end;
+    if (!start || !end) {
+      return { configured: false, inQuietHours: false };
+    }
+
     const verdict = evaluateQuietHours({
-      start: prefs.quietHoursStart,
-      end: prefs.quietHoursEnd,
+      start,
+      end,
       timezone:
-        prefs.quietHoursTimezone ?? fallbackTimezone ?? this.deps.defaultTimezone,
+        prefs?.quietHoursTimezone ??
+        tenantDefault?.timezone ??
+        fallbackTimezone ??
+        this.deps.defaultTimezone,
     });
     return { configured: true, ...verdict };
   }
