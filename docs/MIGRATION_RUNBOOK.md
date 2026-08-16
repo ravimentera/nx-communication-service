@@ -78,10 +78,23 @@ The files:
       P12). Treat it accordingly, and delete it when the cutover is signed off.
 - [ ] **A read-only role on the source.** `GRANT CONNECT`, `GRANT USAGE ON
       SCHEMA public`, `GRANT SELECT` on the tables above. Nothing more.
-- [ ] **The target has the baseline `0xxx` series applied** — `0001`–`0012`,
-      minus the deliberately-absent `0004` — and no rows. **`0013` is not part of
-      the baseline**: it retires the plaintext credential columns and is applied
-      after the load, in §8b (D97).
+- [ ] **The target has the baseline `0xxx` series applied** — `0001`–`0020`,
+      minus the deliberately-absent `0004`, `0013` and `0014` — and no rows.
+      **`0013` is not part of the baseline**: it retires the plaintext credential
+      columns and is applied after the load, in §8b (D97). `0014` is a no-op
+      against the current `0001` and exists only for a database built from the
+      older file (D103).
+
+      `0015`–`0020` landed in P13 and every one of them is baseline:
+
+      | | What it adds | Why the load cares |
+      |---|---|---|
+      | `0015` | `UNIQUE (tenant_id, recipient_id, channel)` on `consent_records` | `9011` upserts against it and refuses to run without it |
+      | `0016` | `playbooks.context_mapping`, `playbooks.priority_rules` | pack install writes both |
+      | `0017` | partial unique index on inbound `provider_message_id` | dedupes a retried provider callback |
+      | `0018` | `playbook_runs` status `RUNNING` | the run reservation writes it |
+      | `0019` | `UNIQUE (campaign_id, recipient_id)` | campaign expansion upserts against it |
+      | `0020` | webhook credential columns on `tenant_channel_configs` | none — but `9003` should not be re-run after it without re-reading §8b |
       ```bash
       npm run migrate:print          # prints the exact commands, runs nothing
       ```
@@ -99,6 +112,16 @@ The files:
       does not restart, so the window is however long §4 takes. It used to say
       "not required", which was true of the migration and false of the cutover
       once the two stopped being separated by a parallel run (D99).
+- [ ] **Decide whether `COMPLIANCE_SHADOW_MODE` stays on.** It defaults to
+      `true` and should stay that way through the window. `9011_consent.sql`
+      seeds consent from the legacy preference data, and its second log line is
+      the number of migrated recipients left with **no** consent on any channel —
+      who will be blocked the moment shadow mode is turned off. Read that number
+      before flipping it, not after.
+
+      Until P13 there was nothing to decide: `consent_records` had no writer at
+      all, so leaving shadow mode would have blocked essentially every send with
+      `CONSENT_REQUIRED` and there was no API to clear a single one.
 - [ ] **Decide `CHANNEL_DRY_RUN` before the window, not during it.** Approving a
       message sends for real in the new engine and sent nothing in the old one
       (D44), so the first approval after the repoint is the first real send this
@@ -182,10 +205,32 @@ the same command.
 
 ```bash
 for f in 9002_tenants 9003_channel_configs 9004_recipients 9005_templates \
-         9006_preferences 9007_events 9008_messages 9009_approvals; do
+         9006_preferences 9007_events 9008_messages 9009_approvals \
+         9011_consent; do
   psql "$TARGET_URL" -v ON_ERROR_STOP=1 -f "migrations/$f.sql"
 done
 ```
+
+`9011_consent` is last, and after `9006` specifically: it reads the preference
+rows `9006` wrote. It seeds a consent record for every migrated recipient the
+legacy data shows as contactable — `allow_communications` AND the per-channel
+opt-in — on `email` and `sms` only.
+
+**Read its second log line before you turn compliance enforcement on.** It
+counts the migrated recipients left with no consent on any channel, who will be
+blocked the moment `COMPLIANCE_SHADOW_MODE` goes to `false`:
+
+```sql
+SELECT detail, n FROM mig.log WHERE loader = '9011_consent' ORDER BY at;
+```
+
+Every row it writes carries `source = 'migration'` and a `proof` object naming
+the columns it was derived from. That is deliberate and it should stay legible:
+the source system recorded **no explicit consent event**, so these are an
+inference from a pre-existing contact relationship, not evidence that anybody
+signed anything. A recipient who had opted out gets **no row** rather than a
+revoked one — a revoked row would assert they once consented, which is exactly
+the thing this cannot know.
 
 Run them one at a time the first time, and read the tail of each — every file
 ends with the queries worth running immediately after it.
