@@ -74,6 +74,20 @@ export interface DispatchResult {
   /** True when the caller should re-enqueue later rather than give up. */
   deferrable?: boolean;
   retryAt?: Date;
+  /**
+   * True when the send failed for an **infrastructural** reason — the queue
+   * would not take the job — rather than because anything decided it should not
+   * go.
+   *
+   * The distinction is load-bearing for approvals. `ApprovalService.release()`
+   * cancels an approval whose dispatch came back refused, which is right when
+   * compliance said no or the channel rejected the content: those do not become
+   * true later, and an approval left sitting approved-and-undelivered forever is
+   * worse. A queue outage is the opposite — nothing decided anything, the
+   * human's decision still stands, and cancelling it destroys a record of a
+   * choice somebody actually made. See D105.
+   */
+  transient?: boolean;
 }
 
 export interface DispatcherDeps {
@@ -299,12 +313,32 @@ export class Dispatcher {
     const row = { id: messageId };
 
     if (!enqueued.queued) {
-      // The row stays QUEUED but nothing will pick it up. Say so plainly.
+      // The row used to stay at QUEUED, which was a lie: nothing was going to
+      // pick it up, and `QUEUED` is exactly the state that means something will.
+      // A reader could not tell this row from one waiting its turn, and the
+      // approvals plane could not tell this outcome from a compliance refusal —
+      // so it cancelled the approval behind it (D105).
+      //
+      // FAILED is what actually happened: the send was attempted and did not
+      // happen. `suppressionReason` is deliberately NOT set — that column means
+      // "the compliance gate stopped this" and nothing stopped this.
+      await this.persist(
+        { ...msg, messageId },
+        correlationId,
+        {
+          status: 'FAILED',
+          rendered,
+          extraMetadata: {
+            dispatchFailure: { reason: enqueued.reason, at: new Date().toISOString() },
+          },
+        },
+      );
+
       logger.error('message persisted but not queued', {
         messageId: row.id,
         reason: enqueued.reason,
       });
-      return { queued: false, messageId: row.id, skipped: enqueued.reason };
+      return { queued: false, messageId: row.id, skipped: enqueued.reason, transient: true };
     }
 
     // Record the job id so the message can be recalled later (P12). BullMQ
@@ -315,16 +349,23 @@ export class Dispatcher {
     // A write per send, on a row that was inserted moments ago. Not free, but
     // the alternative is scanning the queue to find a job by payload, which is
     // O(depth) at exactly the moment somebody is cancelling a large campaign.
-    if (enqueued.jobId) {
-      await this.deps.db
-        .update(messages)
-        .set({
-          metadata: sql`coalesce(${messages.metadata}, '{}'::jsonb) || ${JSON.stringify({
-            jobId: enqueued.jobId,
-          })}::jsonb`,
-        })
-        .where(and(eq(messages.tenantId, msg.tenantId), eq(messages.id, messageId)));
-    }
+    //
+    // The `- 'dispatchFailure'` is not incidental. That marker is what tells
+    // `ApprovalService.approve()` to re-dispatch instead of reporting itself
+    // idempotent (D105), so a stale one is a double-send waiting for the right
+    // sequence: queue refuses, retry succeeds, the worker later marks the row
+    // FAILED for a delivery reason, and a re-approval finds a FAILED row still
+    // carrying the old marker. Cleared here, on the one path that proves the
+    // queue took it. The update is unconditional for the same reason — a queue
+    // that returns no job id still has to clear it.
+    await this.deps.db
+      .update(messages)
+      .set({
+        metadata: sql`(coalesce(${messages.metadata}, '{}'::jsonb) || ${JSON.stringify(
+          enqueued.jobId ? { jobId: enqueued.jobId } : {},
+        )}::jsonb) - 'dispatchFailure'`,
+      })
+      .where(and(eq(messages.tenantId, msg.tenantId), eq(messages.id, messageId)));
 
     return { queued: true, messageId: row.id, jobId: enqueued.jobId };
   }

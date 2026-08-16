@@ -75,8 +75,15 @@ const registry: ChannelRegistry = {
   list: () => ['email' as ChannelType],
 };
 
+/**
+ * Set to a reason to make the queue refuse every job, as a disabled or
+ * unreachable one does. Reset in `afterEach`.
+ */
+let queueRefuses: string | null = null;
+
 const queue: NotificationQueue = {
   enqueue: async (job, options) => {
+    if (queueRefuses) return { queued: false, reason: queueRefuses };
     queued.push({ messageId: job.messageId, delayMs: options?.delayMs });
     return { queued: true, jobId: `job-${queued.length}` };
   },
@@ -425,6 +432,123 @@ describe('compliance runs after approval', () => {
       actorRef: 'compliance.gate',
       reason: 'RECIPIENT_UNSUBSCRIBED',
     });
+  });
+});
+
+/**
+ * D105. A queue outage is not a decision, and must not be recorded as one.
+ *
+ * `release()` used to cancel any approval whose dispatch came back un-queued and
+ * non-deferrable — which is right when compliance refused, and wrong when the
+ * queue simply would not take the job. The two were indistinguishable in
+ * `DispatchResult`, so an unreachable Redis silently threw away a human's
+ * decision and left nothing to retry.
+ */
+describe('a queue that will not take the job', () => {
+  afterEach(() => {
+    queueRefuses = null;
+  });
+
+  async function approveWithQueueDown() {
+    const recipient = await makeRecipient();
+    const { approval } = await service.submit(scope, draft({ recipientId: recipient.id }), {
+      key: 'medspa.provider-always',
+    });
+
+    queueRefuses = 'queue disabled';
+    return { approval, result: await service.approve(scope, approval.id, provider) };
+  }
+
+  it('leaves the approval APPROVED — nothing decided against it', async () => {
+    const { result } = await approveWithQueueDown();
+
+    expect(result.dispatch).toMatchObject({ queued: false, transient: true });
+    expect(result.approval.status).toBe('APPROVED');
+    // And nothing pretends the compliance gate had an opinion about it.
+    expect(result.approval.auditTrail.at(-1)).not.toMatchObject({
+      actorRef: 'compliance.gate',
+    });
+  });
+
+  it('marks the message FAILED rather than leaving it QUEUED with no job', async () => {
+    const { approval } = await approveWithQueueDown();
+
+    const [row] = await db.select().from(messages).where(eq(messages.id, approval.messageId));
+    // QUEUED is the state that means something will pick this up. Nothing will.
+    expect(row!.status).toBe('FAILED');
+    expect((row!.metadata as { dispatchFailure?: { reason: string } }).dispatchFailure).toMatchObject(
+      { reason: 'queue disabled' },
+    );
+    // Not a suppression: that column means the compliance gate stopped it.
+    expect(row!.suppressionReason).toBeNull();
+  });
+
+  it('retries the send when approve is called again and the queue is back', async () => {
+    const { approval } = await approveWithQueueDown();
+    expect(queued).toHaveLength(0);
+
+    queueRefuses = null;
+    const retry = await service.approve(scope, approval.id, provider);
+
+    // NOT reported as idempotent — that is what used to strand it.
+    expect(retry.idempotent).toBeUndefined();
+    expect(retry.dispatch).toMatchObject({ queued: true });
+    expect(queued.map((q) => q.messageId)).toContain(approval.messageId);
+
+    const [row] = await db.select().from(messages).where(eq(messages.id, approval.messageId));
+    expect(row!.status).toBe('QUEUED');
+    // The marker is cleared, or the next FAILED row would look like this one
+    // and re-approving would send the message twice.
+    expect((row!.metadata as { dispatchFailure?: unknown }).dispatchFailure).toBeUndefined();
+  });
+
+  it('is idempotent again once the retry has succeeded', async () => {
+    const { approval } = await approveWithQueueDown();
+    queueRefuses = null;
+    await service.approve(scope, approval.id, provider);
+    const before = queued.length;
+
+    const third = await service.approve(scope, approval.id, provider);
+
+    expect(third.idempotent).toBe(true);
+    expect(queued).toHaveLength(before);
+  });
+
+  it('still cancels when compliance refuses — the two are not the same thing', async () => {
+    // The behaviour this fix must not weaken. A permanent refusal leaves an
+    // approval that can never be delivered, and it should not sit there looking
+    // actionable.
+    const recipient = await makeRecipient('unsubscribed');
+    const { approval } = await service.submit(scope, draft({ recipientId: recipient.id }), {
+      key: 'medspa.provider-always',
+    });
+
+    const result = await service.approve(scope, approval.id, provider);
+
+    expect(result.dispatch).toMatchObject({ queued: false, skipped: 'RECIPIENT_UNSUBSCRIBED' });
+    expect(result.dispatch?.transient).toBeUndefined();
+    expect(result.approval.status).toBe('CANCELLED');
+  });
+
+  it('does not retry a message that failed at the worker rather than at the queue', async () => {
+    // A delivery failure carries no `dispatchFailure` marker, so re-approving
+    // must not re-send it. This is the double-send the marker exists to bound.
+    const recipient = await makeRecipient();
+    const { approval } = await service.submit(scope, draft({ recipientId: recipient.id }), {
+      key: 'medspa.provider-always',
+    });
+    await service.approve(scope, approval.id, provider);
+    const before = queued.length;
+
+    await db
+      .update(messages)
+      .set({ status: 'FAILED' })
+      .where(eq(messages.id, approval.messageId));
+
+    const again = await service.approve(scope, approval.id, provider);
+
+    expect(again.idempotent).toBe(true);
+    expect(queued).toHaveLength(before);
   });
 });
 

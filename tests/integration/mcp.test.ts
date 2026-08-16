@@ -348,17 +348,14 @@ describe('the review tools', () => {
   });
 
   /**
-   * These two assert the **audit trail**, not the final status, and the reason
-   * is worth stating rather than working around silently.
+   * These assert the **audit trail** as well as the status, because this
+   * harness runs with `SKIP_QUEUE=true`: the decision is recorded and the
+   * delivery that should follow it does not happen.
    *
-   * This harness runs with `SKIP_QUEUE=true`, so `release()` finds the queue
-   * disabled, gets `{queued: false}` back from the dispatcher, and — because a
-   * non-deferrable un-queued send is treated as a permanent refusal — moves the
-   * approval to `CANCELLED`. The human decision still happened and is still
-   * recorded; only the delivery that followed it did not.
-   *
-   * So the trail is the honest thing to assert here, and it is also the thing
-   * that matters: who decided, and what they decided.
+   * That used to cancel the approval — a queue outage looked identical to a
+   * compliance refusal, so the human's decision was thrown away by the
+   * infrastructure being unavailable. It does not any more (D105). The trail is
+   * the thing that matters either way: who decided, and what they decided.
    */
   it('approveMessage decides the approval, and records who', async () => {
     const created = await draft();
@@ -371,7 +368,11 @@ describe('the review tools', () => {
 
     expect(res.status).toBe(200);
     const [row] = await h.db
-      .select({ decidedBy: approvalsTable.decidedBy, trail: approvalsTable.auditTrail })
+      .select({
+        status: approvalsTable.status,
+        decidedBy: approvalsTable.decidedBy,
+        trail: approvalsTable.auditTrail,
+      })
       .from(approvalsTable)
       .where(eq(approvalsTable.id, approvalId));
 
@@ -382,6 +383,8 @@ describe('the review tools', () => {
         expect.objectContaining({ to: 'APPROVED', actorType: 'user', actorRef: 'user-1' }),
       ]),
     );
+    // And the decision survived the queue being unavailable (D105).
+    expect(row!.status).toBe('APPROVED');
   });
 
   it('approveMessage with content edits before approving', async () => {
@@ -395,11 +398,16 @@ describe('the review tools', () => {
 
     expect(res.status).toBe(200);
     const [row] = await h.db
-      .select({ edited: approvalsTable.editedContent, trail: approvalsTable.auditTrail })
+      .select({
+        status: approvalsTable.status,
+        edited: approvalsTable.editedContent,
+        trail: approvalsTable.auditTrail,
+      })
       .from(approvalsTable)
       .where(eq(approvalsTable.id, approvalId));
 
     expect(row!.edited).toBe('Rewritten by a person.');
+    expect(row!.status).toBe('EDITED_APPROVED');
     expect(row!.trail).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ to: 'EDITED_APPROVED', actorRef: 'user-1' }),

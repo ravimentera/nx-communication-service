@@ -475,7 +475,19 @@ export class ApprovalService {
     // Idempotent: the FE double-clicks, the network retries, the operator runs
     // the same bulk action twice. Approving an approved row is a no-op that
     // returns 200 — and crucially does NOT dispatch a second time.
+    //
+    // WITH ONE EXCEPTION, and it is the reason this method is not simply a
+    // guard: an approval whose dispatch never reached the queue (D105). The
+    // decision was made and stands, but nothing is carrying the message, and
+    // returning `idempotent: true` here would strand it forever — the caller
+    // would be told the work was already done. Retrying the release is what
+    // makes a queue outage recoverable by pressing approve again.
     if (APPROVED_STATES.includes(current.status) || current.status === 'SENT') {
+      if (current.status !== 'SENT' && (await this.dispatchFailed(scope, current.messageId))) {
+        const body = current.editedContent ?? current.originalContent ?? '';
+        const retried = await this.release(scope, current, body);
+        return { approval: retried.approval, dispatch: retried.dispatch };
+      }
       return { approval: current, idempotent: true };
     }
 
@@ -720,6 +732,26 @@ export class ApprovalService {
    * approval to a send, and it goes through the dispatcher — so the P5
    * compliance gate runs *after* approval, not instead of it.
    */
+  /**
+   * Did this message's last dispatch fail to reach the queue?
+   *
+   * Read from the row rather than inferred from a missing job id: an
+   * implementation of `NotificationQueue` is allowed to enqueue successfully
+   * without returning one, and treating "no job id" as "never queued" would
+   * send some messages twice. `FAILED` plus the marker is written in one place,
+   * by the dispatcher, and only when the enqueue genuinely refused.
+   */
+  private async dispatchFailed(scope: TenantScope, messageId: string): Promise<boolean> {
+    const [row] = await this.deps.db
+      .select({ status: messages.status, metadata: messages.metadata })
+      .from(messages)
+      .where(and(eq(messages.tenantId, scope.tenantId), eq(messages.id, messageId)))
+      .limit(1);
+
+    if (!row || row.status !== 'FAILED') return false;
+    return Boolean((row.metadata as { dispatchFailure?: unknown } | null)?.dispatchFailure);
+  }
+
   private async release(
     scope: TenantScope,
     approval: Approval,
@@ -770,6 +802,24 @@ export class ApprovalService {
       throttle: envelope.throttle,
       sendAt,
     });
+
+    // The queue would not take the job. NOTHING DECIDED ANYTHING — the human's
+    // approval still stands, and cancelling it would destroy the record of a
+    // choice somebody made because a piece of infrastructure was unavailable
+    // for a moment. The approval keeps its status; the message is FAILED and
+    // carries `metadata.dispatchFailure`, which is what makes `approve()`
+    // retry instead of reporting itself idempotent. See D105.
+    if (!dispatch.queued && dispatch.transient) {
+      this.deps.logger.error(
+        'approved message could not be queued — the approval stands and the send can be retried',
+        {
+          approvalId: approval.id,
+          messageId: approval.messageId,
+          reason: dispatch.skipped,
+        },
+      );
+      return { approval, dispatch };
+    }
 
     // Compliance said no, permanently. The approval is cancelled rather than
     // left looking approved-and-pending forever, and the audit trail records
