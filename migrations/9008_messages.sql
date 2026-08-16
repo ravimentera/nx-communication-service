@@ -105,11 +105,25 @@ BEGIN
       -- casts cleanly, so read it as text and compare.
       COALESCE(lower(s.metadata->>'aiGenerated') IN ('true', 't', '1'), false),
       s.queued_message,
-      CASE WHEN mig.map_message_status(s.status) <> upper(COALESCE(s.status, ''))
-           THEN COALESCE(s.metadata::jsonb, '{}'::jsonb)
-                || jsonb_build_object('migration',
-                     jsonb_build_object('sourceStatus', s.status, 'from', 'message_history'))
-           ELSE s.metadata::jsonb END,
+      -- Stamped on EVERY migrated row, not only the ones whose status changed
+      -- (D99). Two readers depend on it:
+      --
+      --   `migrated: true`  — 9009's backlog rewrite cancels never-sent messages
+      --                       that have no approval row, and this is how it tells
+      --                       a migrated row from one the engine wrote. A message
+      --                       has no audit trail to check the way an approval
+      --                       does, so without this the rewrite could not be
+      --                       made safe to re-run.
+      --   `migration.sourceStatus` — the original word. Cancelling the backlog
+      --                       is lossy otherwise, and "how many were approved
+      --                       and never sent?" is a question someone will ask
+      --                       after the fact (D44).
+      COALESCE(s.metadata::jsonb, '{}'::jsonb)
+        || jsonb_build_object(
+             'migrated', true,
+             'migration', jsonb_build_object(
+               'sourceStatus', COALESCE(s.status, ''),
+               'from', 'message_history')),
       s.engagement_data::jsonb, s.conversation_id, s.thread_id, s.sender_name,
       s.participant_phone,
       COALESCE(mig.to_tz(s.created_at), now()), COALESCE(mig.to_tz(s.created_at), now())

@@ -168,6 +168,54 @@ BEGIN
                      ('PENDING_APPROVAL','APPROVED','SCHEDULED','REJECTED','DECLINED')))
            AND NOT EXISTS (SELECT 1 FROM approvals a WHERE a.message_id = m.id)), 'FAIL'),
 
+      -- ── nothing migrated is still actionable (D99) ──────────────────────
+      -- The invariant the disposition rests on: once the old service has stopped
+      -- for good, a migrated row in a live state is work that will never move —
+      -- and it sits in a provider's inbox looking like work that will.
+      --
+      -- Both are **no-ops until `mig.finalize_cutover()` has run**, and hard
+      -- assertions afterwards. Before that point live rows are the normal state
+      -- of a load: the source can still write, and cancelling early would freeze
+      -- a row the delta would otherwise have moved on. Skipped entirely when the
+      -- operator has chosen another disposition.
+      --
+      -- Every column reference is table-qualified: this function
+      -- `RETURNS TABLE (…, status text)`, so a bare `status` resolves to the
+      -- output column and Postgres rejects the query as ambiguous.
+      ('migrated messages left in a live state (after finalize)', 0,
+       (SELECT CASE
+          WHEN COALESCE(mig.setting('cutover_finalized'), '') <> 'true'
+            OR upper(COALESCE(mig.setting('historic_approved_disposition'), 'CANCELLED'))
+               <> 'CANCELLED' THEN 0
+          ELSE (SELECT count(*) FROM messages m
+                 WHERE m.metadata->>'migrated' = 'true'
+                   AND m.status IN ('PENDING', 'PENDING_APPROVAL', 'QUEUED'))
+        END), 'FAIL'),
+
+      ('migrated approvals left in a live state (after finalize)', 0,
+       (SELECT CASE
+          WHEN COALESCE(mig.setting('cutover_finalized'), '') <> 'true'
+            OR upper(COALESCE(mig.setting('historic_approved_disposition'), 'CANCELLED'))
+               <> 'CANCELLED' THEN 0
+          -- `jsonb_array_length = 1` as well as the containment, matching
+          -- `finalize_cutover`'s own predicate exactly. Containment alone is not
+          -- enough: an approval a human decided in the NEW system still carries
+          -- the migration entry underneath their own, and finalize leaves it
+          -- alone on purpose. Without this the check would report a fault every
+          -- time somebody did their job.
+          ELSE (SELECT count(*) FROM approvals a
+                 WHERE jsonb_array_length(a.audit_trail) = 1
+                   AND a.audit_trail @> '[{"actorRef":"migration:p9"}]'::jsonb
+                   AND a.status IN ('PENDING_APPROVAL', 'APPROVED', 'SCHEDULED'))
+        END), 'FAIL'),
+
+      -- Every migrated message keeps the word it arrived with, so cancelling
+      -- the backlog is not lossy and D44's count stays answerable.
+      ('migrated messages missing their source status', 0,
+       (SELECT count(*) FROM messages m
+         WHERE m.metadata->>'migrated' = 'true'
+           AND m.metadata->'migration'->>'sourceStatus' IS NULL), 'FAIL'),
+
       -- ── integrity, not parity ───────────────────────────────────────────
       ('message_analytics rows per message never exceeds one', 0,
        (SELECT count(*) FROM (

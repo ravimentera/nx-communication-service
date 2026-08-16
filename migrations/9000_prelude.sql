@@ -91,7 +91,7 @@ INSERT INTO mig.settings (key, value, note) VALUES
   ('template_fallback_tenant', '',
    'Tenant to attribute templates whose medspa_id is NULL. Empty = quarantine them instead of guessing. See runbook §5.4.'),
   ('historic_approved_disposition', 'CANCELLED',
-   'What to do with approvals that were APPROVED but never sent (D44). CANCELLED (default) or APPROVED. Read the count from the recon before changing it.'),
+   'What to do with everything that was never sent (D44): approvals at APPROVED, SCHEDULED or PENDING_APPROVAL, their messages, and never-sent messages with no approval. CANCELLED (default) or anything else to leave them as loaded. With no parallel run the old service never restarts, so leaving them puts work nobody will do into every inbox (D99). Read the count from the recon before changing it.'),
   ('delta_refresh_days', '7',
    'Trailing window, in days, that scripts/delta-sync.sql re-reads for status changes. message_history has no updated_at, so an older row that changes is not detected.'),
   ('watermark_lag_minutes', '5',
@@ -326,15 +326,23 @@ $$;
 --   PENDING_APPROVAL -> PENDING_APPROVAL   exactly what the engine writes while
 --                                          an approval is open
 --   APPROVED         -> PENDING            approved, and then nothing happened
---                                          (D44). 9009 rewrites these to
---                                          CANCELLED under the default
---                                          disposition.
+--                                          (D44)
 --   SCHEDULED        -> PENDING            same: no job was ever created, and
 --                                          the migration does not create one
 --   DECLINED         -> CANCELLED          matches approval.service.ts:585,
 --   REJECTED         -> CANCELLED          which sets the message to CANCELLED
 --                                          when a human declines
 --   CANCELLED        -> CANCELLED
+--
+-- The first three do NOT survive the load in that state. This map says what a
+-- source word means; `mig.apply_backlog_disposition()` in 9009 then takes every
+-- never-sent row to CANCELLED, because with no parallel run the old service
+-- never restarts and nothing in flight will ever move (D99).
+--
+-- The two steps are kept apart deliberately. This function is IMMUTABLE and
+-- cannot read `mig.settings`, and the disposition is an operator's call with a
+-- knob; putting it here would hard-code the decision into a translation table
+-- and make the load un-rerunnable when someone changed their mind.
 --
 -- `suppression_reason` stays NULL for all of them: its CHECK (0005) enumerates
 -- the compliance gate's reasons, and "a human said no" is not one of them.

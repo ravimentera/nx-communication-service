@@ -635,8 +635,22 @@ describe('messages', () => {
     expect(byId['4'].status).toBe('PENDING_APPROVAL');
     expect(byId['5'].status).toBe('CANCELLED');        // REJECTED -> the decline path's word
     expect(byId['7'].status).toBe('RECEIVED');
+    // Stamped on EVERY row, not only the ones whose status changed (D99).
+    // Cancelling the never-sent backlog is lossy otherwise, and "how many were
+    // approved and never sent?" is a question someone asks after the fact (D44).
     expect(byId['3'].source_status).toBe('APPROVED');
-    expect(byId['1'].source_status).toBeNull();        // unchanged statuses get no marker
+    expect(byId['1'].source_status).toBe('SENT');
+  });
+
+  it('marks every migrated message as migrated', async () => {
+    // `mig.finalize_cutover()` cancels never-sent messages that have no approval
+    // row, and this flag is how it tells a migrated row from one the engine
+    // wrote — a message has no audit trail to check the way an approval does.
+    const { rows } = await target.query(
+      `SELECT count(*)::int AS n FROM messages WHERE metadata->>'migrated' <> 'true'
+          OR metadata->>'migrated' IS NULL`,
+    );
+    expect(rows[0].n).toBe(0);
   });
 
   it('converts naive source timestamps at the declared source zone', async () => {
@@ -894,5 +908,109 @@ describe('delta sync', () => {
        WHERE message_id = '10000000-0000-0000-0000-000000000002'`,
     );
     expect(rows[0]).toMatchObject({ status: 'APPROVED', entries: 2 });
+  });
+});
+
+/**
+ * `mig.finalize_cutover()` — D99.
+ *
+ * Runs last in this file because it is terminal: it cancels everything still in
+ * flight, on the premise that the old service has stopped and does not restart.
+ * Deliberately NOT part of `apply_backlog_disposition`, which runs on every
+ * delta — folding it in froze rows the delta should have moved on, and the two
+ * delta-sync tests above are what caught that.
+ */
+describe('finalize_cutover', () => {
+  it('leaves nothing migrated in a state that looks actionable', async () => {
+    // Before: there is still open work, and the verify checks are no-ops.
+    const liveBefore = await one(
+      target,
+      `SELECT count(*)::int FROM messages
+        WHERE metadata->>'migrated' = 'true'
+          AND status IN ('PENDING','PENDING_APPROVAL','QUEUED')`,
+    );
+    expect(Number(liveBefore)).toBeGreaterThan(0);
+    expect((await verify()).filter((r) => r.status === 'FAIL')).toEqual([]);
+
+    await target.query(`CALL mig.finalize_cutover()`);
+
+    expect(
+      Number(
+        await one(
+          target,
+          `SELECT count(*)::int FROM messages
+            WHERE metadata->>'migrated' = 'true'
+              AND status IN ('PENDING','PENDING_APPROVAL','QUEUED')`,
+        ),
+      ),
+    ).toBe(0);
+    // `jsonb_array_length = 1` as well: an approval a human decided in the NEW
+    // system still carries the migration entry underneath their own, and
+    // finalize leaves those alone on purpose. The next test covers that case.
+    expect(
+      Number(
+        await one(
+          target,
+          `SELECT count(*)::int FROM approvals
+            WHERE jsonb_array_length(audit_trail) = 1
+              AND audit_trail @> '[{"actorRef":"migration:p9"}]'::jsonb
+              AND status IN ('PENDING_APPROVAL','APPROVED','SCHEDULED')`,
+        ),
+      ),
+    ).toBe(0);
+  });
+
+  it('keeps the messages that really were delivered', async () => {
+    // The whole reason for CANCELLED over a blanket SENT: what is true stays
+    // true in both directions.
+    expect(
+      await one(target, `SELECT status FROM messages WHERE id = '10000000-0000-0000-0000-000000000001'`),
+    ).toBe('SENT');
+    expect(
+      await one(target, `SELECT status FROM messages WHERE id = '10000000-0000-0000-0000-000000000007'`),
+    ).toBe('RECEIVED');
+  });
+
+  it('leaves an approval a human decided in the new system alone', async () => {
+    // m2's approval was decided by 'a-real-person' in the previous describe.
+    const { rows } = await target.query(
+      `SELECT status FROM approvals WHERE message_id = '10000000-0000-0000-0000-000000000002'`,
+    );
+    expect(rows[0].status).toBe('APPROVED');
+  });
+
+  it('keeps the source word, so the D44 count is still answerable', async () => {
+    const { rows } = await target.query(
+      `SELECT metadata->'migration'->>'sourceStatus' AS was, count(*)::int AS n
+         FROM messages WHERE metadata->>'migrated' = 'true' GROUP BY 1 ORDER BY 1`,
+    );
+    // Cancelling is not the same as forgetting.
+    expect(rows.map((r: { was: string }) => r.was)).toContain('APPROVED');
+  });
+
+  it('turns the verify checks into real assertions once it has run', async () => {
+    expect(await one(target, `SELECT mig.setting('cutover_finalized')`)).toBe('true');
+    expect((await verify()).filter((r) => r.status === 'FAIL')).toEqual([]);
+
+    // Put one back into a live state and the check now fails, which is what
+    // makes it worth having.
+    await target.query(
+      `UPDATE messages SET status = 'PENDING'
+        WHERE id = '10000000-0000-0000-0000-000000000003'`,
+    );
+    const failures = (await verify()).filter((r) => r.status === 'FAIL');
+    expect(failures.map((f) => f.check_name)).toContain(
+      'migrated messages left in a live state (after finalize)',
+    );
+
+    await target.query(
+      `UPDATE messages SET status = 'CANCELLED'
+        WHERE id = '10000000-0000-0000-0000-000000000003'`,
+    );
+  });
+
+  it('is a no-op run twice', async () => {
+    await target.query(`CALL mig.finalize_cutover()`);
+    expect((await verify()).filter((r) => r.status === 'FAIL')).toEqual([]);
   });
 });

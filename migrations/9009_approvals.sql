@@ -52,12 +52,48 @@
 -- Default: they become CANCELLED, with the reason in the audit trail, and the
 -- message goes to CANCELLED with them. `mig.settings.historic_approved_disposition`
 -- is the knob; the recon prints the count so the call is made with a number in
--- front of the operator rather than in the abstract. Rows still
--- PENDING_APPROVAL are untouched — those are genuinely in flight.
+-- front of the operator rather than in the abstract.
 --
 -- The rewrite only touches approvals whose audit trail is exactly the single
 -- entry this migration wrote. Anything a human has since acted on in the new
--- system is left alone, which matters on the delta sync.
+-- system is left alone.
+--
+-- -----------------------------------------------------------------------------
+-- WIDENED: `PENDING_APPROVAL` IS CANCELLED TOO, AND SO IS EVERY NEVER-SENT
+-- MESSAGE WITHOUT AN APPROVAL (D99)
+--
+-- This used to leave `PENDING_APPROVAL` alone, on the reasoning that those rows
+-- were "genuinely in flight". That reasoning belonged to a cutover with a live
+-- system on both sides of it. There is no parallel run and no live traffic: the
+-- old service is stopped before the migration and never starts again, so a row
+-- that was in flight is a row that will never move.
+--
+-- Leaving them would put a queue of drafts nobody is going to act on into every
+-- provider's approvals inbox on day one, each looking like outstanding work.
+--
+-- So the rule is now one sentence: **nothing migrated may land in a state that
+-- looks actionable.** Three groups reach a terminal state here —
+--
+--   1. approvals at APPROVED / SCHEDULED / PENDING_APPROVAL  -> CANCELLED
+--   2. their messages                                        -> CANCELLED
+--   3. never-sent messages with no approval row at all       -> CANCELLED
+--      (PENDING and QUEUED: submitted or enqueued in the old system, never
+--       delivered, and no BullMQ job exists in the new one to deliver them)
+--
+-- `CANCELLED` rather than `SENT`, which was the alternative considered: nothing
+-- in the engine re-sends a message whatever its status — neither the rate
+-- limiter nor the throttle reads the column, and no sweeper walks it — so both
+-- are mechanically safe. CANCELLED is the one that is also true. Marking them
+-- SENT would have the product assert it delivered messages nobody received, and
+-- would make `sent_at` (copied verbatim, and written at INSERT time in the
+-- source) read as a delivery timestamp for a delivery that never happened.
+--
+-- Every migrated message carries `metadata.migration.sourceStatus`, so the
+-- original word is recoverable and "how many were approved and never sent?"
+-- still has an answer:
+--
+--   SELECT metadata->'migration'->>'sourceStatus' AS was, count(*)
+--     FROM messages WHERE metadata->>'migrated' = 'true' GROUP BY 1 ORDER BY 2 DESC;
 -- =============================================================================
 
 BEGIN;
@@ -82,6 +118,9 @@ BEGIN
   WITH stale AS (
     SELECT ap.id, ap.status, ap.message_id
     FROM approvals ap
+    -- APPROVED and SCHEDULED only. `PENDING_APPROVAL` is handled by
+    -- `mig.finalize_cutover()` instead, and the split is deliberate — see the
+    -- header of that procedure.
     WHERE ap.status IN ('APPROVED', 'SCHEDULED')
       -- Exactly one entry, and it is this migration's: anything a human has
       -- touched in the new system is not ours to rewrite.
@@ -108,6 +147,111 @@ BEGIN
 
   CALL mig.note('9009_approvals',
                 'historic APPROVED/SCHEDULED cancelled rather than released', d);
+END $$;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- FINALIZE (D99) — run ONCE, after the last load, and never again
+--
+-- `apply_backlog_disposition` above runs on every delta and only touches rows
+-- that were already decided in the old system: APPROVED or SCHEDULED, and then
+-- nothing happened. That is safe to repeat, because the source's own word is
+-- unchanged by repeating it.
+--
+-- This procedure is the other half, and it is NOT safe to repeat during a
+-- parallel run — which is exactly why it is separate.
+--
+-- It cancels everything still in flight: approvals at `PENDING_APPROVAL`, and
+-- messages at `PENDING` / `PENDING_APPROVAL` / `QUEUED` that have no approval
+-- row of their own. Those are only dead once the old service has stopped for
+-- good. Run it while the old service can still write and you cancel a draft a
+-- provider is about to approve — and worse, the cancellation appends an audit
+-- entry, which takes `jsonb_array_length(audit_trail)` past 1 and permanently
+-- disqualifies the row from every later delta refresh. It would be frozen
+-- CANCELLED even after the source moved on.
+--
+-- (That is not hypothetical. Folding this into `apply_backlog_disposition` was
+-- the first attempt, and two delta-sync tests caught it: a message the source
+-- had since DELIVERED stayed CANCELLED, and an approval a human had decided in
+-- the new system grew a third audit entry.)
+--
+-- WHY IT EXISTS AT ALL: with no parallel run and no staging, the old service is
+-- stopped before the migration and never starts again. Anything "in flight" at
+-- that moment will never move. Leaving it puts a queue of drafts nobody is
+-- going to action into every provider's inbox on day one, each looking like
+-- outstanding work.
+--
+-- CANCELLED rather than SENT, which was the alternative considered: nothing in
+-- the engine re-sends a message whatever its status — neither the rate limiter
+-- nor the per-playbook throttle reads the column, and no sweeper walks it — so
+-- both are mechanically safe. CANCELLED is the one that is also true. SENT
+-- would have the product assert it delivered messages nobody received, and make
+-- `sent_at` (copied verbatim, and written at INSERT time in the source) read as
+-- a delivery timestamp for a delivery that never happened.
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE OR REPLACE PROCEDURE mig.finalize_cutover()
+LANGUAGE plpgsql AS $$
+DECLARE
+  v_disposition text := upper(COALESCE(mig.setting('historic_approved_disposition'), 'CANCELLED'));
+  d bigint := 0;
+BEGIN
+  IF v_disposition <> 'CANCELLED' THEN
+    CALL mig.note('9009_approvals',
+                  'finalize skipped (disposition ' || v_disposition || ')', 0);
+    RETURN;
+  END IF;
+
+  -- The decided-but-never-sent backlog, in case it has not run since the last load.
+  CALL mig.apply_backlog_disposition();
+
+  -- 1. approvals still open. Same audit-trail guard: anything a human has acted
+  --    on in the new system is not ours to rewrite.
+  WITH stale AS (
+    SELECT ap.id, ap.status, ap.message_id
+    FROM approvals ap
+    WHERE ap.status = 'PENDING_APPROVAL'
+      AND jsonb_array_length(ap.audit_trail) = 1
+      AND ap.audit_trail @> '[{"actorRef":"migration:p9"}]'::jsonb
+  ),
+  moved AS (
+    UPDATE approvals ap
+    SET status = 'CANCELLED',
+        audit_trail = ap.audit_trail || jsonb_build_array(jsonb_build_object(
+          'at', to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+          'from', stale.status, 'to', 'CANCELLED',
+          'actorType', 'system', 'actorRef', 'migration:p9',
+          'reason', 'open for review when the old service stopped, and it does not restart (D99)')),
+        updated_at = now()
+    FROM stale WHERE ap.id = stale.id
+    RETURNING ap.message_id
+  )
+  UPDATE messages m
+  SET status = 'CANCELLED', updated_at = now()
+  FROM moved
+  WHERE m.id = moved.message_id
+    AND m.status IN ('PENDING', 'PENDING_APPROVAL');
+  GET DIAGNOSTICS d = ROW_COUNT;
+  CALL mig.note('9009_approvals', 'open approvals cancelled at finalize', d);
+
+  -- 2. never-sent messages with no approval row at all. `PENDING` is one the old
+  --    system had not sent; `QUEUED` is one it handed to a BullMQ queue that is
+  --    about to be thrown away, and the new service has no job for it.
+  --
+  --    Keyed on `metadata.migrated`, stamped by 9008 on every row it writes, so
+  --    anything the new engine wrote is left alone. A message has no audit trail
+  --    to check the way an approval does; this is its equivalent.
+  UPDATE messages m
+  SET status = 'CANCELLED', updated_at = now()
+  WHERE m.status IN ('PENDING', 'PENDING_APPROVAL', 'QUEUED')
+    AND m.metadata->>'migrated' = 'true';
+  GET DIAGNOSTICS d = ROW_COUNT;
+  CALL mig.note('9009_approvals', 'never-sent migrated messages cancelled at finalize', d);
+
+  -- Records that this ran, which is what turns 9010's two "nothing is still
+  -- actionable" checks from no-ops into hard assertions.
+  INSERT INTO mig.settings (key, value, note)
+  VALUES ('cutover_finalized', 'true',
+          'mig.finalize_cutover() has run. Set by the procedure; do not set by hand.')
+  ON CONFLICT (key) DO UPDATE SET value = 'true';
 END $$;
 
 CREATE OR REPLACE PROCEDURE mig.load_approvals(p_since timestamptz DEFAULT '-infinity')
