@@ -1,6 +1,8 @@
 /**
  * Shared adapter concerns: dry-run and error classification.
  */
+import { randomUUID } from 'node:crypto';
+
 import type { Logger } from 'winston';
 
 import type {
@@ -94,7 +96,12 @@ export function dryRunResult(
   return {
     success: true,
     dispatched: false,
-    providerMessageId: `dryrun-${channel}-${Date.now()}`,
+    // randomUUID, not Date.now(). Two messages dispatched in the same
+    // millisecond — which a campaign does constantly — produced the SAME
+    // provider id, and `messages.provider_message_id` is what a receipt joins
+    // on. In dry run that meant one receipt could match several messages, and
+    // 0017's inbound unique index would reject the second.
+    providerMessageId: `dryrun-${channel}-${randomUUID()}`,
   };
 }
 

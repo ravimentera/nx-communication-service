@@ -74,13 +74,29 @@ services:
       - |
         echo "Migrations are NEVER run by tooling. Run these yourself, in order:"
         echo
-        for f in /migrations/[0-9]*.sql; do
+        # Split schema from one-shot data, the same way scripts/print-migrations.mjs
+        # does. Listing both series in one block was the whole problem: it read as
+        # "run all of these", and the 9xxx files load out of the mentera-core
+        # database and need a linked source. 0013 and 0014 are excluded for the
+        # same reason they are excluded from tests/helpers/migrations.ts — neither
+        # is baseline schema.
+        for f in /migrations/0[0-9]*.sql; do
           [ -e "$$f" ] || { echo "  (no migrations yet)"; break; }
+          case "$$f" in *0013_*|*0014_*) continue;; esac
           echo "  psql \"\$$DATABASE_URL\" -v ON_ERROR_STOP=1 -f migrations/$$(basename $$f)"
         done
         echo
-        echo "The 9xxx series are one-shot data migrations from the mentera-core"
-        echo "database — read docs/MIGRATION_RUNBOOK.md first."
+        echo "Not baseline, and applied deliberately — read the runbook first:"
+        for f in /migrations/0013_*.sql /migrations/0014_*.sql; do
+          [ -e "$$f" ] && echo "  migrations/$$(basename $$f)"
+        done
+        echo
+        echo "One-shot data migrations from mentera-core"
+        echo "(read docs/MIGRATION_RUNBOOK.md first):"
+        for f in /migrations/9[0-9]*.sql; do
+          [ -e "$$f" ] || break
+          echo "  psql \"\$$DATABASE_URL\" -v ON_ERROR_STOP=1 -f migrations/$$(basename $$f)"
+        done
 
 volumes:
   outreach-pgdata:

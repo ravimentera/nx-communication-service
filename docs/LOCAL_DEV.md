@@ -38,16 +38,23 @@ The host has no `psql` client, so use the one inside the Postgres container.
 same files, applied by the same `psql`, in the order the README specifies:
 
 ```bash
-docker compose exec -T postgres psql -U outreach -d outreach -v ON_ERROR_STOP=1 -f /migrations/0001_core_schema.sql
+for f in $(docker compose exec -T postgres sh -c 'ls /migrations/0*.sql' | tr -d '\r'); do
+  case "$f" in *0013_*|*0014_*) continue;; esac
+  docker compose exec -T postgres psql -U outreach -d outreach -v ON_ERROR_STOP=1 -f "$f"
+done
 ```
 
-```bash
-docker compose exec -T postgres psql -U outreach -d outreach -v ON_ERROR_STOP=1 -f /migrations/0002_approvals.sql
-```
+A loop rather than a list, deliberately. This section used to name `0001`,
+`0002` and `0003` by hand; there are twenty now, and a hand-written list is
+wrong from the moment the next phase adds a file — silently, because a database
+missing a migration fails much later and somewhere else.
 
-```bash
-docker compose exec -T postgres psql -U outreach -d outreach -v ON_ERROR_STOP=1 -f /migrations/0003_playbooks.sql
-```
+`0013` and `0014` are skipped because they are not baseline schema. `0013`
+retires the plaintext credential columns and belongs after a data load
+(`docs/MIGRATION_RUNBOOK.md` §8b); `0014` is a no-op against the current `0001`.
+`npm run migrate:print` prints the same split, and
+`tests/helpers/migrations.ts` is what the test harnesses use — all three agree
+by construction.
 
 Order matters: `0002` and `0003` add foreign keys whose other side is created
 earlier. Every file is idempotent and wrapped in a transaction, so re-running

@@ -54,7 +54,21 @@ export function createErrorHandler(options: ErrorHandlerOptions): ErrorRequestHa
 
       res.status(err.statusCode).json({
         success: false,
-        error: { code: err.code, message: err.message, details: err.details },
+        error: {
+          code: err.code,
+          message: err.message,
+          // ── DETAILS ARE FOR 4xx ONLY ────────────────────────────────────
+          //
+          // A 4xx's `details` tell a caller what to fix — which field, which
+          // permission, which allowed values — and that is the whole point of
+          // carrying them. A 5xx's tell them about US: an
+          // `ChannelNotConfiguredError` carries the tenant id, and a database
+          // error carries whatever the driver put there.
+          //
+          // The log line above already has all of it, correlated by
+          // `requestId`, which is what an operator actually debugs from.
+          ...(err.statusCode >= 500 && production ? {} : { details: err.details }),
+        },
         requestId,
       });
       return;

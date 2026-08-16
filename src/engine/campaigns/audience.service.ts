@@ -119,6 +119,15 @@ export interface AudienceServiceDeps {
 }
 
 /** Rows are inserted in batches of this size. See `importRows`. */
+/** Rows per page when walking an audience. */
+const MEMBER_PAGE_SIZE = 5_000;
+
+/**
+ * The point at which expanding an audience in memory stops being reasonable.
+ * Reaching it is logged at `error` — a truncated campaign must never be silent.
+ */
+const MEMBER_HARD_CAP = 500_000;
+
 const IMPORT_BATCH = 1_000;
 
 export class AudienceService {
@@ -467,25 +476,64 @@ export class AudienceService {
       .offset(options.offset ?? 0);
   }
 
-  /** Members, as recipient ids. The orchestrator's expand step reads this. */
+  /**
+   * Members, as recipient ids. The orchestrator's expand step reads this.
+   *
+   * ───────────────────────────────────────────────────────────────────────────
+   * IT PAGES, AND IT SAYS SO WHEN IT STOPS
+   *
+   * There was a bare `.limit(100_000)`, so an audience of 150,000 silently
+   * became one of 100,000: the campaign launched, reported `expanded: 100000`,
+   * completed, and 50,000 people were never contacted with nothing anywhere
+   * recording it. A silent cap reads as "covered everything".
+   *
+   * The explicit `options.limit` is still honoured — a caller asking for a page
+   * gets a page — but the default now walks the whole audience.
+   */
   async memberIds(
     scope: TenantScope,
     audienceId: string,
     options: { limit?: number; offset?: number } = {},
   ): Promise<string[]> {
-    const rows = await this.deps.db
-      .select({ recipientId: audienceMembers.recipientId })
-      .from(audienceMembers)
-      .where(
-        and(
-          eq(audienceMembers.audienceId, audienceId),
-          eq(audienceMembers.tenantId, scope.tenantId),
-        ),
-      )
-      .orderBy(audienceMembers.recipientId)
-      .limit(options.limit ?? 100_000)
-      .offset(options.offset ?? 0);
-    return rows.map((r) => r.recipientId);
+    const page = async (limit: number, offset: number): Promise<string[]> => {
+      const rows = await this.deps.db
+        .select({ recipientId: audienceMembers.recipientId })
+        .from(audienceMembers)
+        .where(
+          and(
+            eq(audienceMembers.audienceId, audienceId),
+            eq(audienceMembers.tenantId, scope.tenantId),
+          ),
+        )
+        .orderBy(audienceMembers.recipientId)
+        .limit(limit)
+        .offset(offset);
+      return rows.map((r) => r.recipientId);
+    };
+
+    // An explicit limit is a caller asking for one page. Honour it exactly.
+    if (options.limit !== undefined) return page(options.limit, options.offset ?? 0);
+
+    const all: string[] = [];
+    let offset = options.offset ?? 0;
+    for (;;) {
+      const batch = await page(MEMBER_PAGE_SIZE, offset);
+      all.push(...batch);
+      if (batch.length < MEMBER_PAGE_SIZE) break;
+      offset += batch.length;
+
+      if (all.length >= MEMBER_HARD_CAP) {
+        // A bound still has to exist — this array is held in memory — but it is
+        // loud now. An operator seeing this line knows the campaign is short,
+        // which is the entire difference from before.
+        this.deps.logger.error(
+          'audience is larger than the engine will expand in one pass — the campaign will be INCOMPLETE',
+          { tenantId: scope.tenantId, audienceId, expanded: all.length, cap: MEMBER_HARD_CAP },
+        );
+        break;
+      }
+    }
+    return all;
   }
 
   // ── internals ─────────────────────────────────────────────────────────────

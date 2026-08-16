@@ -211,6 +211,7 @@ export function createApp(deps: AppDeps): Express {
       redis: deps.redis,
       logger,
       queueStats: deps.queue ? () => deps.queue!.stats() : undefined,
+      packs: deps.playbooks?.packs,
     }),
   );
 

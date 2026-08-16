@@ -151,7 +151,8 @@ export class RecipientService {
       patch.lastName !== undefined ||
       patch.timezone !== undefined ||
       patch.locale !== undefined ||
-      patch.contactPoints !== undefined;
+      patch.contactPoints !== undefined ||
+      patch.attributes !== undefined;
 
     if (!hasUpdate) {
       const existing = await this.getByExternalRef(scope, ref);
@@ -169,6 +170,24 @@ export class RecipientService {
         timezone: sql`COALESCE(${patch.timezone ?? null}, ${recipients.timezone})`,
         locale: sql`COALESCE(${patch.locale ?? null}, ${recipients.locale})`,
         ...(patch.contactPoints ? { contactPoints: patch.contactPoints } : {}),
+        // ── ATTRIBUTES WERE DROPPED ON THE UPDATE BRANCH ────────────────────
+        //
+        // The INSERT wrote them and the UPDATE did not, so re-importing a lead
+        // list to refresh scores, segments or lifecycle stage was a no-op for
+        // every recipient that already existed — which after the first import is
+        // all of them. The import reported success and changed nothing.
+        //
+        // MERGED with `||` rather than replaced: `attributes` is where several
+        // sources write (an import, a context provider, `POST /v1/recipients`),
+        // and a partial import must not blank what another one knows. The
+        // incoming keys win, which is what "refresh" means.
+        ...(patch.attributes
+          ? {
+              attributes: sql`COALESCE(${recipients.attributes}, '{}'::jsonb) || ${JSON.stringify(
+                patch.attributes,
+              )}::jsonb`,
+            }
+          : {}),
         updatedAt: new Date(),
       })
       .where(

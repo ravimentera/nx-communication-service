@@ -14,7 +14,23 @@ const files = readdirSync(dir)
   .filter((f) => /^\d{4}_.*\.sql$/.test(f))
   .sort();
 
-const schema = files.filter((f) => !f.startsWith('9'));
+/**
+ * Files in the `0*` series that are NOT baseline schema.
+ *
+ * Must match `NON_BASELINE_MIGRATIONS` in `tests/helpers/migrations.ts`, and
+ * `tests/unit/platform/migrations.test.ts` asserts that it does — this is a
+ * `.mjs` script and that is a `.ts` module, so the list is duplicated and the
+ * test is what keeps the duplication honest.
+ *
+ * Listing them with the baseline was a real inconsistency, not a cosmetic one:
+ * `0013` retires the plaintext credential columns and belongs after a data
+ * load, so an operator following this output in order sealed their credentials
+ * before `9003_channel_configs.sql` had inserted any.
+ */
+const NON_BASELINE = ['0013_encrypt_credentials.sql', '0014_drop_queued_message.sql'];
+
+const schema = files.filter((f) => !f.startsWith('9') && !NON_BASELINE.includes(f));
+const nonBaseline = files.filter((f) => NON_BASELINE.includes(f));
 const data = files.filter((f) => f.startsWith('9'));
 
 console.log('Migrations are NEVER run by tooling. Run these yourself, in order:\n');
@@ -24,6 +40,12 @@ if (schema.length === 0 && data.length === 0) {
 } else {
   for (const f of schema) {
     console.log(`  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/${f}`);
+  }
+  if (nonBaseline.length > 0) {
+    console.log('\nNot baseline, and applied deliberately — read the runbook first:\n');
+    for (const f of nonBaseline) {
+      console.log(`  migrations/${f}`);
+    }
   }
   if (data.length > 0) {
     console.log('\nOne-shot data migrations from mentera-core');

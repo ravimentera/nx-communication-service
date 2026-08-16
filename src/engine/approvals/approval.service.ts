@@ -45,7 +45,7 @@ import { and, asc, count, desc, eq, gte, inArray, lt, sql, type SQL } from 'driz
 import type { Logger } from 'winston';
 
 import type { Db } from '../../db/index.js';
-import { approvals, messages } from '../../db/schema.js';
+import { approvals, messages, tenants } from '../../db/schema.js';
 import type { ApprovalStatus } from '../../db/schema/approvals.js';
 import type { Priority } from '../../domain/index.js';
 import type { TenantScope } from '../../platform/db/tenant-scope.js';
@@ -447,6 +447,16 @@ export class ApprovalService {
   }
 
   /** Counts by status, priority and age, for the approver's dashboard header. */
+  /**
+   * `startOfToday` is computed in the TENANT's timezone, not the server's.
+   *
+   * `new Date(); setHours(0,0,0,0)` is midnight where the process runs, which
+   * for a pod in UTC and a New York clinic means "today" starts at 7pm the
+   * previous evening — so the dashboard's `approvedToday` counted a chunk of
+   * yesterday and dropped this evening's. Exactly the class of defect D34
+   * introduced `formatDate`'s timezone resolution to prevent, in the one place
+   * that computes a boundary rather than formats one.
+   */
   async dashboard(
     scope: TenantScope,
     approverRef?: string,
@@ -462,10 +472,15 @@ export class ApprovalService {
     const base: SQL[] = [eq(approvals.tenantId, scope.tenantId)];
     if (approverRef) base.push(eq(approvals.approverRef, approverRef));
 
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
+    const [tenantRow] = await this.deps.db
+      .select({ timezone: tenants.timezone })
+      .from(tenants)
+      .where(eq(tenants.id, scope.tenantId))
+      .limit(1);
+
+    const startOfToday = startOfDayIn(tenantRow?.timezone ?? 'UTC');
     const startOfWeek = new Date(startOfToday);
-    startOfWeek.setDate(startOfWeek.getDate() - startOfWeek.getDay());
+    startOfWeek.setUTCDate(startOfWeek.getUTCDate() - startOfWeek.getUTCDay());
 
     const decided = ['APPROVED', 'EDITED_APPROVED', 'AUTO_APPROVED', 'SENT'];
 
@@ -803,10 +818,49 @@ export class ApprovalService {
       throw new ForbiddenError('Bulk approval requires the outreach:approve:bulk permission');
     }
 
+    // ── AND THE POLICY'S OWN RIGHT, WHICH THE DOCSTRING ABOVE PROMISED ──────
+    //
+    // `rights.bulk` was loaded, typed and documented here as required — and
+    // never read. The two are not redundant, and the difference is the point:
+    // a PERMISSION is granted per user, usually broadly, while the RIGHT is
+    // authored per policy by the tenant. A clinic that decides messages under
+    // one policy must be read one at a time was overridden by any admin holding
+    // a broad permission, which is the exact thing `rights` exists to prevent.
+    //
+    // Checked per row, because a batch can span policies: the ones that forbid
+    // it report their own error and the rest proceed, rather than one strict
+    // policy failing the whole call.
+    const rightsByPolicy = new Map<string, boolean>();
+    const bulkAllowed = async (approval: Approval): Promise<boolean> => {
+      if (!approval.policyId) return true; // the fallback policy permits it
+      const cached = rightsByPolicy.get(approval.policyId);
+      if (cached !== undefined) return cached;
+
+      const policy = await this.deps.policies.load(this.scopeOf(approval), {
+        policyId: approval.policyId,
+      });
+      const allowed = policy?.rights?.bulk !== false;
+      rightsByPolicy.set(approval.policyId, allowed);
+      return allowed;
+    };
+
     const results: { id: string; ok: boolean; status?: ApprovalStatus; error?: string }[] = [];
 
     for (const id of ids) {
       try {
+        if (!this.isAdmin(actor)) {
+          const approval = await this.require(scope, id);
+          if (!(await bulkAllowed(approval))) {
+            results.push({
+              id,
+              ok: false,
+              error:
+                'This approval’s policy does not permit bulk actions; it must be decided individually',
+            });
+            continue;
+          }
+        }
+
         const outcome =
           action === 'approve'
             ? await this.approve(scope, id, actor)
@@ -998,11 +1052,30 @@ export class ApprovalService {
     return toApproval(row);
   }
 
+  /**
+   * The row every mutation starts from — scoped to the sub-tenant as well as
+   * the tenant.
+   *
+   * `filterClause` has applied `subTenantId` to every LIST since P6 and this
+   * applied only `tenantId`, so a caller scoped to one location could not SEE
+   * another location's approvals and could act on any of them by id. That is
+   * the same asymmetry D45 records in the source — the check on the list and
+   * nowhere else — reintroduced one level down.
+   *
+   * A scope with no `subTenantId` is org-wide and matches every row, which is
+   * what an admin without a location header should get.
+   */
   private async require(scope: TenantScope, id: string): Promise<Approval> {
     const [row] = await this.deps.db
       .select()
       .from(approvals)
-      .where(and(eq(approvals.tenantId, scope.tenantId), eq(approvals.id, id)))
+      .where(
+        and(
+          eq(approvals.tenantId, scope.tenantId),
+          eq(approvals.id, id),
+          ...(scope.subTenantId ? [eq(approvals.subTenantId, scope.subTenantId)] : []),
+        ),
+      )
       .limit(1);
     if (!row) throw new NotFoundError(`Approval '${id}' not found`);
     return toApproval(row);
@@ -1221,6 +1294,35 @@ function toView(row: {
     senderId: row.senderId,
     messageStatus: row.messageStatus,
   };
+}
+
+/**
+ * Midnight today, in the given IANA zone, as an instant.
+ *
+ * Built by formatting `now` into the zone's calendar date and reading it back
+ * as UTC — the only way to get a zone's day boundary without a date library,
+ * and correct across DST because the formatter does the conversion.
+ *
+ * An unknown zone falls back to UTC rather than throwing: a dashboard is not
+ * worth failing over a misconfigured timezone, and the compliance gate is where
+ * a bad zone must be caught (it is validated at the edge now).
+ */
+function startOfDayIn(timezone: string): Date {
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(new Date());
+
+    const get = (type: string) => parts.find((p) => p.type === type)?.value ?? '01';
+    return new Date(`${get('year')}-${get('month')}-${get('day')}T00:00:00.000Z`);
+  } catch {
+    const utc = new Date();
+    utc.setUTCHours(0, 0, 0, 0);
+    return utc;
+  }
 }
 
 /** Short, stable fingerprint of a body, so an edit is provable from the trail. */

@@ -190,14 +190,32 @@ export class Renderer {
     hbs.registerHelper('helperMissing', () => '');
   }
 
-  private compile(source: string, cacheKey?: string): HandlebarsTemplateDelegate {
+  /**
+   * `noEscape` follows the FORMAT, which it did not before.
+   *
+   * Handlebars escapes for HTML by default, and this compiled every template
+   * that way — so a plain-text SMS rendered `O'Brien` as `O&#x27;Brien` and
+   * `Smith & Jones` as `Smith &amp; Jones`, in a message a person reads. There
+   * is nothing to escape in a 160-character text message; the escaping is a
+   * defence against markup in a document that has no markup.
+   *
+   * HTML and MJML keep escaping on. That is not symmetry — it is the whole
+   * reason the default exists, and turning it off there would put a recipient's
+   * own display name into an HTML document unescaped.
+   */
+  private compile(
+    source: string,
+    format: TemplateFormat,
+    cacheKey?: string,
+  ): HandlebarsTemplateDelegate {
     if (cacheKey) {
       const hit = this.compiled.get(cacheKey);
       if (hit) return hit;
     }
+    const noEscape = format === 'TEXT' || format === 'MARKDOWN';
     let template: HandlebarsTemplateDelegate;
     try {
-      template = this.hbs.compile(source, { strict: false, noEscape: false });
+      template = this.hbs.compile(source, { strict: false, noEscape });
     } catch (error) {
       throw new ValidationError('Template failed to compile', {
         reason: error instanceof Error ? error.message : String(error),
@@ -223,7 +241,19 @@ export class Renderer {
     const warnings: string[] = [];
 
     const aliased = applyAliases(source, options.aliases ?? {});
-    const template = this.compile(aliased);
+
+    // ── THE COMPILED CACHE, WHICH WAS DEAD CODE ─────────────────────────────
+    //
+    // `compile()` has taken a `cacheKey` since P4 and `render()` never passed
+    // one, so the LRU it maintains was allocated, bounded, evicted from — and
+    // never read. Every render recompiled.
+    //
+    // The key has to cover everything that changes the OUTPUT of compilation:
+    // the aliased source (so two packs' alias maps cannot collide) and the
+    // format (which now decides `noEscape`, so one key per source would return
+    // an HTML-escaping template for an SMS).
+    const cacheKey = `${format}\u0000${aliased}`;
+    const template = this.compile(aliased, format, cacheKey);
 
     let output: string;
     try {

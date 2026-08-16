@@ -29,7 +29,7 @@
  * ─────────────────────────────────────────────────────────────────────────────
  */
 import { Queue, Worker, type Job } from 'bullmq';
-import { and, asc, eq, inArray, isNotNull, lt } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNotNull, lt, sql } from 'drizzle-orm';
 import type { Redis } from 'ioredis';
 import type { Logger } from 'winston';
 
@@ -192,7 +192,45 @@ export class SlaSweeper {
     if (report.scanned > 0) {
       this.deps.logger.info('approval SLA sweep', report);
     }
+
+    // `approvalsPendingGauge` was declared in P6 and never `.set()` — so the
+    // metric existed, was scraped, and read zero for every tenant forever.
+    // A gauge that is always zero is worse than a missing one: it answers the
+    // question "is anything waiting on a human?" with a confident no.
+    //
+    // The sweep is the natural place. It already runs on a schedule, it is
+    // exactly one replica per tick, and its cadence (60s) is the resolution
+    // anyone wants from a backlog gauge.
+    await this.refreshPendingGauge();
+
     return report;
+  }
+
+  /**
+   * Pending approvals per tenant, for the gauge.
+   *
+   * Never throws: a metrics refresh must not fail a sweep that has already
+   * decided real approvals.
+   */
+  private async refreshPendingGauge(): Promise<void> {
+    try {
+      const rows = await this.deps.db
+        .select({ tenantId: approvals.tenantId, count: sql<number>`count(*)::int` })
+        .from(approvals)
+        .where(eq(approvals.status, 'PENDING_APPROVAL'))
+        .groupBy(approvals.tenantId);
+
+      // Reset first: a tenant whose queue emptied since the last sweep would
+      // otherwise keep its old value indefinitely, because it produces no row.
+      approvalsPendingGauge.reset();
+      for (const row of rows) {
+        approvalsPendingGauge.set({ tenant: row.tenantId }, row.count);
+      }
+    } catch (error) {
+      this.deps.logger.warn('could not refresh the pending-approvals gauge', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   private async markExpired(

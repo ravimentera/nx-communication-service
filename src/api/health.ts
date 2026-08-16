@@ -26,6 +26,12 @@ export interface HealthDeps {
   logger: Logger;
   /** Present once the delivery plane is wired (P3). */
   queueStats?: () => Promise<Record<string, number>>;
+  /**
+   * The loaded packs, so `GET /health/detailed` can report a pack whose JSON
+   * failed validation. Absent means the check reports `degraded` and says so,
+   * which is the honest answer for a deployment that wired no registry.
+   */
+  packs?: { list: () => string[]; errors: () => string[] };
 }
 
 type CheckStatus = 'up' | 'down' | 'degraded';
@@ -75,8 +81,29 @@ export function createHealthRouter(deps: HealthDeps): Router {
       queues: deps.queueStats
         ? { status: 'up' as CheckStatus, detail: await deps.queueStats() }
         : { status: 'degraded' as CheckStatus, detail: { note: 'queue disabled' } },
-      // Populated in P7.
-      packs: { status: 'up' as CheckStatus, detail: { note: 'not wired until P7' } },
+      // ── PACKS ────────────────────────────────────────────────────────────
+      //
+      // This reported `up` with the note "not wired until P7" for six phases
+      // after P7 shipped. A health check that always says `up` is not a check;
+      // it is a claim, and this one was false in the direction that matters —
+      // a pack whose JSON fails validation means some playbook silently does
+      // not exist, and the boot log is the only place that said so.
+      //
+      // `degraded`, not `down`: a broken pack costs that pack's playbooks, and
+      // one bad file in a vertical nobody installed must not fail the whole
+      // service's health check and take it out of the load balancer.
+      packs: deps.packs
+        ? (() => {
+            const errors = deps.packs.errors();
+            return {
+              status: (errors.length === 0 ? 'up' : 'degraded') as CheckStatus,
+              detail: {
+                loaded: deps.packs.list(),
+                ...(errors.length > 0 ? { errors } : {}),
+              },
+            };
+          })()
+        : { status: 'degraded' as CheckStatus, detail: { note: 'no pack registry wired' } },
     };
 
     const healthy = checks.database.status === 'up';

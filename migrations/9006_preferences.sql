@@ -39,6 +39,28 @@ BEGIN;
 
 SELECT mig.require_source('communication_preferences');
 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- REFUSE TO RUN AFTER THE CUTOVER HAS BEEN FINALIZED.
+--
+-- This is the ONE loader that writes over existing rows (see the DO UPDATE
+-- below and its reasoning). That is right while the old service is the sole
+-- writer and wrong the moment it is not: after the repoint, re-running this
+-- would take the source's `allow_communications` and overwrite an unsubscribe
+-- somebody made in the NEW engine — putting a person who asked not to be
+-- contacted back on the list, silently.
+--
+-- The row-level guard further down handles the ordinary case. This is the blunt
+-- one, because "I re-ran the loaders to be safe" is a thing an operator does at
+-- 2am and it should not be able to un-unsubscribe anybody.
+-- ─────────────────────────────────────────────────────────────────────────────
+DO $$
+BEGIN
+  IF mig.setting('cutover_finalized') = 'true' THEN
+    RAISE EXCEPTION
+      '9006_preferences must not run after mig.finalize_cutover(): it overwrites preferences, and the new engine has been the writer since the repoint. If you genuinely need to re-load, clear mig.settings.cutover_finalized deliberately and read docs/MIGRATION_RUNBOOK.md first.';
+  END IF;
+END $$;
+
 WITH latest AS (
   SELECT DISTINCT ON (s.medspa_id, s.patient_id) s.*
   FROM src.communication_preferences s
@@ -118,6 +140,19 @@ ins AS (
     voice_opt_in          = EXCLUDED.voice_opt_in,
     direct_mail_opt_in    = EXCLUDED.direct_mail_opt_in,
     updated_at            = EXCLUDED.updated_at
+  -- ── LAST WRITER WINS, AND THE NEW ENGINE IS A WRITER ──────────────────────
+  --
+  -- Unconditional, this reverted anything the new engine had written. The case
+  -- that matters is an unsubscribe: a recipient opts out after the repoint,
+  -- somebody re-runs this loader, and the source's `allow_communications = true`
+  -- comes straight back. They start receiving messages again, and nothing
+  -- anywhere records that it happened.
+  --
+  -- The predicate is the honest rule the DO UPDATE always meant: carry the
+  -- source's change across only when it is NEWER than what the target holds.
+  -- A change made in the old system during the load still wins, which is the
+  -- whole reason this loader updates rather than skips.
+  WHERE recipient_preferences.updated_at <= EXCLUDED.updated_at
   RETURNING 1
 )
 INSERT INTO mig.log (loader, detail, n)
