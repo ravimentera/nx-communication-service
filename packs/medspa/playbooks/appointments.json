@@ -2,96 +2,259 @@
   {
     "key": "medspa.appointment-reminder",
     "name": "Appointment reminder",
-    "description": "enhanced-event-handler.ts:121-164. Two dispatches in the source, one per channel, both using template id 'appointment-reminder'.",
+    "description": "enhanced-event-handler.ts:121-164. Two dispatches in the source, one per channel, both using template id 'appointment-reminder'. Three callers have spelled these fields three ways: this contract's names, the deleted source's nested appointmentDetails/oldAppointment, and scheduling-service's startTime/oldStartTime — which is the only one sending these events today. contextMapping accepts all three rather than picking one and breaking the others.",
     "priority": 10,
     "approvalPolicyKey": "system.transactional",
-    "contentSource": { "kind": "template", "templateKey": "medspa.appointment-reminder.email" },
+    "contentSource": {
+      "kind": "template",
+      "templateKey": "medspa.appointment-reminder.email"
+    },
     "channelPlan": [
-      { "channel": "email", "templateKey": "medspa.appointment-reminder.email" },
-      { "channel": "sms", "templateKey": "medspa.appointment-reminder.sms" }
+      {
+        "channel": "email",
+        "templateKey": "medspa.appointment-reminder.email"
+      },
+      {
+        "channel": "sms",
+        "templateKey": "medspa.appointment-reminder.sms"
+      }
     ],
     "dataContract": {
       "type": "object",
-      "required": ["appointmentDate"],
+      "required": [
+        "appointmentDate"
+      ],
       "properties": {
-        "appointmentDate": { "type": "string", "description": "Rendered as supplied; the source never parses it." },
-        "doctorName": { "type": "string", "default": "your provider" }
+        "appointmentDate": {
+          "type": "string",
+          "description": "Rendered as supplied; the source never parses it."
+        },
+        "doctorName": {
+          "type": "string",
+          "default": "your provider"
+        }
       }
     },
-    "triggers": [{ "type": "event", "eventType": "APPOINTMENT_REMINDER" }]
+    "contextMapping": {
+      "appointmentDate": [
+        "appointmentDate",
+        "appointmentDetails.date",
+        "startTime"
+      ],
+      "doctorName": [
+        "doctorName",
+        "providerName",
+        "appointmentDetails.provider",
+        "provider"
+      ]
+    },
+    "triggers": [
+      {
+        "type": "event",
+        "eventType": "APPOINTMENT_REMINDER"
+      }
+    ]
   },
-
   {
     "key": "medspa.appointment-confirmation",
     "name": "Appointment confirmation",
-    "description": "enhanced-event-handler.ts:166-189. Email only. Spreads the whole appointmentDetails object into the variables.",
+    "description": "enhanced-event-handler.ts:166-189. Email only. Spreads the whole appointmentDetails object into the variables. Three callers have spelled these fields three ways: this contract's names, the deleted source's nested appointmentDetails/oldAppointment, and scheduling-service's startTime/oldStartTime — which is the only one sending these events today. contextMapping accepts all three rather than picking one and breaking the others.",
     "priority": 10,
     "approvalPolicyKey": "system.transactional",
-    "contentSource": { "kind": "template", "templateKey": "medspa.appointment-confirmation.email" },
-    "channelPlan": [{ "channel": "email" }],
+    "contentSource": {
+      "kind": "template",
+      "templateKey": "medspa.appointment-confirmation.email"
+    },
+    "channelPlan": [
+      {
+        "channel": "email"
+      }
+    ],
     "dataContract": {
       "type": "object",
-      "required": ["appointmentDate"],
+      "required": [
+        "appointmentDate"
+      ],
       "properties": {
-        "appointmentDate": { "type": "string" },
-        "appointmentTime": { "type": "string" },
-        "location": { "type": "string" },
-        "provider": { "type": "string" }
+        "appointmentDate": {
+          "type": "string"
+        },
+        "appointmentTime": {
+          "type": "string"
+        },
+        "location": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        }
       }
     },
-    "triggers": [{ "type": "event", "eventType": "APPOINTMENT_CONFIRMATION" }]
+    "contextMapping": {
+      "appointmentDate": [
+        "appointmentDate",
+        "appointmentDetails.date",
+        "startTime"
+      ],
+      "appointmentTime": [
+        "appointmentTime",
+        "appointmentDetails.time",
+        "startTime"
+      ],
+      "location": [
+        "location",
+        "appointmentDetails.location"
+      ],
+      "provider": [
+        "provider",
+        "appointmentDetails.provider",
+        "providerId"
+      ]
+    },
+    "triggers": [
+      {
+        "type": "event",
+        "eventType": "APPOINTMENT_CONFIRMATION"
+      }
+    ]
   },
-
   {
     "key": "medspa.appointment-cancellation",
     "name": "Appointment cancellation",
-    "description": "enhanced-event-handler.ts:191-233. The SMS is deliberately narrower than the email: the source passes only appointmentDate and location to it (:220-221).",
+    "description": "enhanced-event-handler.ts:191-233. The SMS is deliberately narrower than the email: the source passes only appointmentDate and location to it (:220-221). Three callers have spelled these fields three ways: this contract's names, the deleted source's nested appointmentDetails/oldAppointment, and scheduling-service's startTime/oldStartTime — which is the only one sending these events today. contextMapping accepts all three rather than picking one and breaking the others.",
     "priority": 10,
     "approvalPolicyKey": "system.transactional",
-    "contentSource": { "kind": "template", "templateKey": "medspa.appointment-cancellation.email" },
+    "contentSource": {
+      "kind": "template",
+      "templateKey": "medspa.appointment-cancellation.email"
+    },
     "channelPlan": [
-      { "channel": "email", "templateKey": "medspa.appointment-cancellation.email" },
-      { "channel": "sms", "templateKey": "medspa.appointment-cancellation.sms" }
+      {
+        "channel": "email",
+        "templateKey": "medspa.appointment-cancellation.email"
+      },
+      {
+        "channel": "sms",
+        "templateKey": "medspa.appointment-cancellation.sms"
+      }
     ],
     "dataContract": {
       "type": "object",
-      "required": ["appointmentDate"],
+      "required": [
+        "appointmentDate"
+      ],
       "properties": {
-        "appointmentDate": { "type": "string" },
-        "location": { "type": "string" }
+        "appointmentDate": {
+          "type": "string"
+        },
+        "location": {
+          "type": "string"
+        }
       }
     },
-    "triggers": [{ "type": "event", "eventType": "APPOINTMENT_CANCELLATION" }]
+    "contextMapping": {
+      "appointmentDate": [
+        "appointmentDate",
+        "appointmentDetails.date",
+        "startTime"
+      ],
+      "location": [
+        "location",
+        "appointmentDetails.location"
+      ]
+    },
+    "triggers": [
+      {
+        "type": "event",
+        "eventType": "APPOINTMENT_CANCELLATION"
+      }
+    ]
   },
-
   {
     "key": "medspa.appointment-rescheduling",
     "name": "Appointment rescheduling",
-    "description": "enhanced-event-handler.ts:235-283. The source reads oldAppointment.date and newAppointment.date with NO guard (:246-251) — an event missing either throws and is logged as a generic failure. The contract below catches that case by name instead.",
+    "description": "enhanced-event-handler.ts:235-283. The source reads oldAppointment.date and newAppointment.date with NO guard (:246-251) — an event missing either throws and is logged as a generic failure. The contract below catches that case by name instead. Three callers have spelled these fields three ways: this contract's names, the deleted source's nested appointmentDetails/oldAppointment, and scheduling-service's startTime/oldStartTime — which is the only one sending these events today. contextMapping accepts all three rather than picking one and breaking the others.",
     "priority": 10,
     "approvalPolicyKey": "system.transactional",
-    "contentSource": { "kind": "template", "templateKey": "medspa.appointment-rescheduling.email" },
+    "contentSource": {
+      "kind": "template",
+      "templateKey": "medspa.appointment-rescheduling.email"
+    },
     "channelPlan": [
-      { "channel": "email", "templateKey": "medspa.appointment-rescheduling.email" },
-      { "channel": "sms", "templateKey": "medspa.appointment-rescheduling.sms" }
+      {
+        "channel": "email",
+        "templateKey": "medspa.appointment-rescheduling.email"
+      },
+      {
+        "channel": "sms",
+        "templateKey": "medspa.appointment-rescheduling.sms"
+      }
     ],
     "dataContract": {
       "type": "object",
-      "required": ["oldDate", "newDate"],
+      "required": [
+        "oldDate",
+        "newDate"
+      ],
       "properties": {
-        "oldDate": { "type": "string" },
-        "oldTime": { "type": "string" },
-        "newDate": { "type": "string" },
-        "newTime": { "type": "string" },
-        "location": { "type": "string" },
-        "provider": { "type": "string" }
+        "oldDate": {
+          "type": "string"
+        },
+        "oldTime": {
+          "type": "string"
+        },
+        "newDate": {
+          "type": "string"
+        },
+        "newTime": {
+          "type": "string"
+        },
+        "location": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        }
       }
+    },
+    "contextMapping": {
+      "oldDate": [
+        "oldDate",
+        "oldAppointment.date",
+        "oldStartTime"
+      ],
+      "oldTime": [
+        "oldTime",
+        "oldAppointment.time",
+        "oldStartTime"
+      ],
+      "newDate": [
+        "newDate",
+        "newAppointment.date",
+        "newStartTime"
+      ],
+      "newTime": [
+        "newTime",
+        "newAppointment.time",
+        "newStartTime"
+      ],
+      "location": [
+        "location",
+        "appointmentDetails.location"
+      ],
+      "provider": [
+        "provider",
+        "appointmentDetails.provider",
+        "providerId"
+      ]
     },
     "triggers": [
       {
         "type": "event",
         "eventType": "APPOINTMENT_RESCHEDULING",
-        "eventTypeAliases": ["APPOINTMENT_RESCHEDULED"]
+        "eventTypeAliases": [
+          "APPOINTMENT_RESCHEDULED"
+        ]
       }
     ]
   }

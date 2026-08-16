@@ -75,6 +75,18 @@ export const playbooks = pgTable(
     priority: integer('priority').notNull().default(100),
     /** JSON Schema for caller-supplied context, generated from Zod (§0.9). */
     dataContract: jsonb('data_contract').notNull().default(sql`'{}'::jsonb`),
+    /**
+     * Target contract field → candidate source paths, tried in order. Lets a
+     * pack accept a caller's field names without renaming its contract; see
+     * `engine/playbooks/context-mapping.ts`. Added in 0016.
+     */
+    contextMapping: jsonb('context_mapping').notNull().default(sql`'{}'::jsonb`),
+    /**
+     * `[{when: <predicate>, priority: 'URGENT'}]` — raise a run's priority when
+     * the context says so. The medspa system alert documented a CRITICAL →
+     * URGENT escalation that nothing implemented. Added in 0016.
+     */
+    priorityRules: jsonb('priority_rules').notNull().default(sql`'[]'::jsonb`),
     /** {kind:'template',templateKey} | {kind:'ai',promptPackKey} | {kind:'hybrid',...} */
     contentSource: jsonb('content_source').notNull().default(sql`'{}'::jsonb`),
     /** [{channel, priority, fallbackAfterMs}] — replaces the dispatch switch. */

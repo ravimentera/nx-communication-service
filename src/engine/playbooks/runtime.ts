@@ -56,8 +56,16 @@ import type { Dispatcher } from '../delivery/dispatcher.js';
 import type { PreferenceService } from '../compliance/preference.service.js';
 import type { RecipientService } from '../recipients/recipient.service.js';
 import type { PackRegistry } from '../../packs/loader.js';
-import { readPath, type MatchedPlaybook, type Playbook, type PlaybookMatcher } from './matcher.js';
+import {
+  evaluatePredicate,
+  readPath,
+  type MatchedPlaybook,
+  type Playbook,
+  type Predicate,
+  type PlaybookMatcher,
+} from './matcher.js';
 import type { OutreachTrigger, PlaybookRunResult } from './trigger.js';
+import { applyContextMapping, type ContextMapping } from './context-mapping.js';
 import { validateContract, type DataContract } from './contract.js';
 
 export const playbookRunsTotal = new promClient.Counter({
@@ -207,8 +215,17 @@ export class PlaybookRuntime {
 
       // ── 3. data contract ──────────────────────────────────────────────────
       // Before anything expensive: no LLM call, no template lookup, no send.
+      //
+      // The mapping runs first, and only fills fields the caller did not send.
+      // It is how a pack accepts `startTime` for a contract that asks for
+      // `appointmentDate` without renaming the contract and breaking the other
+      // two callers that spell it differently again.
       const contract = playbook.dataContract as DataContract | null;
-      const validation = validateContract(contract, context);
+      const mapped = applyContextMapping(
+        playbook.contextMapping as ContextMapping | null,
+        context,
+      );
+      const validation = validateContract(contract, mapped);
       if (!validation.ok) {
         return finish({
           status: 'FAILED',
@@ -441,7 +458,14 @@ export class PlaybookRuntime {
     },
   ): Promise<{ status: PlaybookRunResult['status']; messageId?: string; approvalId?: string }> {
     const channel = toChannelType(target.entry.channel) as ChannelType;
-    const priority = trigger.priority ?? target.entry.priority ?? 'MEDIUM';
+    // The caller's explicit priority wins; then the playbook's own rules, which
+    // are how `medspa.system-alert` gets its documented CRITICAL → URGENT
+    // escalation; then the channel entry's default.
+    const priority =
+      trigger.priority ??
+      this.escalatedPriority(playbook, input.context) ??
+      target.entry.priority ??
+      'MEDIUM';
 
     const renderContext = this.buildContext(input.base, playbook, channel, input);
     const source = (playbook.contentSource ?? {}) as ContentSource;
@@ -526,6 +550,29 @@ export class PlaybookRuntime {
     });
 
     return { status: dispatchStatus(dispatched), messageId: dispatched.messageId };
+  }
+
+  /**
+   * The first matching `priority_rules` entry, or undefined.
+   *
+   * Evaluated against the validated context with the trigger predicate's seven
+   * operators — not a second expression dialect. First match wins, so a pack
+   * orders its own rules rather than the engine guessing which is more specific.
+   */
+  private escalatedPriority(
+    playbook: Playbook,
+    context: Record<string, unknown>,
+  ): Priority | undefined {
+    const rules = (playbook.priorityRules ?? []) as {
+      when?: Predicate;
+      priority: Priority;
+    }[];
+    if (!Array.isArray(rules) || rules.length === 0) return undefined;
+
+    for (const rule of rules) {
+      if (evaluatePredicate(rule.when, context, this.deps.logger)) return rule.priority;
+    }
+    return undefined;
   }
 
   /** template · ai · hybrid. */

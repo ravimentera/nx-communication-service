@@ -55,7 +55,13 @@ let pool: ReturnType<typeof createDb>['pool'];
 let db: Db;
 let runtime: PlaybookRuntime;
 let registry: PlaybookRegistry;
-let sent: { channel: string; to: string; body: string; messageId: string }[] = [];
+let sent: {
+  channel: string;
+  to: string;
+  body: string;
+  messageId: string;
+  priority: string;
+}[] = [];
 
 const packs = loadPacks(join(process.cwd(), 'packs'), logger);
 
@@ -80,6 +86,7 @@ const queue: NotificationQueue = {
       to: job.to.value,
       body: job.rendered.body,
       messageId: job.messageId,
+      priority: job.priority,
     });
     return { queued: true, jobId: `job-${sent.length}` };
   },
@@ -443,6 +450,136 @@ describe('an APPOINTMENT_REMINDER, end to end', () => {
     expect(sent).toHaveLength(1);
     const opened = await db.select().from(approvals).where(eq(approvals.tenantId, TENANT));
     expect(opened).toHaveLength(0);
+  });
+});
+
+/**
+ * The shapes real callers actually send.
+ *
+ * Three of them exist and none agreed with the contract. `scheduling-service`
+ * — the only service posting these events, repointed in P10 — sends
+ * `startTime` / `oldStartTime` / `newStartTime`
+ * (`notification.service.ts:86,112,148,175`). The deleted source read a nested
+ * `appointmentDetails.date` / `oldAppointment.date`. The contract asks for
+ * `appointmentDate` / `oldDate` / `newDate`.
+ *
+ * Before `contextMapping`, every appointment event from the live caller failed
+ * its contract on arrival: a FAILED run, no message, no reminder. Renaming the
+ * contract would have picked one caller and broken the other two.
+ */
+describe('the field names a caller actually sends', () => {
+  it('accepts scheduling-service’s startTime for a contract that asks for appointmentDate', async () => {
+    const recipient = await makeRecipient([{ type: 'sms', value: '+15551234567' }]);
+
+    const results = await runtime.run(
+      trigger({
+        recipientId: recipient.id,
+        channels: ['sms'],
+        // Verbatim from notification.service.ts:112.
+        payload: {
+          context: { startTime: 'Tuesday 9 March, 09:00', type: 'consultation', location: 'Suite 2' },
+        },
+      }),
+    );
+
+    expect(results[0]).toMatchObject({
+      playbookKey: 'medspa.appointment-reminder',
+      status: 'QUEUED',
+    });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.body).toContain('Tuesday 9 March');
+  });
+
+  it('still prefers the contract’s own name when the caller sends it', async () => {
+    const recipient = await makeRecipient([{ type: 'sms', value: '+15551234567' }]);
+
+    await runtime.run(
+      trigger({
+        recipientId: recipient.id,
+        channels: ['sms'],
+        // Both spellings. The explicit one wins — a mapping fills gaps, it does
+        // not override what the caller actually said.
+        payload: {
+          context: { appointmentDate: 'Wednesday', startTime: 'Tuesday' },
+        },
+      }),
+    );
+
+    expect(sent[0]!.body).toContain('Wednesday');
+    expect(sent[0]!.body).not.toContain('Tuesday');
+  });
+
+  it('accepts the source’s nested appointmentDetails shape too', async () => {
+    const recipient = await makeRecipient([{ type: 'sms', value: '+15551234567' }]);
+
+    await runtime.run(
+      trigger({
+        recipientId: recipient.id,
+        channels: ['sms'],
+        payload: { context: { appointmentDetails: { date: 'Friday', location: 'Suite 1' } } },
+      }),
+    );
+
+    expect(sent[0]!.body).toContain('Friday');
+  });
+
+  it('maps the rescheduling pair, which the source read with no guard at all', async () => {
+    const recipient = await makeRecipient([{ type: 'email', value: 'ada@example.test' }]);
+
+    const results = await runtime.run(
+      trigger({
+        eventType: 'APPOINTMENT_RESCHEDULING',
+        recipientId: recipient.id,
+        channels: ['email'],
+        // notification.service.ts:175.
+        payload: {
+          context: {
+            oldStartTime: 'Monday 10:00',
+            newStartTime: 'Thursday 14:00',
+            newEndTime: 'Thursday 15:00',
+            type: 'follow-up',
+            location: 'Suite 2',
+          },
+        },
+      }),
+    );
+
+    expect(results[0]).toMatchObject({
+      playbookKey: 'medspa.appointment-rescheduling',
+      status: 'QUEUED',
+    });
+    expect(sent[0]!.body).toContain('Monday 10:00');
+    expect(sent[0]!.body).toContain('Thursday 14:00');
+  });
+});
+
+describe('priority rules', () => {
+  /**
+   * `medspa.system-alert` documented "URGENT when severity is CRITICAL" — the
+   * source applied it at :716 — and nothing implemented it, so a critical alert
+   * queued at MEDIUM behind every appointment reminder.
+   */
+  it('escalates a CRITICAL system alert to URGENT', async () => {
+    await runtime.run(
+      trigger({
+        eventType: 'SYSTEM_ALERT',
+        payload: { context: { message: 'disk full', severity: 'CRITICAL' } },
+      }),
+    );
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.priority).toBe('URGENT');
+  });
+
+  it('leaves a non-critical one at the default', async () => {
+    await runtime.run(
+      trigger({
+        eventType: 'SYSTEM_ALERT',
+        payload: { context: { message: 'nightly backup done', severity: 'INFO' } },
+      }),
+    );
+
+    expect(sent[0]!.priority).toBe('MEDIUM');
   });
 });
 

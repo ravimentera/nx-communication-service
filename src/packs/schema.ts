@@ -121,6 +121,28 @@ export const playbookDefinitionSchema = z
     isActive: z.boolean().optional(),
     priority: z.number().int().optional(),
     dataContract: dataContractSchema.optional(),
+    /**
+     * Accept a caller's spelling of a contract field without renaming the
+     * contract. Values are dotted paths into the event context, tried in order;
+     * put the contract's own field name first so a correct payload is untouched.
+     * Deliberately name-to-name only — no transforms (D107).
+     */
+    contextMapping: z.record(z.string(), z.array(z.string().min(1)).min(1)).optional(),
+    /**
+     * Raise the priority of a run when the context matches. The same bounded
+     * predicate the trigger's `where` uses, evaluated against the event
+     * context — deliberately not an expression language.
+     */
+    priorityRules: z
+      .array(
+        z
+          .object({
+            when: predicateSchema,
+            priority: z.enum(['LOW', 'MEDIUM', 'HIGH', 'URGENT']),
+          })
+          .strict(),
+      )
+      .optional(),
     contentSource: contentSourceSchema,
     channelPlan: z.array(channelPlanEntrySchema).min(1),
     /** Resolved to an id at install. Missing policy ⇒ install fails loudly. */

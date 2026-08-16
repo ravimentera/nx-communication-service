@@ -2,55 +2,101 @@
   {
     "key": "medspa.staff-alert",
     "name": "Staff alert",
-    "description": "enhanced-event-handler.ts:440-479. The recipient is STAFF — this is the case that requires messages.recipient_id to be nullable. The Slack channel 'staff-alerts' was hardcoded at :448.",
+    "description": "enhanced-event-handler.ts:440-479. The recipient is STAFF — this is the case that requires messages.recipient_id to be nullable. The Slack channel 'staff-alerts' was hardcoded at :448. The email channel addresses $config.staffEmails: this playbook has no recipient at all, so an entry resolving its address from a recipient's contact points could never fire. Deliberately NOT in requiredConfig — a tenant that configures no staff mailbox gets the Slack alert and one error log per skipped channel, which is the runtime's documented behaviour for an unset $config reference, rather than an install that refuses.",
     "priority": 10,
     "approvalPolicyKey": "system.transactional",
-    "contentSource": { "kind": "template", "templateKey": "medspa.staff-alert.email" },
+    "contentSource": {
+      "kind": "template",
+      "templateKey": "medspa.staff-alert.email"
+    },
     "channelPlan": [
-      { "channel": "slack", "templateKey": "medspa.staff-alert.slack", "fixedTarget": "$config.slackChannels.staffAlerts" },
-      { "channel": "email", "templateKey": "medspa.staff-alert.email", "contactPointType": "email" }
+      {
+        "channel": "slack",
+        "templateKey": "medspa.staff-alert.slack",
+        "fixedTarget": "$config.slackChannels.staffAlerts"
+      },
+      {
+        "channel": "email",
+        "templateKey": "medspa.staff-alert.email",
+        "fixedTarget": "$config.staffEmails"
+      }
     ],
     "dataContract": {
       "type": "object",
-      "required": ["message"],
+      "required": [
+        "message"
+      ],
       "properties": {
-        "message": { "type": "string" },
-        "urgency": { "type": "string", "default": "NORMAL" }
+        "message": {
+          "type": "string"
+        },
+        "urgency": {
+          "type": "string",
+          "default": "NORMAL"
+        }
       }
     },
-    "triggers": [{ "type": "event", "eventType": "STAFF_ALERT" }]
+    "triggers": [
+      {
+        "type": "event",
+        "eventType": "STAFF_ALERT"
+      }
+    ]
   },
-
   {
     "key": "medspa.shift-reminder",
     "name": "Shift reminder",
     "description": "enhanced-event-handler.ts:481-526. Staff-directed. The one case where the SMS carries the same variables as the email.",
     "priority": 20,
     "approvalPolicyKey": "system.transactional",
-    "contentSource": { "kind": "template", "templateKey": "medspa.shift-reminder.email" },
+    "contentSource": {
+      "kind": "template",
+      "templateKey": "medspa.shift-reminder.email"
+    },
     "channelPlan": [
-      { "channel": "email", "templateKey": "medspa.shift-reminder.email" },
-      { "channel": "sms", "templateKey": "medspa.shift-reminder.sms" }
+      {
+        "channel": "email",
+        "templateKey": "medspa.shift-reminder.email"
+      },
+      {
+        "channel": "sms",
+        "templateKey": "medspa.shift-reminder.sms"
+      }
     ],
     "dataContract": {
       "type": "object",
-      "required": ["shiftDate"],
+      "required": [
+        "shiftDate"
+      ],
       "properties": {
-        "shiftDate": { "type": "string" },
-        "shiftTime": { "type": "string" },
-        "location": { "type": "string" }
+        "shiftDate": {
+          "type": "string"
+        },
+        "shiftTime": {
+          "type": "string"
+        },
+        "location": {
+          "type": "string"
+        }
       }
     },
-    "triggers": [{ "type": "event", "eventType": "SHIFT_REMINDER" }]
+    "triggers": [
+      {
+        "type": "event",
+        "eventType": "SHIFT_REMINDER"
+      }
+    ]
   },
-
   {
     "key": "medspa.emergency-notification",
     "name": "Emergency notification",
     "description": "enhanced-event-handler.ts:528-564. TWO literals removed: the Slack channel 'emergency-alerts' (:536) and to: 'emergency-team@medspa.com' (:549). Both are now tenant config. Priority is URGENT on both channels regardless of what the event asked for (:541, :558).",
     "priority": 1,
     "approvalPolicyKey": "system.transactional",
-    "contentSource": { "kind": "template", "templateKey": "medspa.emergency-alert.email" },
+    "contentSource": {
+      "kind": "template",
+      "templateKey": "medspa.emergency-alert.email"
+    },
     "channelPlan": [
       {
         "channel": "slack",
@@ -67,26 +113,45 @@
     ],
     "dataContract": {
       "type": "object",
-      "required": ["message"],
+      "required": [
+        "message"
+      ],
       "properties": {
-        "message": { "type": "string" },
-        "affectedAreas": { "type": ["array", "string"], "default": [] }
+        "message": {
+          "type": "string"
+        },
+        "affectedAreas": {
+          "type": [
+            "array",
+            "string"
+          ],
+          "default": []
+        }
       }
     },
-    "triggers": [{ "type": "event", "eventType": "EMERGENCY_NOTIFICATION" }],
+    "triggers": [
+      {
+        "type": "event",
+        "eventType": "EMERGENCY_NOTIFICATION"
+      }
+    ],
     "metadata": {
-      "alwaysSendChannels": ["slack"],
+      "alwaysSendChannels": [
+        "slack"
+      ],
       "$comment": "The source posts the Slack alert UNCONDITIONALLY, outside any event.channels check (:533). `alwaysSendChannels` exempts it from the trigger's channel intersection — an emergency a caller could silence by omitting a channel would be a bad design."
     }
   },
-
   {
     "key": "medspa.system-alert",
     "name": "System alert",
-    "description": "enhanced-event-handler.ts:703-722. Slack only. The channel 'system-alerts' was hardcoded at :711, and priority is URGENT when severity is CRITICAL (:716).",
+    "description": "enhanced-event-handler.ts:703-722. Slack only. The channel 'system-alerts' was hardcoded at :711, and priority is URGENT when severity is CRITICAL (:716). The CRITICAL -> URGENT escalation the source applied at :716 is the priorityRules entry below; it was described here and implemented nowhere, so a critical system alert queued at MEDIUM behind everything else.",
     "priority": 1,
     "approvalPolicyKey": "system.transactional",
-    "contentSource": { "kind": "template", "templateKey": "medspa.system-alert.slack" },
+    "contentSource": {
+      "kind": "template",
+      "templateKey": "medspa.system-alert.slack"
+    },
     "channelPlan": [
       {
         "channel": "slack",
@@ -96,73 +161,159 @@
     ],
     "dataContract": {
       "type": "object",
-      "required": ["message"],
+      "required": [
+        "message"
+      ],
       "properties": {
-        "message": { "type": "string" },
-        "systemComponent": { "type": "string", "default": "system" },
-        "severity": { "type": "string", "default": "INFO" }
+        "message": {
+          "type": "string"
+        },
+        "systemComponent": {
+          "type": "string",
+          "default": "system"
+        },
+        "severity": {
+          "type": "string",
+          "default": "INFO"
+        }
       }
     },
-    "triggers": [{ "type": "event", "eventType": "SYSTEM_ALERT" }]
+    "triggers": [
+      {
+        "type": "event",
+        "eventType": "SYSTEM_ALERT"
+      }
+    ],
+    "priorityRules": [
+      {
+        "when": {
+          "severity": {
+            "eq": "CRITICAL"
+          }
+        },
+        "priority": "URGENT"
+      }
+    ]
   },
-
   {
     "key": "medspa.general-notification",
     "name": "General notification",
     "description": "enhanced-event-handler.ts:648-671. Addressed to recipientEmail, not patientEmail — the generic escape hatch.",
     "priority": 90,
     "approvalPolicyKey": "system.transactional",
-    "contentSource": { "kind": "template", "templateKey": "medspa.general-notification.email" },
-    "channelPlan": [{ "channel": "email" }],
+    "contentSource": {
+      "kind": "template",
+      "templateKey": "medspa.general-notification.email"
+    },
+    "channelPlan": [
+      {
+        "channel": "email"
+      }
+    ],
     "dataContract": {
       "type": "object",
-      "required": ["subject", "message"],
+      "required": [
+        "subject",
+        "message"
+      ],
       "properties": {
-        "subject": { "type": "string" },
-        "message": { "type": "string" }
+        "subject": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
       }
     },
-    "triggers": [{ "type": "event", "eventType": "GENERAL_NOTIFICATION" }]
+    "triggers": [
+      {
+        "type": "event",
+        "eventType": "GENERAL_NOTIFICATION"
+      }
+    ]
   },
-
   {
     "key": "medspa.marketing-campaign",
     "name": "Marketing campaign",
     "description": "enhanced-event-handler.ts:673-701. The one case whose template id comes from the EVENT (`template`), not from a literal, and which fans out over a recipients[] array. That fan-out is the campaign orchestrator's job — P11 owns it, and this playbook covers the single-recipient path only.",
     "priority": 80,
     "approvalPolicyKey": "system.transactional",
-    "contentSource": { "kind": "template", "templateKey": "medspa.general-notification.email" },
-    "channelPlan": [{ "channel": "email" }],
+    "contentSource": {
+      "kind": "template",
+      "templateKey": "medspa.general-notification.email"
+    },
+    "channelPlan": [
+      {
+        "channel": "email"
+      }
+    ],
     "dataContract": {
       "type": "object",
-      "required": ["subject", "message"],
+      "required": [
+        "subject",
+        "message"
+      ],
       "properties": {
-        "subject": { "type": "string" },
-        "message": { "type": "string" },
-        "campaignName": { "type": "string" }
+        "subject": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "campaignName": {
+          "type": "string"
+        }
       }
     },
-    "throttle": { "maxPerRecipientPerDay": 1 },
-    "triggers": [{ "type": "event", "eventType": "MARKETING_CAMPAIGN" }]
+    "throttle": {
+      "maxPerRecipientPerDay": 1
+    },
+    "triggers": [
+      {
+        "type": "event",
+        "eventType": "MARKETING_CAMPAIGN"
+      }
+    ]
   },
-
   {
     "key": "system.approval-escalation",
     "name": "Approval escalation",
     "description": "P6's SLA sweeper notifies the fallback approver through the engine itself, rather than down a private side channel. Not from the source — this is the engine self-hosting, and it is the proof the abstraction holds.",
     "priority": 1,
     "approvalPolicyKey": "system.transactional",
-    "contentSource": { "kind": "template", "templateKey": "system.approval-escalation.email" },
-    "channelPlan": [{ "channel": "email" }],
+    "contentSource": {
+      "kind": "template",
+      "templateKey": "system.approval-escalation.email"
+    },
+    "channelPlan": [
+      {
+        "channel": "email"
+      }
+    ],
     "dataContract": {
       "type": "object",
-      "required": ["approvalId"],
+      "required": [
+        "approvalId"
+      ],
       "properties": {
-        "approvalId": { "type": "string" },
-        "originalApproverRef": { "type": "string", "default": "an unassigned queue" },
-        "waitedHours": { "type": "number", "default": 0 }
+        "approvalId": {
+          "type": "string"
+        },
+        "originalApproverRef": {
+          "type": "string",
+          "default": "an unassigned queue"
+        },
+        "waitedHours": {
+          "type": "number",
+          "default": 0
+        }
       }
     },
-    "triggers": [{ "type": "event", "eventType": "APPROVAL_ESCALATION" }]
+    "triggers": [
+      {
+        "type": "event",
+        "eventType": "APPROVAL_ESCALATION"
+      }
+    ]
   }
 ]
