@@ -68,6 +68,20 @@ const envSchema = z.object({
   EVENT_PROCESSING_CONCURRENCY: int(3),
   NOTIFICATION_CONCURRENCY: int(5),
   MAX_CONCURRENCY: int(10),
+  /**
+   * The worker's throughput cap: `SEND_MAX_PER_INTERVAL` jobs started per
+   * `SEND_LIMITER_INTERVAL_MS`.
+   *
+   * Without it one tenant's 50,000-recipient campaign fills the queue and every
+   * other tenant's appointment reminder waits behind it. It also keeps the
+   * service inside Twilio's and SendGrid's own rate limits, which is where an
+   * uncapped burst turns into retries that make the burst worse.
+   *
+   * 100/second is well above any real steady-state volume here and well below
+   * the providers' limits.
+   */
+  SEND_MAX_PER_INTERVAL: int(100),
+  SEND_LIMITER_INTERVAL_MS: int(1_000),
   RETRY_LIMIT: int(5),
   URGENT_RETRY_LIMIT: int(10),
 
@@ -169,6 +183,28 @@ const envSchema = z.object({
    * an internet-exposed one stops leaking; `*` restores the old behaviour for
    * a deployment whose network perimeter already handles it.
    */
+  /**
+   * How many reverse proxies sit in front of this service.
+   *
+   * Express `trust proxy` as a hop count rather than `true`: believing the
+   * whole `X-Forwarded-For` chain lets any client prepend an address and defeat
+   * every per-IP limit. 1 is a single load balancer, which is the deployment
+   * this has; 0 disables the header entirely for a direct-to-pod setup.
+   */
+  /**
+   * Origins allowed to call this service from a browser. Comma-separated, or
+   * `*` for the old wide-open behaviour.
+   *
+   * `app.use(cors())` with no argument reflects any origin and was shipped that
+   * way. Every route here is behind gateway auth, so this is defence in depth
+   * rather than the only control — but the default should not be "any website
+   * may make credentialed cross-origin calls to the outreach engine".
+   *
+   * Empty (the default) disables CORS headers entirely, which is right for a
+   * service reached only through the gateway and never from a browser.
+   */
+  CORS_ALLOWED_ORIGINS: str(''),
+  TRUST_PROXY_HOPS: int(1),
   METRICS_ALLOWED_IPS: str('127.0.0.1,::1'),
   ENFORCE_QUIET_HOURS: bool(true),
   RETENTION_DRY_RUN: bool(true),
@@ -191,6 +227,10 @@ function shape(env: Env) {
       port: env.PORT,
       host: env.HOST,
       env: env.NODE_ENV,
+      trustProxyHops: env.TRUST_PROXY_HOPS,
+      corsAllowedOrigins: env.CORS_ALLOWED_ORIGINS.split(',')
+        .map((v) => v.trim())
+        .filter(Boolean),
       isProduction: env.NODE_ENV === 'production',
     },
     db: {
@@ -217,6 +257,8 @@ function shape(env: Env) {
       eventQueueName: env.EVENT_QUEUE_NAME,
       eventConcurrency: env.EVENT_PROCESSING_CONCURRENCY,
       notificationConcurrency: env.NOTIFICATION_CONCURRENCY,
+      sendMaxPerInterval: env.SEND_MAX_PER_INTERVAL,
+      sendLimiterIntervalMs: env.SEND_LIMITER_INTERVAL_MS,
       maxConcurrency: env.MAX_CONCURRENCY,
       defaultAttempts: env.RETRY_LIMIT,
       urgentAttempts: env.URGENT_RETRY_LIMIT,

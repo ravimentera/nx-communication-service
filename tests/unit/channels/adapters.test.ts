@@ -135,13 +135,24 @@ describe('missing credentials fail permanently, not on a retry loop', () => {
     expect(result.error).toMatchObject({ code: 'MISSING_BOT_TOKEN', retryable: false });
   });
 
-  it('push without an FCM key', async () => {
+  /**
+   * The adapter targets the FCM legacy API, decommissioned in 2024, and
+   * `fcmApiKey` has no entry in the config schema, no credential mapper and no
+   * caller in the composition root — so there is no supported way to configure
+   * it at all. It used to answer `MISSING_FCM_KEY`, which reads like something
+   * an operator can fix.
+   *
+   * Every other test of this adapter asserts the dry-run path, which is why
+   * none of that showed.
+   */
+  it('push says it is not implemented, rather than asking for a key nobody can supply', async () => {
     const result = await new PushChannel(live).send(
       sms,
       { type: 'push', value: 'tok' },
       creds({}),
     );
-    expect(result.error).toMatchObject({ code: 'MISSING_FCM_KEY', retryable: false });
+    expect(result.error).toMatchObject({ code: 'PUSH_NOT_IMPLEMENTED', retryable: false });
+    expect(result.error?.message).toMatch(/FCM v1/);
   });
 });
 

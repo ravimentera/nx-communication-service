@@ -273,7 +273,13 @@ describe('retry policy is preserved from the source', () => {
 
     const job = await queue['queue'].getJob(enqueued.jobId!);
     expect(job!.opts.attempts).toBe(10);
-    expect(job!.opts.backoff).toEqual({ type: 'fixed', delay: 50 });
+    // `custom`, with the flat-vs-exponential decision moved into the worker's
+    // `backoffStrategy` so it can add jitter. An outage fails every in-flight
+    // job at once, and a deterministic delay then retries all of them at the
+    // same instant — a herd that keeps the provider down and burns every
+    // attempt in lockstep. URGENT still gets a FLAT base, which is what the
+    // `fixed` here used to say.
+    expect(job!.opts.backoff).toEqual({ type: 'custom', delay: 50 });
     expect(job!.opts.priority).toBe(1);
   }, 30_000);
 
@@ -290,7 +296,7 @@ describe('retry policy is preserved from the source', () => {
 
     const job = await queue['queue'].getJob(enqueued.jobId!);
     expect(job!.opts.attempts).toBe(5);
-    expect(job!.opts.backoff).toEqual({ type: 'exponential', delay: 50 });
+    expect(job!.opts.backoff).toEqual({ type: 'custom', delay: 50 });
     expect(job!.opts.priority).toBe(3);
   }, 30_000);
 

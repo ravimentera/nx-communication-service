@@ -34,6 +34,8 @@
 import { Router, type NextFunction, type Request, type Response } from 'express';
 import { z } from 'zod';
 
+import { isValidTimezone, TIMEZONE_ERROR } from '../../domain/timezone.js';
+
 import type { AudienceService, ImportRow } from '../../engine/campaigns/audience.service.js';
 import { CONSENT_SOURCES } from '../../engine/compliance/consent.service.js';
 import type { CampaignOrchestrator } from '../../engine/campaigns/orchestrator.js';
@@ -68,7 +70,7 @@ const importRowSchema = z.object({
   firstName: z.string().optional(),
   lastName: z.string().optional(),
   locale: z.string().optional(),
-  timezone: z.string().optional(),
+  timezone: z.string().refine(isValidTimezone, TIMEZONE_ERROR).optional(),
   attributes: z.record(z.string(), z.unknown()).optional(),
 });
 

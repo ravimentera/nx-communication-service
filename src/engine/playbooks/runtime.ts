@@ -280,6 +280,7 @@ export class PlaybookRuntime {
       const approvalIds: string[] = [];
       const statuses: PlaybookRunResult['status'][] = [];
       const failures: string[] = [];
+      let deferredUntil: Date | undefined;
 
       // ── PER CHANNEL, ISOLATED ─────────────────────────────────────────────
       //
@@ -302,6 +303,14 @@ export class PlaybookRuntime {
           });
           if (outcome.messageId) messageIds.push(outcome.messageId);
           if (outcome.approvalId) approvalIds.push(outcome.approvalId);
+          if (outcome.deferredUntil) {
+            // The soonest, so a caller waiting on the whole run knows when the
+            // first channel is due back rather than the last.
+            deferredUntil =
+              !deferredUntil || outcome.deferredUntil < deferredUntil
+                ? outcome.deferredUntil
+                : deferredUntil;
+          }
           statuses.push(outcome.status);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -328,6 +337,7 @@ export class PlaybookRuntime {
         status,
         messageIds,
         approvalIds,
+        ...(deferredUntil ? { deferredUntil } : {}),
         // A rolled-up status always carries a reason now. SUPPRESSED and
         // SKIPPED used to leave it null, so `playbook_runs.error` was empty for
         // exactly the runs somebody was asking "why did nothing arrive?" about.
@@ -514,7 +524,12 @@ export class PlaybookRuntime {
       eventId: string;
       base: RenderContext;
     },
-  ): Promise<{ status: PlaybookRunResult['status']; messageId?: string; approvalId?: string }> {
+  ): Promise<{
+    status: PlaybookRunResult['status'];
+    messageId?: string;
+    approvalId?: string;
+    deferredUntil?: Date;
+  }> {
     const channel = toChannelType(target.entry.channel) as ChannelType;
     // The caller's explicit priority wins; then the playbook's own rules, which
     // are how `medspa.system-alert` gets its documented CRITICAL → URGENT
@@ -588,6 +603,7 @@ export class PlaybookRuntime {
             : 'PENDING_APPROVAL',
         messageId: submitted.approval.messageId,
         approvalId: submitted.approval.id,
+        ...(submitted.dispatch?.retryAt ? { deferredUntil: submitted.dispatch.retryAt } : {}),
       };
     }
 
@@ -607,7 +623,11 @@ export class PlaybookRuntime {
       throttle,
     });
 
-    return { status: dispatchStatus(dispatched), messageId: dispatched.messageId };
+    return {
+      status: dispatchStatus(dispatched),
+      messageId: dispatched.messageId,
+      ...(dispatched.retryAt ? { deferredUntil: dispatched.retryAt } : {}),
+    };
   }
 
   /**

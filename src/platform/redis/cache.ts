@@ -10,6 +10,8 @@
  *  - Every method is failure-tolerant: a cache miss and a cache error are the
  *    same thing to a caller. A cache must never be able to fail a request.
  */
+import { createHash } from 'node:crypto';
+
 import type { Logger } from 'winston';
 
 import type { KeyValueStore, RedisHandle } from './client.js';
@@ -28,8 +30,24 @@ export class Cache {
     this.prefix = handle.keyPrefix;
   }
 
+  /**
+   * A cache key, with the variable part hashed.
+   *
+   * The id is interpolated between `:` separators, and callers compose ids from
+   * several values the same way — `config:agent` uses `${tenantId}:${senderId}`.
+   * A tenant id containing a colon therefore aliases onto a different pair:
+   * `('a:b', 'c')` and `('a', 'b:c')` produce the same string. Tenant ids come
+   * from an upstream system and nothing here constrains their characters.
+   *
+   * Hashing removes the question. It also bounds the key length, which matters
+   * for the agent keys that concatenate two ids.
+   *
+   * The namespace stays in the clear so `KEYS outreach:config:tenant:*` still
+   * works for an operator.
+   */
   key(namespace: string, id: string): string {
-    return `${this.prefix}${namespace}:${id}`;
+    const digest = createHash('sha256').update(id).digest('hex').slice(0, 32);
+    return `${this.prefix}${namespace}:${digest}`;
   }
 
   async get<T>(key: string): Promise<T | null> {

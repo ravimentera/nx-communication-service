@@ -55,7 +55,18 @@ describe('Cache', () => {
   it('namespaces keys with the configured prefix', async () => {
     const redis = await createRedis({ ...base, skip: true }, logger);
     const cache = new Cache(redis, logger);
-    expect(cache.key('recipient', 'r1')).toBe('outreach:recipient:r1');
+    // The namespace stays in the clear so `KEYS outreach:recipient:*` still
+    // works for an operator; the id is hashed because callers compose ids from
+    // several values with `:` separators, and a tenant id containing a colon
+    // would otherwise alias onto a different pair.
+    const key = cache.key('recipient', 'r1');
+    expect(key).toMatch(/^outreach:recipient:[0-9a-f]{32}$/);
+    expect(cache.key('recipient', 'r1')).toBe(key);
+    expect(cache.key('recipient', 'r2')).not.toBe(key);
+
+    // The collision this closes: ('a:b','c') and ('a','b:c') used to produce
+    // the same string.
+    expect(cache.key('config', 'a:b:c')).not.toBe(cache.key('config:a', 'b:c'));
   });
 
   it('round-trips JSON', async () => {

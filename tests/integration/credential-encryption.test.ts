@@ -188,10 +188,20 @@ describe('ChannelConfigService with a cipher', () => {
 
   it('keeps cleartext out of the cache', async () => {
     await configs.getTenantConfig('sealed-tenant');
-    const cached = await redis.store.get('test:config:tenant:sealed-tenant');
-    expect(cached).toBeTruthy();
-    expect(cached).not.toContain('twilio-secret');
-    expect(cached).not.toContain('SG.sealed');
+
+    // The key is hashed now — callers compose ids with `:` separators, so a
+    // tenant id containing one used to alias onto a different pair. Scan for
+    // the namespace rather than reconstructing the digest, which would just
+    // restate the implementation.
+    const keys = await redis.store.keys('test:config:tenant:*');
+    expect(keys.length).toBeGreaterThan(0);
+
+    const cached = await Promise.all(keys.map((key) => redis.store.get(key)));
+    expect(cached.some(Boolean)).toBe(true);
+    for (const value of cached) {
+      expect(value ?? '').not.toContain('twilio-secret');
+      expect(value ?? '').not.toContain('SG.sealed');
+    }
   });
 
   it('still reads a row that was written before encryption was turned on', async () => {

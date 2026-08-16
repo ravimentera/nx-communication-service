@@ -924,8 +924,9 @@ export class ApprovalService {
 
     // Compliance said no, permanently. The approval is cancelled rather than
     // left looking approved-and-pending forever, and the audit trail records
-    // why. Deferrals are left alone: `retryAt` means later, not never, and P7's
-    // scheduler picks them back up.
+    // why. Deferrals are left alone: `retryAt` means later, not never, and
+    // `DeferralWorker` re-dispatches them (D90) — which it genuinely does now.
+    // This said "P7's scheduler" for six phases while no such thing existed.
     if (!dispatch.queued && dispatch.skipped && !dispatch.deferrable) {
       const cancelled = await this.move(this.scopeOf(approval), approval, {
         to: 'CANCELLED',

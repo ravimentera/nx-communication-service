@@ -156,6 +156,8 @@ async function main(): Promise<void> {
             urgentAttempts: config.queue.urgentAttempts,
             backoffDelayMs: 5_000,
             concurrency: config.queue.notificationConcurrency,
+            maxPerInterval: config.queue.sendMaxPerInterval,
+            limiterIntervalMs: config.queue.sendLimiterIntervalMs,
           },
           resolveCredentials: (channel, scope) => credentials.resolve(channel, scope),
           onResult: createResultRecorder(db, logger, {

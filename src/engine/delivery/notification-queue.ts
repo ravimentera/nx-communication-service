@@ -73,6 +73,9 @@ export interface QueueRetryConfig {
   urgentAttempts: number;
   backoffDelayMs: number;
   concurrency: number;
+  /** Jobs this worker will start per `limiterIntervalMs`. See the limiter note. */
+  maxPerInterval: number;
+  limiterIntervalMs: number;
 }
 
 export interface NotificationQueueDeps {
@@ -148,10 +151,20 @@ function jobOptions(priority: Priority, retry: QueueRetryConfig, options?: Enque
   return {
     priority: JOB_PRIORITY[priority],
     attempts: urgent ? retry.urgentAttempts : retry.attempts,
-    // Urgent messages must not back off exponentially into minutes.
-    backoff: urgent
-      ? { type: 'fixed' as const, delay: retry.backoffDelayMs }
-      : { type: 'exponential' as const, delay: retry.backoffDelayMs },
+    // ── JITTERED ────────────────────────────────────────────────────────────
+    //
+    // A provider outage fails every in-flight job at once, and a deterministic
+    // backoff then retries all of them at the same instant — and again, and
+    // again, in a thundering herd that keeps the provider down and burns every
+    // attempt in lockstep. `custom` spreads them.
+    //
+    // Urgent messages keep a FIXED base rather than exponential, so they do not
+    // back off into minutes (the source's own choice, preserved). They get
+    // jitter too: simultaneity is the problem, not the curve.
+    backoff: {
+      type: 'custom' as const,
+      delay: retry.backoffDelayMs,
+    },
     removeOnComplete: { age: 24 * 3600, count: 1000 },
     removeOnFail: { age: 7 * 24 * 3600 },
     ...(options?.delayMs && options.delayMs > 0 ? { delay: options.delayMs } : {}),
@@ -228,6 +241,41 @@ export class BullNotificationQueue implements NotificationQueue {
         connection: connection.duplicate(),
         concurrency: deps.retry.concurrency,
         lockDuration: LOCK_DURATION_MS,
+        // ── FAIRNESS ─────────────────────────────────────────────────────────
+        //
+        // Without a limiter, one tenant launching a 50,000-recipient campaign
+        // fills the queue and every other tenant's appointment reminder waits
+        // behind it. BullMQ's limiter caps the whole worker's throughput, which
+        // does not partition by tenant — but it does bound how fast any single
+        // producer can drain the workers, and it is the mechanism the queue
+        // actually offers. Per-tenant fairness needs a queue per tenant or a
+        // group key; both are a larger change than the starvation warrants
+        // today, and this is recorded rather than pretended away.
+        //
+        // It also protects the providers: Twilio and SendGrid rate-limit, and
+        // hitting those limits produces retries that make the burst worse.
+        limiter: {
+          max: deps.retry.maxPerInterval,
+          duration: deps.retry.limiterIntervalMs,
+        },
+        settings: {
+          // The `custom` backoff declared in `jobOptions`.
+          backoffStrategy: (
+            attemptsMade: number,
+            _type?: string,
+            _err?: Error,
+            job?: { opts?: { backoff?: unknown }; data?: unknown },
+          ) => {
+            const base = (job?.opts?.backoff as { delay?: number } | undefined)?.delay ?? 5_000;
+            const urgent = (job?.data as SendJob | undefined)?.priority === 'URGENT';
+            // Urgent stays flat; everything else doubles.
+            const window = urgent ? base : base * 2 ** Math.max(0, attemptsMade - 1);
+            // Full jitter: anywhere in [0, window). Spreads a synchronised
+            // failure across the whole window rather than bunching it at the
+            // end, which is what a "delay ± 10%" scheme does.
+            return Math.round(Math.random() * window);
+          },
+        },
       },
     );
 

@@ -25,7 +25,7 @@
  * reason, counted, and written by the dispatcher as a `SUPPRESSED` message row.
  * ─────────────────────────────────────────────────────────────────────────────
  */
-import { and, eq, gte, isNull, sql } from 'drizzle-orm';
+import { and, eq, gte, inArray, isNull, sql } from 'drizzle-orm';
 import type { Logger } from 'winston';
 
 import type { Db } from '../../db/index.js';
@@ -132,6 +132,15 @@ export interface ComplianceGateDeps {
     tenantId: string;
   }) => Promise<string[]>;
 }
+
+/**
+ * Message statuses that represent capacity actually used.
+ *
+ * QUEUED counts because it is on its way and double-counting a send in flight
+ * is the safe direction; SUPPRESSED, FAILED and CANCELLED do not, because
+ * nothing was sent and nobody received anything.
+ */
+const CONSUMES_QUOTA = ['QUEUED', 'SENT', 'DELIVERED'];
 
 export class ComplianceGate {
   constructor(private readonly deps: ComplianceGateDeps) {}
@@ -422,6 +431,21 @@ export class ComplianceGate {
     return null;
   }
 
+  /**
+   * Messages that actually consumed capacity.
+   *
+   * ───────────────────────────────────────────────────────────────────────────
+   * A SUPPRESSED MESSAGE COSTS NOTHING AND MUST NOT COUNT
+   *
+   * This had no status predicate, so every row counted — including the
+   * SUPPRESSED ones the gate itself had just refused. A tenant near its limit
+   * therefore entered a spiral: suppressions filled the window, the window
+   * suppressed more, and each suppression made the next one likelier. Nothing
+   * was sent and the quota stayed full.
+   *
+   * FAILED rows are excluded for the same reason: a message the provider
+   * rejected consumed no send. CANCELLED never left either.
+   */
   private async countSent(scope: TenantScope, channel: ChannelType, since: Date): Promise<number> {
     const [row] = await this.deps.db
       .select({ count: sql<number>`count(*)::int` })
@@ -432,6 +456,7 @@ export class ComplianceGate {
           eq(messages.channel, channel),
           eq(messages.direction, 'outbound'),
           gte(messages.createdAt, since),
+          inArray(messages.status, CONSUMES_QUOTA),
         ),
       );
     return row?.count ?? 0;
@@ -455,6 +480,10 @@ export class ComplianceGate {
             eq(messages.recipientId, recipientId),
             eq(messages.direction, 'outbound'),
             gte(messages.createdAt, since),
+            // A suppression is not a message this recipient received, and
+            // counting it burned their daily allowance without them hearing
+            // from anyone.
+            inArray(messages.status, CONSUMES_QUOTA),
           ),
         );
       if ((row?.count ?? 0) >= maxPerRecipientPerDay) return true;
@@ -471,6 +500,7 @@ export class ComplianceGate {
             eq(messages.recipientId, recipientId),
             eq(messages.direction, 'outbound'),
             gte(messages.createdAt, since),
+            inArray(messages.status, CONSUMES_QUOTA),
             sql`${messages.metadata}->>'playbookKey' = ${input.playbookKey}`,
           ),
         );

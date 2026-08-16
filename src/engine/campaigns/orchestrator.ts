@@ -847,7 +847,18 @@ function mapStatus(result: PlaybookRunResult): CampaignRecipientStatus {
     case 'PENDING_APPROVAL':
       return 'PENDING_APPROVAL';
     case 'SUPPRESSED':
-      return 'SUPPRESSED';
+      // ── DEFERRED IS NOT SUPPRESSED ──────────────────────────────────────
+      //
+      // A quiet-hours or rate-limit deferral produces a SUPPRESSED run with a
+      // `retryAt`, and `DeferralWorker` re-dispatches the message when it comes
+      // due. The recipient row said SUPPRESSED, which reads terminal — so
+      // campaign stats under-reported a campaign that was still going, and an
+      // operator looking at the tail of a large send saw a wall of suppressions
+      // for messages that were about to go out.
+      //
+      // The message is retried either way; this is the bookkeeping catching up
+      // with it.
+      return result.deferredUntil ? 'PENDING' : 'SUPPRESSED';
     case 'SKIPPED':
       return 'SKIPPED';
     case 'FAILED':

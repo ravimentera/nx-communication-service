@@ -115,6 +115,22 @@ export function createApp(deps: AppDeps): Express {
 
   app.disable('x-powered-by');
 
+  // ── trust proxy ──────────────────────────────────────────────────────────
+  //
+  // Without this, `req.ip` is the load balancer's address for EVERY request —
+  // so `express-rate-limit` on `/unsubscribe/:token` put every client in the
+  // world into one bucket. The limiter did not protect the endpoint; it broke
+  // it, and the people it 429'd were recipients clicking unsubscribe.
+  //
+  // A NUMBER, not `true`. `trust proxy: true` tells Express to believe the
+  // whole `X-Forwarded-For` chain, which any client can prepend to — turning
+  // the limiter back off, this time silently. The hop count says "believe
+  // exactly the proxies we actually have in front of us".
+  //
+  // It does NOT affect the /metrics allow-list, which reads the socket's peer
+  // address directly for this exact reason: a header is not an access control.
+  app.set('trust proxy', config.server.trustProxyHops);
+
   // First, so every request downstream is measured and correlated.
   app.use(
     createObservabilityMiddleware({
@@ -145,7 +161,24 @@ export function createApp(deps: AppDeps): Express {
   });
 
   app.use(helmet());
-  app.use(cors());
+
+  // ── CORS ──────────────────────────────────────────────────────────────────
+  //
+  // `cors()` with no argument reflects ANY origin, which is how this shipped.
+  // Every route is behind gateway auth so it was never the only control, but
+  // the default should not be "any website may make cross-origin calls to the
+  // outreach engine".
+  //
+  // The default is now no CORS headers at all, which is correct for a service
+  // reached through the gateway and never from a browser directly.
+  // `CORS_ALLOWED_ORIGINS` names the exceptions; `*` restores the old
+  // behaviour for a deployment that needs it.
+  const origins = config.server.corsAllowedOrigins;
+  if (origins.includes('*')) {
+    app.use(cors());
+  } else if (origins.length > 0) {
+    app.use(cors({ origin: origins, credentials: true }));
+  }
 
   // (2) Pre-auth AND pre-body-parser: a provider callback carries no gateway
   //     headers — the signature is the credential — and verifying it needs the

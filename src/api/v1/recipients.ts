@@ -10,6 +10,8 @@ import { Router, type NextFunction, type Request, type Response } from 'express'
 import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
 
+import { isValidTimezone, TIMEZONE_ERROR } from '../../domain/timezone.js';
+
 import {
   CONSENT_SOURCES,
   type ConsentService,
@@ -34,7 +36,11 @@ const preferenceSchema = z.object({
   preferredTimeOfDay: z.string().optional(),
   quietHoursStart: z.string().regex(/^([01]?\d|2[0-3]):[0-5]\d$/).nullable().optional(),
   quietHoursEnd: z.string().regex(/^([01]?\d|2[0-3]):[0-5]\d$/).nullable().optional(),
-  quietHoursTimezone: z.string().nullable().optional(),
+  quietHoursTimezone: z
+    .string()
+    .refine(isValidTimezone, TIMEZONE_ERROR)
+    .nullable()
+    .optional(),
   eventOptOuts: z.array(z.string()).optional(),
 });
 
@@ -43,7 +49,7 @@ const recipientSchema = z.object({
   displayName: z.string().optional(),
   firstName: z.string().optional(),
   lastName: z.string().optional(),
-  timezone: z.string().optional(),
+  timezone: z.string().refine(isValidTimezone, TIMEZONE_ERROR).optional(),
   locale: z.string().optional(),
   contactPoints: z
     .array(
