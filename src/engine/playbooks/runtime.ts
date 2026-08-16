@@ -33,7 +33,7 @@
  *    attempt. `(tenant_id, playbook_id, idempotency_key)` is unique now.
  * ─────────────────────────────────────────────────────────────────────────────
  */
-import { and, desc, eq } from 'drizzle-orm';
+import { and, desc, eq, sql } from 'drizzle-orm';
 import type { Logger } from 'winston';
 
 import type { Db } from '../../db/index.js';
@@ -169,12 +169,52 @@ export class PlaybookRuntime {
     const { playbook } = matched;
     const started = new Date();
 
+    // ── idempotency ─────────────────────────────────────────────────────────
+    //
+    // THE RESERVATION IS THE RUN ROW, AND IT IS WRITTEN BEFORE ANYTHING SENDS.
+    //
+    // This used to read `playbook_runs` for a prior run, dispatch, and insert
+    // the row at the very end with `onConflictDoNothing`. That is check-then-act:
+    // the unique index deduped the BOOKKEEPING and not the SENDS. Two concurrent
+    // deliveries of the same event — BullMQ concurrency above 1, a stalled-job
+    // reclaim, a crash between the dispatch and the insert — both found no prior
+    // run and both dispatched. It is exactly the defect this file's own header
+    // claims to have fixed.
+    //
+    // Now the INSERT comes first and decides the race: `ON CONFLICT DO NOTHING
+    // … RETURNING` returns a row to exactly one caller, and only that caller
+    // goes on to send. The loser reads the winner's row and reports SKIPPED.
+    const reservation = await this.reserveRun(scope, trigger, playbook, started);
+
+    if (!reservation.won) {
+      this.deps.logger.info('playbook already ran for this idempotency key — skipping', {
+        playbookKey: playbook.key,
+        idempotencyKey: trigger.idempotencyKey,
+        priorRunId: reservation.existing?.id,
+        priorStatus: reservation.existing?.status,
+      });
+      return {
+        playbookId: playbook.id,
+        playbookKey: playbook.key,
+        status: 'SKIPPED',
+        reason: `already ran (${reservation.existing?.status ?? 'in flight'})`,
+        ...(reservation.existing?.id ? { runId: reservation.existing.id } : {}),
+        messageIds: reservation.existing?.messageIds ?? [],
+        approvalIds: [],
+      };
+    }
+
+    const runId = reservation.id;
+
     const finish = async (
       result: Omit<PlaybookRunResult, 'playbookId' | 'playbookKey'>,
     ): Promise<PlaybookRunResult> => {
       const full: PlaybookRunResult = {
         playbookId: playbook.id,
         playbookKey: playbook.key,
+        // Populated on every path now. It was only ever set on the
+        // already-ran branch, so a caller could not follow a run it started.
+        runId,
         ...result,
       };
       playbookRunsTotal.inc({
@@ -182,31 +222,11 @@ export class PlaybookRuntime {
         result: full.status,
         tenant: scope.tenantId,
       });
-      await this.recordRun(scope, trigger, playbook, full, started);
+      await this.completeRun(scope, runId, full);
       return full;
     };
 
     try {
-      // ── idempotency ───────────────────────────────────────────────────────
-      const existing = await this.priorRun(scope, playbook.id, trigger.idempotencyKey);
-      if (existing) {
-        this.deps.logger.info('playbook already ran for this idempotency key — skipping', {
-          playbookKey: playbook.key,
-          idempotencyKey: trigger.idempotencyKey,
-          priorRunId: existing.id,
-          priorStatus: existing.status,
-        });
-        return {
-          playbookId: playbook.id,
-          playbookKey: playbook.key,
-          status: 'SKIPPED',
-          reason: `already ran (${existing.status})`,
-          runId: existing.id,
-          messageIds: existing.messageIds ?? [],
-          approvalIds: [],
-        };
-      }
-
       // ── 1. recipient ──────────────────────────────────────────────────────
       const recipient = await this.resolveRecipient(scope, trigger);
 
@@ -259,24 +279,59 @@ export class PlaybookRuntime {
       const messageIds: string[] = [];
       const approvalIds: string[] = [];
       const statuses: PlaybookRunResult['status'][] = [];
+      const failures: string[] = [];
 
+      // ── PER CHANNEL, ISOLATED ─────────────────────────────────────────────
+      //
+      // One channel's failure used to abort the whole fan-out and return
+      // `messageIds: []` from the outer catch — so if the email dispatched and
+      // the SMS template lookup threw, the run said FAILED and nothing-sent, an
+      // operator re-fired it, and the recipient got the email twice. For
+      // `medspa.emergency-notification` it was worse: a Slack render failure
+      // killed the URGENT ops email queued behind it.
+      //
+      // Each channel now stands or falls alone, and what did send is recorded
+      // whatever happens to the rest.
       for (const target of targets) {
-        const outcome = await this.deliverOne(scope, trigger, playbook, target, {
-          recipient,
-          context: validation.context,
-          eventId,
-          base,
-        });
-        if (outcome.messageId) messageIds.push(outcome.messageId);
-        if (outcome.approvalId) approvalIds.push(outcome.approvalId);
-        statuses.push(outcome.status);
+        try {
+          const outcome = await this.deliverOne(scope, trigger, playbook, target, {
+            recipient,
+            context: validation.context,
+            eventId,
+            base,
+          });
+          if (outcome.messageId) messageIds.push(outcome.messageId);
+          if (outcome.approvalId) approvalIds.push(outcome.approvalId);
+          statuses.push(outcome.status);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          this.deps.logger.error('one channel of a playbook run failed; the rest continue', {
+            playbookKey: playbook.key,
+            channel: target.entry.channel,
+            tenantId: scope.tenantId,
+            correlationId: trigger.correlationId,
+            error: message,
+          });
+          statuses.push('FAILED');
+          failures.push(`${target.entry.channel}: ${message}`);
+        }
+
+        // Persisted as we go, not only at the end. A process that dies between
+        // two channels still leaves behind the record of what was already sent,
+        // which is the difference between an operator re-firing safely and
+        // sending the first channel twice.
+        await this.recordProgress(scope, runId, messageIds);
       }
 
+      const status = rollUp(statuses);
       return finish({
-        status: rollUp(statuses),
+        status,
         messageIds,
         approvalIds,
-        reason: statuses.every((s) => s === 'SUPPRESSED') ? 'suppressed by compliance' : undefined,
+        // A rolled-up status always carries a reason now. SUPPRESSED and
+        // SKIPPED used to leave it null, so `playbook_runs.error` was empty for
+        // exactly the runs somebody was asking "why did nothing arrive?" about.
+        reason: reasonFor(status, statuses, failures),
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -286,6 +341,9 @@ export class PlaybookRuntime {
         correlationId: trigger.correlationId,
         error: message,
       });
+      // `messageIds` is not reachable from here — anything that threw outside
+      // the channel loop threw before a send. `completeRun` leaves whatever
+      // `recordProgress` already wrote alone rather than clearing it.
       return finish({ status: 'FAILED', reason: message, messageIds: [], approvalIds: [] });
     }
   }
@@ -755,14 +813,56 @@ export class PlaybookRuntime {
       .orderBy(desc(playbookRuns.startedAt));
   }
 
-  private async priorRun(
+  /**
+   * Claim this (tenant, playbook, idempotency key) before sending anything.
+   *
+   * `playbook_runs_idempotency_unique` (0007) is partial on
+   * `idempotency_key IS NOT NULL`, so the conflict target must name the same
+   * predicate. A trigger with no key cannot be deduped at all — a manual
+   * invocation is legitimately repeatable — and simply inserts.
+   *
+   * The row starts `RUNNING`. That state is new and it is what makes the
+   * reservation meaningful: a second delivery arriving mid-flight sees it and
+   * stands down, rather than finding nothing because the first has not
+   * finished writing its result yet.
+   */
+  private async reserveRun(
     scope: TenantScope,
-    playbookId: string,
-    idempotencyKey: string | undefined,
-  ): Promise<{ id: string; status: string; messageIds: string[] } | null> {
-    if (!idempotencyKey) return null;
-
+    trigger: OutreachTrigger,
+    playbook: Playbook,
+    startedAt: Date,
+  ): Promise<{
+    won: true;
+    id: string;
+    existing?: undefined;
+  } | {
+    won: false;
+    id?: undefined;
+    existing: { id: string; status: string; messageIds: string[] } | null;
+  }> {
     const [row] = await this.deps.db
+      .insert(playbookRuns)
+      .values({
+        tenantId: scope.tenantId,
+        subTenantId: scope.subTenantId,
+        playbookId: playbook.id,
+        trigger: trigger as unknown as Record<string, unknown>,
+        status: 'RUNNING',
+        messageIds: [],
+        correlationId: trigger.correlationId,
+        idempotencyKey: trigger.idempotencyKey,
+        startedAt,
+      })
+      .onConflictDoNothing({
+        target: [playbookRuns.tenantId, playbookRuns.playbookId, playbookRuns.idempotencyKey],
+        where: sql`${playbookRuns.idempotencyKey} IS NOT NULL`,
+      })
+      .returning({ id: playbookRuns.id });
+
+    if (row) return { won: true, id: row.id };
+
+    // Lost the race, or this event has been delivered before.
+    const [existing] = await this.deps.db
       .select({
         id: playbookRuns.id,
         status: playbookRuns.status,
@@ -772,46 +872,65 @@ export class PlaybookRuntime {
       .where(
         and(
           eq(playbookRuns.tenantId, scope.tenantId),
-          eq(playbookRuns.playbookId, playbookId),
-          eq(playbookRuns.idempotencyKey, idempotencyKey),
+          eq(playbookRuns.playbookId, playbook.id),
+          trigger.idempotencyKey
+            ? eq(playbookRuns.idempotencyKey, trigger.idempotencyKey)
+            : sql`false`,
         ),
       )
       .limit(1);
 
-    return row ?? null;
+    return { won: false, existing: existing ?? null };
   }
 
-  private async recordRun(
+  /**
+   * What has been sent so far, written between channels.
+   *
+   * Never throws: a bookkeeping failure must not fail a send that already
+   * happened, and the run row is updated again at the end regardless.
+   */
+  private async recordProgress(
     scope: TenantScope,
-    trigger: OutreachTrigger,
-    playbook: Playbook,
+    runId: string,
+    messageIds: string[],
+  ): Promise<void> {
+    if (messageIds.length === 0) return;
+    try {
+      await this.deps.db
+        .update(playbookRuns)
+        .set({ messageIds })
+        .where(and(eq(playbookRuns.tenantId, scope.tenantId), eq(playbookRuns.id, runId)));
+    } catch (error) {
+      this.deps.logger.warn('could not record playbook run progress', {
+        runId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private async completeRun(
+    scope: TenantScope,
+    runId: string,
     result: PlaybookRunResult,
-    startedAt: Date,
   ): Promise<void> {
     try {
       await this.deps.db
-        .insert(playbookRuns)
-        .values({
-          tenantId: scope.tenantId,
-          subTenantId: scope.subTenantId,
-          playbookId: playbook.id,
-          trigger: trigger as unknown as Record<string, unknown>,
+        .update(playbookRuns)
+        .set({
           status: result.status,
-          error: result.contractErrors?.join('; ') ?? result.reason,
-          messageIds: result.messageIds,
-          correlationId: trigger.correlationId,
-          idempotencyKey: trigger.idempotencyKey,
-          startedAt,
+          error: result.contractErrors?.join('; ') ?? result.reason ?? null,
+          // Only when this path knows of any. The outer catch reports none
+          // because it threw before the channel loop; clearing what
+          // `recordProgress` wrote would lose the record of a real send.
+          ...(result.messageIds.length > 0 ? { messageIds: result.messageIds } : {}),
           finishedAt: new Date(),
         })
-        // The partial unique index decides a concurrent redelivery race; the
-        // loser writes nothing rather than failing a run that already sent.
-        .onConflictDoNothing();
+        .where(and(eq(playbookRuns.tenantId, scope.tenantId), eq(playbookRuns.id, runId)));
     } catch (error) {
       // A bookkeeping failure must not turn a successful send into a reported
       // failure — the message has already gone.
-      this.deps.logger.error('failed to record a playbook run', {
-        playbookKey: playbook.key,
+      this.deps.logger.error('failed to complete a playbook run row', {
+        runId,
         error: error instanceof Error ? error.message : String(error),
       });
     }
@@ -864,6 +983,30 @@ function rollUp(statuses: PlaybookRunResult['status'][]): PlaybookRunResult['sta
     if (statuses.includes(status)) return status;
   }
   return 'SKIPPED';
+}
+
+/**
+ * Why a run ended the way it did — never null for a non-SENT status.
+ *
+ * `reason` was set only when every channel was suppressed, so SKIPPED and a
+ * partially-suppressed SUPPRESSED both wrote NULL into `playbook_runs.error` —
+ * for precisely the runs an operator opens the table to ask about.
+ */
+function reasonFor(
+  status: PlaybookRunResult['status'],
+  statuses: PlaybookRunResult['status'][],
+  failures: string[],
+): string | undefined {
+  if (status === 'FAILED') {
+    return failures.length > 0 ? failures.join('; ') : 'one or more channels failed';
+  }
+  if (status === 'SUPPRESSED') {
+    return statuses.every((s) => s === 'SUPPRESSED')
+      ? 'suppressed by compliance'
+      : 'partially suppressed by compliance';
+  }
+  if (status === 'SKIPPED') return 'no channel produced a message';
+  return undefined;
 }
 
 function dispatchStatus(

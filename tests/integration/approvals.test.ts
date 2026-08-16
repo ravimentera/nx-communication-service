@@ -592,6 +592,67 @@ describe('scheduling', () => {
     ]);
   });
 
+  /**
+   * `approve()` has an idempotency guard and `schedule()` had none, while
+   * APPROVED → SCHEDULED is a legal transition — so scheduling after an approve
+   * ran `release()` a second time. A second BullMQ job went out, and
+   * `dispatcher.persist()` reset the message row from SENT back to QUEUED, so
+   * the recipient got it twice and the log showed one send.
+   */
+  it('refuses to schedule an approval that has already been released', async () => {
+    const { approval } = await service.submit(scope, draft({ senderId: 'provider-Sched' }), {
+      key: 'medspa.provider-always',
+    });
+
+    await service.approve(scope, approval.id, {
+      ...provider,
+      senderId: 'provider-Sched',
+    });
+    expect(queued).toHaveLength(1);
+
+    await expect(
+      service.schedule(
+        scope,
+        approval.id,
+        { ...provider, senderId: 'provider-Sched' },
+        new Date(Date.now() + 3_600_000),
+      ),
+    ).rejects.toThrow(/already been released/);
+
+    // Still one job, and the message row was not walked back to QUEUED.
+    expect(queued).toHaveLength(1);
+  });
+
+  it('will not let a second dispatch move a SENT message back to QUEUED', async () => {
+    const { approval } = await service.submit(scope, draft({ senderId: 'provider-Sent' }), {
+      key: 'medspa.provider-always',
+    });
+    await service.approve(scope, approval.id, { ...provider, senderId: 'provider-Sent' });
+
+    // The worker reports the send.
+    await db
+      .update(messages)
+      .set({ status: 'SENT', sentAt: new Date() })
+      .where(and(eq(messages.tenantId, TENANT), eq(messages.id, approval.messageId)));
+
+    // Anything reaching the dispatcher for this row now is a duplicate.
+    await expect(
+      dispatcher(false).dispatch({
+        messageId: approval.messageId,
+        tenantId: TENANT,
+        channel: 'email',
+        to: { type: 'email', value: 'ada@example.test' },
+        rendered: { body: 'again' },
+      }),
+    ).rejects.toThrow(/cannot be dispatched again/);
+
+    const [row] = await db
+      .select({ status: messages.status })
+      .from(messages)
+      .where(and(eq(messages.tenantId, TENANT), eq(messages.id, approval.messageId)));
+    expect(row!.status).toBe('SENT');
+  });
+
   it('refuses a time in the past', async () => {
     const { approval } = await service.submit(scope, draft(), { key: 'medspa.provider-always' });
     await expect(

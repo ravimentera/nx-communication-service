@@ -49,7 +49,12 @@ import { approvals, messages } from '../../db/schema.js';
 import type { ApprovalStatus } from '../../db/schema/approvals.js';
 import type { Priority } from '../../domain/index.js';
 import type { TenantScope } from '../../platform/db/tenant-scope.js';
-import { ForbiddenError, NotFoundError, ValidationError } from '../../platform/http/errors.js';
+import {
+  ConflictError,
+  ForbiddenError,
+  NotFoundError,
+  ValidationError,
+} from '../../platform/http/errors.js';
 import { normalizeChannel, type ChannelType, type ContactPoint, type RenderedMessage } from '../../ports/channel.js';
 import type { Dispatcher, DispatchResult } from '../delivery/dispatcher.js';
 import {
@@ -695,6 +700,27 @@ export class ApprovalService {
     }
     if (sendAt.getTime() <= Date.now()) {
       throw new ValidationError('sendAt must be in the future');
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ALREADY RELEASED MEANS THERE IS NOTHING LEFT TO SCHEDULE.
+    //
+    // `approve()` has an idempotency guard and this had none, while
+    // APPROVED → SCHEDULED is a legal transition — so calling schedule after an
+    // approve ran `release()` a second time. That enqueued a second BullMQ job,
+    // and `dispatcher.persist()` reset the message row from SENT back to QUEUED,
+    // so the recipient got the message twice and the log showed one send.
+    //
+    // 409 rather than a silent no-op: the caller asked for a send time that is
+    // not going to be honoured, and telling them so is the only way they find
+    // out. A message that is genuinely still waiting can be rescheduled — that
+    // is the SCHEDULED → SCHEDULED case, which is not this one.
+    // ─────────────────────────────────────────────────────────────────────────
+    if (APPROVED_STATES.includes(current.status) || current.status === 'SENT') {
+      throw new ConflictError(
+        `Approval '${id}' has already been released for delivery and cannot be scheduled`,
+        { status: current.status },
+      );
     }
 
     const body = current.editedContent ?? current.originalContent ?? '';

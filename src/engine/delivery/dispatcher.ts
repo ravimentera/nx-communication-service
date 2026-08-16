@@ -14,7 +14,7 @@ import type { Logger } from 'winston';
 import type { Db } from '../../db/index.js';
 import { messages } from '../../db/schema.js';
 import type { Priority } from '../../domain/index.js';
-import { NotFoundError } from '../../platform/http/errors.js';
+import { ConflictError, NotFoundError } from '../../platform/http/errors.js';
 import type {
   ChannelRegistry,
   ChannelType,
@@ -146,12 +146,47 @@ export class Dispatcher {
           metadata: sql`coalesce(${messages.metadata}, '{}'::jsonb) || ${JSON.stringify(metadata)}::jsonb`,
           updatedAt: new Date(),
         })
-        // Tenant predicate on every write, without exception (Rule 4).
-        .where(and(eq(messages.tenantId, msg.tenantId), eq(messages.id, msg.messageId)))
+        .where(
+          and(
+            // Tenant predicate on every write, without exception (Rule 4).
+            eq(messages.tenantId, msg.tenantId),
+            eq(messages.id, msg.messageId),
+            // ─────────────────────────────────────────────────────────────────
+            // A DELIVERED MESSAGE IS NOT A DRAFT AGAIN.
+            //
+            // This UPDATE named only (tenant, id), so any second dispatch of an
+            // adopted row rewrote its status — including SENT back to QUEUED,
+            // which is how the approve-then-schedule double-send stayed
+            // invisible in the log: two sends, one row, reading QUEUED.
+            //
+            // The terminal states are the ones no further dispatch may
+            // contradict: the message has left, or a person has been told it
+            // never will. Everything before them is legitimately re-dispatched
+            // — the deferral sweeper adopts a SUPPRESSED row on purpose, and an
+            // approve retries a FAILED one (D105).
+            // ─────────────────────────────────────────────────────────────────
+            sql`${messages.status} NOT IN ('SENT', 'DELIVERED', 'CANCELLED')`,
+          ),
+        )
         .returning({ id: messages.id });
 
       if (!updated) {
-        throw new NotFoundError(`Message '${msg.messageId}' not found for this tenant`);
+        // Either the row is not this tenant's, or it has already been delivered
+        // and nothing may move it. Distinguish the two, because the first is a
+        // caller error and the second is a race this dispatch just lost.
+        const [existing] = await this.deps.db
+          .select({ status: messages.status })
+          .from(messages)
+          .where(and(eq(messages.tenantId, msg.tenantId), eq(messages.id, msg.messageId)))
+          .limit(1);
+
+        if (!existing) {
+          throw new NotFoundError(`Message '${msg.messageId}' not found for this tenant`);
+        }
+        throw new ConflictError(
+          `Message '${msg.messageId}' is ${existing.status} and cannot be dispatched again`,
+          { status: existing.status },
+        );
       }
       return updated.id;
     }

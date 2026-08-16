@@ -23,6 +23,7 @@ import {
   playbookRuns,
   playbooks,
   recipients,
+  templates,
   tenantPacks,
   tenants,
 } from '../../src/db/schema.js';
@@ -631,6 +632,127 @@ describe('idempotency', () => {
     expect(first[0]!.status).toBe('QUEUED');
     expect(second[0]).toMatchObject({ status: 'SKIPPED', reason: expect.stringMatching(/already ran/) });
     expect(sent).toHaveLength(1);
+  });
+});
+
+/**
+ * Redelivery under concurrency, which the "a redelivered event does not send
+ * twice" test above does not exercise — it delivers twice in sequence, and the
+ * old check-then-act guard handled that fine.
+ *
+ * The defect was the gap between reading `playbook_runs` and writing it at the
+ * very end: BullMQ concurrency above 1, a stalled-job reclaim, or a crash
+ * between the dispatch and the insert all put two deliveries inside it, and
+ * both sent. The unique index deduped the bookkeeping and not the sends.
+ */
+describe('concurrent redelivery', () => {
+  it('sends once when the same event arrives twice at the same moment', async () => {
+    const recipient = await makeRecipient([{ type: 'sms', value: '+15559990000' }]);
+    const t = trigger({
+      recipientId: recipient.id,
+      channels: ['sms'],
+      idempotencyKey: 'concurrent-key-1',
+      payload: { context: { appointmentDate: 'Tuesday' } },
+    });
+
+    const [a, b] = await Promise.all([runtime.run(t), runtime.run(t)]);
+
+    // Exactly one message, however the two runs interleaved.
+    expect(sent).toHaveLength(1);
+
+    // One ran; the other stood down and said why.
+    const statuses = [a[0]!.status, b[0]!.status].sort();
+    expect(statuses).toEqual(['QUEUED', 'SKIPPED']);
+    const skipped = [...a, ...b].find((r) => r.status === 'SKIPPED')!;
+    expect(skipped.reason).toMatch(/already ran/);
+
+    // And one run row, not two.
+    const runs = await db
+      .select({ id: playbookRuns.id, status: playbookRuns.status })
+      .from(playbookRuns)
+      .where(
+        and(eq(playbookRuns.tenantId, TENANT), eq(playbookRuns.idempotencyKey, 'concurrent-key-1')),
+      );
+    expect(runs).toHaveLength(1);
+    expect(runs[0]!.status).toBe('QUEUED');
+  });
+
+  it('populates runId on the success path, not only when skipping', async () => {
+    const recipient = await makeRecipient([{ type: 'sms', value: '+15559990001' }]);
+    const [result] = await runtime.run(
+      trigger({
+        recipientId: recipient.id,
+        channels: ['sms'],
+        payload: { context: { appointmentDate: 'Tuesday' } },
+      }),
+    );
+
+    // It was set only on the already-ran branch, so a caller could not follow
+    // a run it had just started.
+    expect(result!.runId).toBeDefined();
+    const [row] = await db
+      .select({ status: playbookRuns.status })
+      .from(playbookRuns)
+      .where(eq(playbookRuns.id, result!.runId as string));
+    expect(row!.status).toBe('QUEUED');
+  });
+});
+
+describe('a channel that fails mid-fan-out', () => {
+  /**
+   * `messageIds` was a local and the outer catch returned `[]`, so an email that
+   * had already dispatched vanished from the record. The run said FAILED and
+   * nothing-sent, an operator re-fired, and the recipient got the email twice.
+   */
+  it('keeps the messages the earlier channels already produced', async () => {
+    const recipient = await makeRecipient([
+      { type: 'email', value: 'partial@example.test' },
+      { type: 'sms', value: '+15559990002' },
+    ]);
+
+    // Break the SMS template only. The email is rendered and dispatched first.
+    await db
+      .update(templates)
+      .set({ key: 'medspa.appointment-reminder.sms.broken' })
+      .where(
+        and(
+          eq(templates.tenantId, TENANT),
+          eq(templates.key, 'medspa.appointment-reminder.sms'),
+        ),
+      );
+
+    try {
+      const [result] = await runtime.run(
+        trigger({
+          recipientId: recipient.id,
+          payload: { context: { appointmentDate: 'Tuesday', doctorName: 'Dr Byron' } },
+        }),
+      );
+
+      // The email went. The run says so, and says which channel failed.
+      expect(sent.map((s) => s.channel)).toEqual(['email']);
+      expect(result!.status).toBe('FAILED');
+      expect(result!.messageIds).toHaveLength(1);
+      expect(result!.reason).toMatch(/sms/i);
+
+      // And the row on disk agrees, which is what an operator reads.
+      const [row] = await db
+        .select({ messageIds: playbookRuns.messageIds, error: playbookRuns.error })
+        .from(playbookRuns)
+        .where(eq(playbookRuns.id, result!.runId as string));
+      expect(row!.messageIds).toHaveLength(1);
+      expect(row!.error).toMatch(/sms/i);
+    } finally {
+      await db
+        .update(templates)
+        .set({ key: 'medspa.appointment-reminder.sms' })
+        .where(
+          and(
+            eq(templates.tenantId, TENANT),
+            eq(templates.key, 'medspa.appointment-reminder.sms.broken'),
+          ),
+        );
+    }
   });
 });
 

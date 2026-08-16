@@ -20,6 +20,7 @@ import {
   pgTable,
   primaryKey,
   text,
+  uniqueIndex,
   unique,
   uuid,
 } from 'drizzle-orm/pg-core';
@@ -148,6 +149,18 @@ export const playbookRuns = pgTable(
     ),
     index('idx_playbook_runs_tenant_playbook').on(t.tenantId, t.playbookId, t.startedAt.desc()),
     index('idx_playbook_runs_correlation').on(t.correlationId),
+    // LOAD-BEARING, and it was missing from this model while living in 0007.
+    // It is what `reserveRun`'s ON CONFLICT targets — the reservation that
+    // makes a redelivered event send once rather than twice. Partial on
+    // `idempotency_key IS NOT NULL`, which is declared in the migration and is
+    // not expressible here.
+    uniqueIndex('playbook_runs_idempotency_unique').on(
+      t.tenantId,
+      t.playbookId,
+      t.idempotencyKey,
+    ),
+    // Runs that died mid-flight: RUNNING with an old started_at. Partial, 0018.
+    index('idx_playbook_runs_in_flight').on(t.tenantId, t.startedAt),
     // The idempotency guard is a PARTIAL unique index (WHERE idempotency_key IS
     // NOT NULL) declared in 0007 — a trigger without a key must not collide
     // with every other keyless run. Drizzle cannot express the WHERE clause.

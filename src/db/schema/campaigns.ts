@@ -13,6 +13,7 @@ import {
   pgTable,
   primaryKey,
   text,
+  uniqueIndex,
   uuid,
 } from 'drizzle-orm/pg-core';
 
@@ -156,6 +157,11 @@ export const campaignRecipients = pgTable(
   },
   (t) => [
     index('idx_campaign_recipients_campaign').on(t.campaignId, t.status),
+    // Load-bearing: it is what `expand()`'s ON CONFLICT targets, and what makes
+    // two concurrent launches insert one audience rather than two. Partial on
+    // both columns being non-null — declared in 0019, and the predicate is not
+    // expressible here.
+    uniqueIndex('campaign_recipients_campaign_recipient_unique').on(t.campaignId, t.recipientId),
     index('idx_campaign_recipients_recipient').on(t.recipientId),
   ],
 );

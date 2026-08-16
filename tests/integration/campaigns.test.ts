@@ -33,6 +33,7 @@ import { createDb, type Db } from '../../src/db/index.js';
 import {
   approvalPolicies,
   campaignRecipients,
+  campaigns as campaignsTable,
   messages,
   playbookTriggers,
   playbooks,
@@ -574,5 +575,105 @@ describe('the orchestrator', () => {
         audienceId: audience.id,
       }),
     ).rejects.toThrow(/not installed/);
+  });
+
+  /**
+   * The race the suite never exercised.
+   *
+   * `launch` read the status, expanded the audience, and only then wrote
+   * PROCESSING — the whole expansion sat in the gap. Two concurrent calls both
+   * read DRAFT, both passed the guard, and both inserted the audience. Every
+   * duplicated `campaign_recipients` row is a second message to a real person.
+   *
+   * Both halves of the fix are asserted here: the atomic status claim, which
+   * makes one caller lose, and `campaign_recipients_campaign_recipient_unique`
+   * (0019), which makes the expansion itself unable to duplicate even if
+   * something reached it twice.
+   */
+  it('launched twice at once, expands the audience once', async () => {
+    const { campaignId } = await campaignOver(
+      ['race1@example.test', 'race2@example.test', 'race3@example.test'],
+      'launch-race',
+    );
+
+    const outcomes = await Promise.allSettled([
+      campaigns.launch(scope, campaignId, { await: true }),
+      campaigns.launch(scope, campaignId, { await: true }),
+    ]);
+
+    const won = outcomes.filter((o) => o.status === 'fulfilled');
+    const lost = outcomes.filter((o) => o.status === 'rejected');
+    expect(won).toHaveLength(1);
+    expect(lost).toHaveLength(1);
+    expect((lost[0] as PromiseRejectedResult).reason).toMatchObject({
+      message: expect.stringMatching(/already running|cannot be launched/),
+    });
+
+    // One row per recipient, not two.
+    const rows = await campaigns.recipients(scope, campaignId);
+    expect(rows).toHaveLength(3);
+    expect(new Set(rows.map((r) => r.recipientId)).size).toBe(3);
+  });
+
+  it('adds only the newcomers when an audience grows under a relaunch', async () => {
+    const audience = await audiences.create(scope, { name: 'grow-audience' });
+    await audiences.addMembers(scope, audience.id, [
+      await makeRecipient(TENANT, 'grow1@example.test'),
+    ]);
+    const { id: campaignId } = await campaigns.create(scope, {
+      name: 'launch-grow',
+      playbookKey: 'acme.nurture',
+      audienceId: audience.id,
+      context: { topic: 'your roof quote' },
+    });
+
+    expect((await campaigns.launch(scope, campaignId, { await: true })).expanded).toBe(1);
+
+    // The campaign completed; add a second member and relaunch from PAUSED.
+    await audiences.addMembers(scope, audience.id, [
+      await makeRecipient(TENANT, 'grow2@example.test'),
+    ]);
+    await db
+      .update(campaignsTable)
+      .set({ status: 'PAUSED' })
+      .where(eq(campaignsTable.id, campaignId));
+
+    // `expanded` counts what was actually ADDED, not what was attempted. The old
+    // read-then-filter reported the same number by subtracting first, and could
+    // not do so honestly the moment two expansions overlapped.
+    const { expanded } = await campaigns.launch(scope, campaignId, { await: true });
+    expect(expanded).toBe(1);
+    expect(await campaigns.recipients(scope, campaignId)).toHaveLength(2);
+  });
+
+  /**
+   * `settle()` had no status predicate, so a row `cancel` had just marked
+   * CANCELLED was stamped back to SENT moments later by the generator that had
+   * not noticed. The operator was told it was cancelled; the table said it went.
+   */
+  it('does not stamp a cancelled recipient back to SENT', async () => {
+    const { campaignId } = await campaignOver(['settle@example.test'], 'settle-guard');
+    await campaigns.launch(scope, campaignId, { await: true });
+
+    const [before] = await campaigns.recipients(scope, campaignId);
+    await db
+      .update(campaignRecipients)
+      .set({ status: 'CANCELLED' })
+      .where(eq(campaignRecipients.id, before!.id));
+
+    // Exactly what an in-flight generator does when it finishes after cancel.
+    await (
+      campaigns as unknown as {
+        settle: (
+          s: typeof scope,
+          id: string,
+          status: string,
+          extra?: Record<string, unknown>,
+        ) => Promise<void>;
+      }
+    ).settle(scope, before!.id, 'SENT', { messageId: before!.messageId ?? undefined });
+
+    const [after] = await campaigns.recipients(scope, campaignId);
+    expect(after!.status).toBe('CANCELLED');
   });
 });
