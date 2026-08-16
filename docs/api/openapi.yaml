@@ -1485,7 +1485,9 @@ paths:
         status update, joined to a message through `provider_message_id`.
 
         A receipt for an unknown message is **204**, not 404: providers retry a
-        non-2xx, and during a parallel run some receipts belong elsewhere.
+        non-2xx, and a receipt for a message sent before the cutover has nothing
+        to match — the source never recorded a provider message id, so migrated
+        rows carry none.
       security: []
       requestBody:
         required: true
