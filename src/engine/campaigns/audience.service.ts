@@ -34,6 +34,10 @@ import type { Db } from '../../db/index.js';
 import { audienceMembers, audiences, importErrors, recipients } from '../../db/schema.js';
 import { NotFoundError, ValidationError } from '../../platform/http/errors.js';
 import { tenantWhere, type TenantScope } from '../../platform/db/tenant-scope.js';
+import type {
+  ConsentService,
+  GrantInput,
+} from '../compliance/consent.service.js';
 import type { RecipientService } from '../recipients/recipient.service.js';
 
 export const AUDIENCE_KINDS = ['static', 'query', 'accumulating'] as const;
@@ -82,10 +86,18 @@ export interface ImportRow {
   attributes?: Record<string, unknown>;
 }
 
+/**
+ * The lawful basis a caller asserts for an imported list, and the evidence for
+ * it. Deliberately the same shape `ConsentService.grant()` takes.
+ */
+export type ImportConsent = GrantInput;
+
 export interface ImportResult {
   importId: string;
   imported: number;
   skipped: number;
+  /** Consent rows written. Zero unless the import declared a basis. */
+  consented?: number;
   errors: number;
 }
 
@@ -93,6 +105,11 @@ export interface AudienceServiceDeps {
   db: Db;
   logger: Logger;
   recipients: RecipientService;
+  /**
+   * P13. Absent means an import cannot record consent — the pre-P13 behaviour,
+   * kept optional so the P11-era tests construct this without it.
+   */
+  consent?: ConsentService;
   /**
    * The `external_ref.system` imported rows are keyed under. A tenant importing
    * its own list owns its own ids, so this is per-import rather than global —
@@ -296,7 +313,7 @@ export class AudienceService {
     scope: TenantScope,
     audienceId: string,
     rows: AsyncIterable<ImportRow>,
-    options: { system?: string; importId?: string } = {},
+    options: { system?: string; importId?: string; consent?: ImportConsent } = {},
   ): Promise<ImportResult> {
     await this.require(scope, audienceId);
 
@@ -306,6 +323,7 @@ export class AudienceService {
     let valid = 0;
     let inserted = 0;
     let errors = 0;
+    let consented = 0;
     let rowNumber = 1; // 1 is the header, so the first data row is 2.
     let batch: { recipientId: string }[] = [];
     const failures: (typeof importErrors.$inferInsert)[] = [];
@@ -328,6 +346,26 @@ export class AudienceService {
           .onConflictDoNothing()
           .returning({ recipientId: audienceMembers.recipientId });
         inserted += added.length;
+
+        // Consent, captured in the same flush as the membership.
+        //
+        // An import is where a lead list arrives with a lawful basis attached —
+        // "these people ticked the box on our stand at the trade show" — and it
+        // is the only bulk path where that can be recorded. Without it, an
+        // imported audience is unreachable the moment enforcement is on, and
+        // the operator's only recourse is a consent call per recipient.
+        //
+        // It is opt-in, and the caller must name a source and a date. There is
+        // no default: "they were in the spreadsheet" is not a lawful basis, and
+        // defaulting would make it look like one.
+        if (options.consent && this.deps.consent) {
+          consented += await this.deps.consent.captureImported(
+            scope,
+            batch.map((b) => b.recipientId),
+            options.consent,
+          );
+        }
+
         batch = [];
       }
       if (failures.length > 0) {
@@ -398,8 +436,9 @@ export class AudienceService {
       imported: inserted,
       skipped,
       errors,
+      consented,
     });
-    return { importId, imported: inserted, skipped, errors };
+    return { importId, imported: inserted, skipped, errors, consented };
   }
 
   /** The downloadable report. Paginated, because a bad header rejects every row. */

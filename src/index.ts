@@ -20,6 +20,7 @@ import { PolicyService } from './engine/approvals/policy.service.js';
 import { TenantConfigAuthorizationProvider } from './engine/approvals/authorization.js';
 import { ApprovalSlaWorker } from './engine/approvals/sla.worker.js';
 import { DeferralWorker } from './engine/delivery/deferral.worker.js';
+import { ConsentService } from './engine/compliance/consent.service.js';
 import { ComplianceGate } from './engine/compliance/gate.js';
 import { lintContent, mergeRules } from './engine/compliance/lint.js';
 import { ErasureService } from './engine/compliance/erasure.service.js';
@@ -378,6 +379,11 @@ async function main(): Promise<void> {
   // to be will want to apply to a period that has already happened.
   const usageService = new UsageService({ db, logger });
 
+  // The write side of `consent_records`. Until P13 the compliance gate read a
+  // table nothing could fill, which made `require_opt_in` — default true —
+  // impossible to satisfy and enforcement impossible to switch on.
+  const consentService = new ConsentService({ db, logger });
+
   // Fills the `tenant` and `sender` namespaces every render context needs.
   // Shared by the runtime, the draft service and the three content routers —
   // each of which used to spread `emptyContext()` and ship `{{tenant.name}}`
@@ -431,6 +437,7 @@ async function main(): Promise<void> {
     db,
     logger,
     recipients: recipientService,
+    consent: consentService,
     defaultImportSystem: 'import',
   });
   const campaignOrchestrator = new CampaignOrchestrator({
@@ -479,6 +486,7 @@ async function main(): Promise<void> {
     recipients: {
       recipients: recipientService,
       preferences,
+      consent: consentService,
       gate: complianceGate,
       erasure: new ErasureService({ db, logger }),
     },
@@ -529,7 +537,12 @@ async function main(): Promise<void> {
       channels: { configs: channelConfigs, dispatcher, queue },
       approvals: { approvals, policies },
       playbooks: { runtime: runtimeRef.current, registry: playbookRegistry, packs },
-      recipients: { recipients: recipientService, preferences, gate: complianceGate },
+      recipients: {
+        recipients: recipientService,
+        preferences,
+        consent: consentService,
+        gate: complianceGate,
+      },
       content: { renderer, store: templateStore, generator, identity, packs, assets: assetService, logger },
       receipts: receiptService,
       context: contextRegistry,

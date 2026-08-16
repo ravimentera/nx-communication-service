@@ -14,6 +14,7 @@ import winston from 'winston';
 
 import { createDb, type Db } from '../../src/db/index.js';
 import { consentRecords, messages, recipients, tenantChannelConfigs } from '../../src/db/schema.js';
+import { ConsentService } from '../../src/engine/compliance/consent.service.js';
 import { ComplianceGate } from '../../src/engine/compliance/gate.js';
 import { PreferenceService } from '../../src/engine/compliance/preference.service.js';
 import { RecipientService } from '../../src/engine/recipients/recipient.service.js';
@@ -177,6 +178,163 @@ describe('check 3 — channel preference and consent', () => {
     expect((await gate(false).check(input(recipient.id))).allow).toBe(true);
 
     await db.update(tenantChannelConfigs).set({ requireOptIn: false }).where(eq(tenantChannelConfigs.tenantId, TENANT));
+  });
+});
+
+/**
+ * The write side of consent, which did not exist until P13.
+ *
+ * The gate has read `consent_records` since P5 and nothing could write a row,
+ * so `require_opt_in` — `NOT NULL DEFAULT true` — made enforcement impossible
+ * to switch on: an operator flipping shadow mode off would have blocked every
+ * send in the tenant with `CONSENT_REQUIRED` and had no API to fix a single one.
+ * The test above proves the gate reads a row; these prove one can be created,
+ * withdrawn, and that withdrawing wins.
+ */
+describe('the consent writer', () => {
+  let consent: ConsentService;
+
+  beforeAll(() => {
+    consent = new ConsentService({ db, logger });
+  });
+
+  async function requiringOptIn<T>(run: () => Promise<T>): Promise<T> {
+    await db
+      .insert(tenantChannelConfigs)
+      .values({ tenantId: TENANT, name: 'cfg', requireOptIn: true })
+      .onConflictDoUpdate({
+        target: tenantChannelConfigs.tenantId,
+        set: { requireOptIn: true },
+      });
+    try {
+      return await run();
+    } finally {
+      await db
+        .update(tenantChannelConfigs)
+        .set({ requireOptIn: false })
+        .where(eq(tenantChannelConfigs.tenantId, TENANT));
+    }
+  }
+
+  it('unblocks a recipient the gate was refusing', async () => {
+    await requiringOptIn(async () => {
+      const recipient = await makeRecipient();
+
+      const before = await gate(false).check(input(recipient.id));
+      expect(before.allow).toBe(false);
+      if (!before.allow) expect(before.reason).toBe('CONSENT_REQUIRED');
+
+      await consent.grant(scope, recipient.id, {
+        channels: ['email'],
+        source: 'signup_form',
+        proof: { ip: '203.0.113.4', formId: 'newsletter' },
+      });
+
+      expect((await gate(false).check(input(recipient.id))).allow).toBe(true);
+    });
+  });
+
+  it('keeps one row per channel, so a re-grant cannot stack', async () => {
+    const recipient = await makeRecipient();
+    await consent.grant(scope, recipient.id, { channels: ['email'], source: 'signup_form' });
+    await consent.grant(scope, recipient.id, { channels: ['email'], source: 'double_optin' });
+
+    const rows = await consent.list(scope, recipient.id);
+    expect(rows).toHaveLength(1);
+    // The later grant is the one that stands, with its own proof.
+    expect(rows[0]!.source).toBe('double_optin');
+  });
+
+  it('lets a revocation win over an earlier grant', async () => {
+    await requiringOptIn(async () => {
+      const recipient = await makeRecipient();
+      await consent.grant(scope, recipient.id, { channels: ['email'], source: 'signup_form' });
+      expect((await gate(false).check(input(recipient.id))).allow).toBe(true);
+
+      await consent.revoke(scope, recipient.id, ['email'], 'asked us to stop');
+
+      const after = await gate(false).check(input(recipient.id));
+      expect(after.allow).toBe(false);
+      if (!after.allow) expect(after.reason).toBe('CONSENT_REQUIRED');
+
+      // Not deleted. The record that they agreed and then withdrew IS the audit
+      // trail, and it is the only thing that can answer "when did this change?".
+      const rows = await consent.list(scope, recipient.id);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ granted: false });
+      expect(rows[0]!.revokedAt).not.toBeNull();
+      expect(rows[0]!.grantedAt).not.toBeNull();
+    });
+  });
+
+  it('revokes every channel when none is named', async () => {
+    const recipient = await makeRecipient();
+    await consent.grant(scope, recipient.id, {
+      channels: ['email', 'sms'],
+      source: 'verbal',
+    });
+
+    const revoked = await consent.revoke(scope, recipient.id);
+    expect(revoked.map((r) => r.channel).sort()).toEqual(['email', 'sms']);
+  });
+
+  /**
+   * The two are read by different checks in the gate — `allowCommunications`
+   * fails check 2, `hasConsent()` is check 3 — and only one of them was being
+   * written. An unsubscribed recipient kept a granted consent row.
+   */
+  it('is withdrawn by an unsubscribe, not just the preference flag', async () => {
+    const recipient = await makeRecipient();
+    await consent.grant(scope, recipient.id, { channels: ['email'], source: 'signup_form' });
+
+    await preferences.unsubscribe(scope, recipient.id, 'clicked the footer');
+
+    const rows = await consent.list(scope, recipient.id);
+    expect(rows[0]).toMatchObject({ granted: false });
+    expect(rows[0]!.revokedAt).not.toBeNull();
+  });
+
+  it('refuses a consent dated in the future', async () => {
+    const recipient = await makeRecipient();
+    await expect(
+      consent.grant(scope, recipient.id, {
+        channels: ['email'],
+        source: 'api',
+        grantedAt: new Date(Date.now() + 86_400_000),
+      }),
+    ).rejects.toThrow(/future/i);
+  });
+
+  it('refuses a recipient belonging to another tenant', async () => {
+    const recipient = await makeRecipient();
+    await expect(
+      consent.grant(
+        { tenantId: 'someone-else' },
+        recipient.id,
+        { channels: ['email'], source: 'api' },
+      ),
+    ).rejects.toThrow(/not found/i);
+  });
+
+  it('captures an imported batch without resurrecting a withdrawal', async () => {
+    const kept = await makeRecipient();
+    const withdrawn = await makeRecipient();
+
+    await consent.grant(scope, withdrawn.id, { channels: ['email'], source: 'signup_form' });
+    await consent.revoke(scope, withdrawn.id, ['email']);
+
+    const written = await consent.captureImported(scope, [kept.id, withdrawn.id], {
+      channels: ['email'],
+      source: 'import',
+      grantedAt: new Date('2026-01-15T00:00:00.000Z'),
+      proof: { file: 'tradeshow-leads.csv' },
+    });
+
+    // One row written, not two: a bulk file is not evidence that somebody who
+    // withdrew has reconsidered.
+    expect(written).toBe(1);
+    expect((await consent.list(scope, kept.id))[0]).toMatchObject({ granted: true });
+    expect((await consent.list(scope, withdrawn.id))[0]).toMatchObject({ granted: false });
   });
 });
 

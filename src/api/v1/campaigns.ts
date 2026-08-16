@@ -35,9 +35,11 @@ import { Router, type NextFunction, type Request, type Response } from 'express'
 import { z } from 'zod';
 
 import type { AudienceService, ImportRow } from '../../engine/campaigns/audience.service.js';
+import { CONSENT_SOURCES } from '../../engine/compliance/consent.service.js';
 import type { CampaignOrchestrator } from '../../engine/campaigns/orchestrator.js';
 import { requireTenant } from '../../platform/http/auth.middleware.js';
 import { NotFoundError } from '../../platform/http/errors.js';
+import { CHANNEL_TYPES } from '../../ports/channel.js';
 
 const audienceSchema = z.object({
   name: z.string().min(1),
@@ -74,6 +76,22 @@ const importRowSchema = z.object({
 const importSchema = z.object({
   system: z.string().min(1).optional(),
   rows: z.array(z.unknown()).min(1),
+  /**
+   * The lawful basis for contacting this list, if the caller has one.
+   *
+   * Optional, and with no default. An imported audience with no consent is
+   * unreachable once enforcement is on, which is the correct outcome for a list
+   * whose provenance nobody can state — defaulting it would turn "we have a
+   * spreadsheet" into a recorded claim that these people agreed.
+   */
+  consent: z
+    .object({
+      channels: z.array(z.enum(CHANNEL_TYPES)).min(1),
+      source: z.enum(CONSENT_SOURCES),
+      grantedAt: z.string().datetime().optional(),
+      proof: z.record(z.unknown()).optional(),
+    })
+    .optional(),
 });
 
 const campaignSchema = z.object({
@@ -169,6 +187,18 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
 
       const result = await deps.audiences.importRows(scope, req.params.id as string, rows(), {
         ...(body.system ? { system: body.system } : {}),
+        ...(body.consent
+          ? {
+              consent: {
+                channels: body.consent.channels,
+                source: body.consent.source,
+                ...(body.consent.grantedAt
+                  ? { grantedAt: new Date(body.consent.grantedAt) }
+                  : {}),
+                ...(body.consent.proof ? { proof: body.consent.proof } : {}),
+              },
+            }
+          : {}),
       });
       res.status(result.errors > 0 ? 207 : 200).json(result);
     }),

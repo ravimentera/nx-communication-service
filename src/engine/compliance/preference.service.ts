@@ -21,11 +21,11 @@
  */
 import { randomBytes } from 'node:crypto';
 
-import { and, eq } from 'drizzle-orm';
+import { and, eq, isNull } from 'drizzle-orm';
 import type { Logger } from 'winston';
 
 import type { Db } from '../../db/index.js';
-import { recipientPreferences } from '../../db/schema.js';
+import { consentRecords, recipientPreferences } from '../../db/schema.js';
 import type { TenantScope } from '../../platform/db/tenant-scope.js';
 import { tenantWhere } from '../../platform/db/tenant-scope.js';
 import { NotFoundError } from '../../platform/http/errors.js';
@@ -131,19 +131,78 @@ export class PreferenceService {
     return row;
   }
 
-  /** Global opt-out. Also flips the recipient's status — see `RecipientService`. */
+  /**
+   * Global opt-out. Also flips the recipient's status — see `RecipientService`.
+   *
+   * And revokes their consent records, which is not belt-and-braces: the two
+   * are read by different checks in the gate. `allowCommunications: false`
+   * fails check 2; `hasConsent()` in check 3 reads `consent_records` and knows
+   * nothing about preferences. A tenant with `require_opt_in` set would have
+   * had an unsubscribed recipient still holding a granted consent row —
+   * harmless while check 2 fires first, and a live opt-out bypass the moment
+   * anything grants an exemption to it. An unsubscribe means withdrawn, in
+   * every place the answer is recorded.
+   */
   async unsubscribe(
     scope: TenantScope,
     recipientId: string,
     reason?: string,
   ): Promise<RecipientPreference> {
     const row = await this.upsert(scope, recipientId, { allowCommunications: false });
+    await this.revokeConsent(scope, recipientId, reason ?? 'unsubscribed');
     this.deps.logger.info('recipient unsubscribed', {
       tenantId: scope.tenantId,
       recipientId,
       reason,
     });
     return row;
+  }
+
+  /**
+   * Withdraw every consent this recipient holds.
+   *
+   * Written here rather than delegating to `ConsentService` because the
+   * preference service is constructed long before it in the composition root
+   * and injecting it would make a cycle. It is one guarded UPDATE, and the
+   * service's own `revoke()` is the same statement.
+   */
+  private async revokeConsent(
+    scope: TenantScope,
+    recipientId: string,
+    reason: string,
+  ): Promise<void> {
+    try {
+      const rows = await this.deps.db
+        .update(consentRecords)
+        .set({ granted: false, revokedAt: new Date(), updatedAt: new Date() })
+        .where(
+          and(
+            eq(consentRecords.tenantId, scope.tenantId),
+            eq(consentRecords.recipientId, recipientId),
+            isNull(consentRecords.revokedAt),
+          ),
+        )
+        .returning({ channel: consentRecords.channel });
+
+      if (rows.length > 0) {
+        this.deps.logger.info('consent revoked by unsubscribe', {
+          tenantId: scope.tenantId,
+          recipientId,
+          channels: rows.map((r) => r.channel),
+          reason,
+        });
+      }
+    } catch (error) {
+      // The opt-out itself has already been written and is what the gate reads
+      // first. Failing the whole unsubscribe because the consent side errored
+      // would leave the caller believing nothing happened, and retrying an
+      // unsubscribe is not something a recipient can be asked to do.
+      this.deps.logger.error('could not revoke consent during unsubscribe', {
+        tenantId: scope.tenantId,
+        recipientId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   /**
@@ -166,6 +225,16 @@ export class PreferenceService {
       });
 
     if (!row) throw new NotFoundError('Unknown or expired unsubscribe token');
+
+    // The link in the footer has to mean the same thing as the API call. It
+    // did not: this path wrote the preference and left every consent record
+    // granted.
+    await this.revokeConsent(
+      { tenantId: row.tenantId },
+      row.recipientId,
+      'unsubscribe-link',
+    );
+
     this.deps.logger.info('recipient unsubscribed by token', {
       tenantId: row.tenantId,
       recipientId: row.recipientId,

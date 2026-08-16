@@ -380,6 +380,123 @@ paths:
       responses:
         '204': { description: Unsubscribed. }
 
+  /v1/recipients/{id}/consent:
+    get:
+      operationId: getRecipientsByIdConsent
+      tags: [recipients]
+      summary: What this recipient has consented to, per channel
+      description: |
+        One record per channel, granted or withdrawn. A withdrawn record is kept
+        rather than deleted — the fact that somebody agreed and then changed
+        their mind is the audit trail, and `revokedAt` is when.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200':
+          description: The recipient's consent records, most recently changed first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  consent:
+                    type: array
+                    items: { $ref: '#/components/schemas/ConsentRecord' }
+    post:
+      operationId: postRecipientsByIdConsent
+      tags: [recipients]
+      summary: Record consent for one or more channels
+      description: |
+        Requires `outreach:send` — whoever may cause a message to go out is the
+        same person who records the basis for it.
+
+        **This is what makes enforcement possible.** `consent_records` has
+        existed since `0001` and had no writer until P13, while
+        `tenant_channel_configs.require_opt_in` defaults to `true` — so turning
+        `COMPLIANCE_SHADOW_MODE` off would have blocked every send in the tenant
+        with `CONSENT_REQUIRED` and left no way to clear a single one.
+
+        Idempotent per channel: granting twice updates the proof rather than
+        stacking rows. A grant clears any earlier revocation, because opting back
+        in is a real thing that happens and this call carries its own evidence.
+
+        `grantedAt` is when they **agreed**, not when this call was made — an
+        import carries a past date. A future one is refused.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [channels, source]
+              properties:
+                channels:
+                  type: array
+                  minItems: 1
+                  items: { type: string, enum: [email, sms, push, in_app, voice, webhook, letter, slack] }
+                source:
+                  type: string
+                  enum: [signup_form, double_optin, import, verbal, paper, api]
+                  description: How the consent was obtained. Not free text — an unauditable value is worse than none.
+                grantedAt: { type: string, format: date-time }
+                proof:
+                  type: object
+                  additionalProperties: true
+                  description: Whatever proves it — form payload, IP, recording reference, paper scan id.
+      responses:
+        '201':
+          description: The consent records as they now stand.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  consent:
+                    type: array
+                    items: { $ref: '#/components/schemas/ConsentRecord' }
+        '404': { description: No such recipient in this tenant. }
+
+  /v1/recipients/{id}/consent/revoke:
+    post:
+      operationId: postRecipientsByIdConsentRevoke
+      tags: [recipients]
+      summary: Withdraw consent
+      description: |
+        Naming no channels withdraws all of them, which is what an unsubscribe
+        means. Nothing is deleted; `granted` becomes false and `revokedAt` is
+        stamped.
+
+        `POST /v1/recipients/{id}/unsubscribe` and the token-based unsubscribe
+        link both call this internally. They are read by different checks in the
+        gate — the preference flag is check 2, consent is check 3 — and before
+        P13 only the first was written, so an unsubscribed recipient kept a
+        granted consent row.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                channels:
+                  type: array
+                  items: { type: string }
+                  description: Omit to withdraw every channel.
+                reason: { type: string, maxLength: 500 }
+      responses:
+        '200':
+          description: How many records were withdrawn, and what they now say.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revoked: { type: integer }
+                  consent:
+                    type: array
+                    items: { $ref: '#/components/schemas/ConsentRecord' }
+
   /v1/recipients/{id}/erase:
     post:
       operationId: postRecipientsByIdErase
@@ -2620,6 +2737,32 @@ components:
         expiresAt: { type: [string, 'null'], format: date-time }
         revokedAt: { type: [string, 'null'], format: date-time }
         createdAt: { type: string, format: date-time }
+
+    ConsentRecord:
+      type: object
+      description: |
+        Proof that a recipient agreed to be contacted on one channel — or, once
+        `revokedAt` is set, that they agreed and then withdrew. There is at most
+        one record per (recipient, channel); the uniqueness is what makes a
+        withdrawal win rather than sit beside an older grant.
+      properties:
+        id: { type: string, format: uuid }
+        recipientId: { type: string, format: uuid }
+        channel: { type: string }
+        granted: { type: boolean }
+        source:
+          type: string
+          nullable: true
+          description: |
+            How it was obtained. `migration` marks a record inferred by
+            `9011_consent.sql` from legacy preference data rather than from an
+            explicit consent event — the proof object says so too.
+        proof:
+          type: object
+          nullable: true
+          additionalProperties: true
+        grantedAt: { type: string, format: date-time, nullable: true }
+        revokedAt: { type: string, format: date-time, nullable: true }
 
     UsageReport:
       type: object

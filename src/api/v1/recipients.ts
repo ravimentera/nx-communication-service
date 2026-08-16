@@ -10,6 +10,10 @@ import { Router, type NextFunction, type Request, type Response } from 'express'
 import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
 
+import {
+  CONSENT_SOURCES,
+  type ConsentService,
+} from '../../engine/compliance/consent.service.js';
 import type { ComplianceGate } from '../../engine/compliance/gate.js';
 import type { ErasureService } from '../../engine/compliance/erasure.service.js';
 import type { PreferenceService } from '../../engine/compliance/preference.service.js';
@@ -64,10 +68,25 @@ const checkSchema = z.object({
 export interface RecipientApiDeps {
   recipients: RecipientService;
   preferences: PreferenceService;
+  /** P13. The write side of `consent_records`, which had none until now. */
+  consent: ConsentService;
   gate: ComplianceGate;
   /** P12. Absent means the two GDPR routes answer 501 rather than 404. */
   erasure?: ErasureService;
 }
+
+const grantConsentSchema = z.object({
+  channels: z.array(z.enum(CHANNEL_TYPES)).min(1),
+  source: z.enum(CONSENT_SOURCES),
+  /** When they agreed, which for an import is not when this call was made. */
+  grantedAt: z.string().datetime().optional(),
+  proof: z.record(z.unknown()).optional(),
+});
+
+const revokeConsentSchema = z.object({
+  channels: z.array(z.enum(CHANNEL_TYPES)).optional(),
+  reason: z.string().max(500).optional(),
+});
 
 function handle(
   fn: (req: Request, res: Response) => Promise<void>,
@@ -187,6 +206,58 @@ export function createRecipientRouter(deps: RecipientApiDeps): Router {
       await deps.preferences.unsubscribe(scope, id, req.body?.reason);
       await deps.recipients.setStatus(scope, id, 'unsubscribed');
       res.status(204).end();
+    }),
+  );
+
+  // ── consent ────────────────────────────────────────────────────────────────
+  //
+  // `consent_records` has existed since 0001 and had no writer until P13: the
+  // compliance gate read a table nothing could fill, so `require_opt_in` —
+  // which defaults to true — would have blocked every send the moment an
+  // operator turned shadow mode off, with no way to record a single consent.
+  //
+  // Gated on SEND rather than a consent-specific permission: whoever may cause
+  // a message to go out is the same person who records the basis for it, and a
+  // permission nobody has been granted is a gate that gets worked around.
+
+  router.get(
+    '/recipients/:id/consent',
+    handle(async (req, res) => {
+      const scope = requireTenant(req);
+      res.json({ consent: await deps.consent.list(scope, req.params.id as string) });
+    }),
+  );
+
+  router.post(
+    '/recipients/:id/consent',
+    requirePermissions(Permission.SEND),
+    handle(async (req, res) => {
+      const scope = requireTenant(req);
+      const body = grantConsentSchema.parse(req.body);
+      const records = await deps.consent.grant(scope, req.params.id as string, {
+        channels: body.channels,
+        source: body.source,
+        ...(body.grantedAt ? { grantedAt: new Date(body.grantedAt) } : {}),
+        ...(body.proof ? { proof: body.proof } : {}),
+      });
+      res.status(201).json({ consent: records });
+    }),
+  );
+
+  router.post(
+    '/recipients/:id/consent/revoke',
+    requirePermissions(Permission.SEND),
+    handle(async (req, res) => {
+      const scope = requireTenant(req);
+      const body = revokeConsentSchema.parse(req.body ?? {});
+      // No channels named means all of them, which is what a withdrawal means.
+      const records = await deps.consent.revoke(
+        scope,
+        req.params.id as string,
+        body.channels,
+        body.reason,
+      );
+      res.json({ revoked: records.length, consent: records });
     }),
   );
 
