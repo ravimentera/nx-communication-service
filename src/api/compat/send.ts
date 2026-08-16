@@ -23,7 +23,8 @@ import { Router, type NextFunction, type Request, type Response } from 'express'
 import { z } from 'zod';
 
 import type { Dispatcher } from '../../engine/delivery/dispatcher.js';
-import { emptyContext, type RenderContext } from '../../engine/content/render-context.js';
+import type { IdentityResolver } from '../../engine/content/identity.js';
+import type { RenderContext } from '../../engine/content/render-context.js';
 import type { Renderer, TemplateFormat } from '../../engine/content/renderer.js';
 import { requireTenant } from '../../platform/http/auth.middleware.js';
 import { NotFoundError, ValidationError } from '../../platform/http/errors.js';
@@ -46,6 +47,12 @@ const emailSchema = z.object({
 export interface SendCompatDeps {
   dispatcher: Dispatcher;
   identity: CompatIdentity;
+  /**
+   * Tenant and sender identity for the render context — a different question
+   * from `identity` above, which resolves the *recipient*. Named apart because
+   * conflating them is how `{{tenant.name}}` came to render blank here.
+   */
+  senderIdentity: IdentityResolver;
   templates: TemplateStore;
   renderer: Renderer;
 }
@@ -70,6 +77,7 @@ function handle(
 export function createBodyResolver(deps: {
   templates: TemplateStore;
   renderer: Renderer;
+  senderIdentity: IdentityResolver;
 }): (
   tenantId: string,
   input: {
@@ -106,7 +114,7 @@ export function createBodyResolver(deps: {
     // variable that happens to be called `tenant` cannot shadow one.
     const context = {
       ...(input.variables ?? {}),
-      ...emptyContext(tenantId),
+      ...(await deps.senderIdentity.baseContext({ tenantId })),
       context: input.variables ?? {},
     } as RenderContext;
     const rendered = await deps.renderer.render(template.content, context, {

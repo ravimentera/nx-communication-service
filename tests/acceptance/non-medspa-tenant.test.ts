@@ -53,6 +53,7 @@ import { Dispatcher } from '../../src/engine/delivery/dispatcher.js';
 import type { NotificationQueue } from '../../src/engine/delivery/notification-queue.js';
 import { PlaybookMatcher } from '../../src/engine/playbooks/matcher.js';
 import { PlaybookRegistry } from '../../src/engine/playbooks/registry.js';
+import { IdentityResolver } from '../../src/engine/content/identity.js';
 import { PlaybookRuntime } from '../../src/engine/playbooks/runtime.js';
 import { RecipientService } from '../../src/engine/recipients/recipient.service.js';
 import { loadPacks } from '../../src/packs/loader.js';
@@ -268,6 +269,8 @@ beforeAll(async () => {
     }),
   };
 
+  const identity = new IdentityResolver({ db, logger });
+
   const runtime = new PlaybookRuntime({
     db,
     logger,
@@ -283,6 +286,7 @@ beforeAll(async () => {
       assembler: new PromptAssembler(renderer),
       logger,
     }),
+    identity,
     approvals: new ApprovalService({ db, logger, policies, dispatcher, authorization }),
     policies,
     dispatcher,

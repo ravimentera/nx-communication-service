@@ -48,7 +48,8 @@ import type { TemplateStore } from '../../ports/template-store.js';
 import type { ApprovalService } from '../approvals/approval.service.js';
 import type { PolicyService } from '../approvals/policy.service.js';
 import type { ContentGenerator } from '../content/generator.js';
-import { emptyContext, type RenderContext } from '../content/render-context.js';
+import type { IdentityResolver } from '../content/identity.js';
+import type { RenderContext } from '../content/render-context.js';
 import type { Renderer } from '../content/renderer.js';
 import type { ContextRegistry } from '../context/registry.js';
 import type { Dispatcher } from '../delivery/dispatcher.js';
@@ -95,6 +96,8 @@ export interface RuntimeDeps {
   templates: TemplateStore;
   renderer: Renderer;
   generator: ContentGenerator;
+  /** Fills the `tenant` and `sender` namespaces of the render context. */
+  identity: IdentityResolver;
   approvals: ApprovalService;
   policies: PolicyService;
   dispatcher: Dispatcher;
@@ -229,7 +232,13 @@ export class PlaybookRuntime {
         });
       }
 
-      // ── 5–7. content, approval, dispatch — per channel ────────────────────
+      // ── 5. identity ───────────────────────────────────────────────────────
+      // Once per run, not once per channel: the tenant row and the agent config
+      // do not change between an email and the SMS that follows it.
+      const senderId = trigger.senderId ?? (trigger.payload.senderId as string | undefined);
+      const base = await this.deps.identity.baseContext(scope, senderId);
+
+      // ── 6–8. content, approval, dispatch — per channel ────────────────────
       const messageIds: string[] = [];
       const approvalIds: string[] = [];
       const statuses: PlaybookRunResult['status'][] = [];
@@ -239,6 +248,7 @@ export class PlaybookRuntime {
           recipient,
           context: validation.context,
           eventId,
+          base,
         });
         if (outcome.messageId) messageIds.push(outcome.messageId);
         if (outcome.approvalId) approvalIds.push(outcome.approvalId);
@@ -427,12 +437,13 @@ export class PlaybookRuntime {
       recipient: Awaited<ReturnType<RecipientService['getById']>>;
       context: Record<string, unknown>;
       eventId: string;
+      base: RenderContext;
     },
   ): Promise<{ status: PlaybookRunResult['status']; messageId?: string; approvalId?: string }> {
     const channel = toChannelType(target.entry.channel) as ChannelType;
     const priority = trigger.priority ?? target.entry.priority ?? 'MEDIUM';
 
-    const renderContext = this.buildContext(scope, playbook, channel, input);
+    const renderContext = this.buildContext(input.base, playbook, channel, input);
     const source = (playbook.contentSource ?? {}) as ContentSource;
 
     const { rendered, aiConfidence, lintErrors } = await this.produceContent(
@@ -617,8 +628,14 @@ export class PlaybookRuntime {
     });
   }
 
+  /**
+   * `base` carries the tenant and sender identity, resolved once per run rather
+   * than per channel — see `IdentityResolver`. It used to be `emptyContext()`
+   * here, which meant `{{tenant.name}}` rendered blank in every message this
+   * engine has ever produced.
+   */
   private buildContext(
-    scope: TenantScope,
+    base: RenderContext,
     playbook: Playbook,
     channel: ChannelType,
     input: {
@@ -626,7 +643,6 @@ export class PlaybookRuntime {
       context: Record<string, unknown>;
     },
   ): RenderContext {
-    const base = emptyContext(scope.tenantId);
     const recipient = input.recipient;
 
     return {

@@ -36,6 +36,7 @@ import { UsageService } from './engine/tenancy/usage.service.js';
 import { hasDuplicateKeys, parseKeyList, Sealer } from './platform/crypto/envelope.js';
 import { AssetService } from './engine/content/asset.service.js';
 import { ContentGenerator } from './engine/content/generator.js';
+import { IdentityResolver } from './engine/content/identity.js';
 import { PromptAssembler } from './engine/content/prompt-assembler.js';
 import { Renderer } from './engine/content/renderer.js';
 import { DrizzleTemplateStore } from './engine/content/store.js';
@@ -377,6 +378,12 @@ async function main(): Promise<void> {
   // to be will want to apply to a period that has already happened.
   const usageService = new UsageService({ db, logger });
 
+  // Fills the `tenant` and `sender` namespaces every render context needs.
+  // Shared by the runtime, the draft service and the three content routers —
+  // each of which used to spread `emptyContext()` and ship `{{tenant.name}}`
+  // blank to the recipient and to the model.
+  const identity = new IdentityResolver({ db, logger });
+
   const lintRules = mergeRules(...packs.compliance());
   const generator = new ContentGenerator({
     llm,
@@ -400,6 +407,7 @@ async function main(): Promise<void> {
     templates: templateStore,
     renderer,
     generator,
+    identity,
     approvals,
     policies,
     dispatcher,
@@ -441,6 +449,7 @@ async function main(): Promise<void> {
   // `/communications/generate-message` — which used to own this logic (D101).
   const draftService = new DraftService({
     generator,
+    identity,
     packs,
     recipients: recipientService,
     approvals,
@@ -464,7 +473,7 @@ async function main(): Promise<void> {
     redis,
     dispatcher,
     queue,
-    content: { renderer, store: templateStore, generator, packs, assets: assetService, logger },
+    content: { renderer, store: templateStore, generator, identity, packs, assets: assetService, logger },
     assets: { assets: assetService },
     tenancy: { apiKeys, usage: usageService },
     recipients: {
@@ -494,7 +503,7 @@ async function main(): Promise<void> {
         logger,
         verifyApiKey: (key) => apiKeys.verify(key),
       }),
-      render: createBodyResolver({ templates: templateStore, renderer }),
+      render: createBodyResolver({ templates: templateStore, renderer, senderIdentity: identity }),
       // P12 workstream 5. Tera's half of the surface: draft, review, decide,
       // read the conversation, start a campaign.
       drafts: draftService,
@@ -521,7 +530,7 @@ async function main(): Promise<void> {
       approvals: { approvals, policies },
       playbooks: { runtime: runtimeRef.current, registry: playbookRegistry, packs },
       recipients: { recipients: recipientService, preferences, gate: complianceGate },
-      content: { renderer, store: templateStore, generator, packs, assets: assetService, logger },
+      content: { renderer, store: templateStore, generator, identity, packs, assets: assetService, logger },
       receipts: receiptService,
       context: contextRegistry,
       drafts: draftService,

@@ -9,7 +9,8 @@ import { z } from 'zod';
 
 import type { AssetService } from '../../engine/content/asset.service.js';
 import type { ContentGenerator } from '../../engine/content/generator.js';
-import { emptyContext, type RenderContext } from '../../engine/content/render-context.js';
+import type { IdentityResolver } from '../../engine/content/identity.js';
+import type { RenderContext } from '../../engine/content/render-context.js';
 import type { Renderer } from '../../engine/content/renderer.js';
 import type { PackRegistry } from '../../packs/loader.js';
 import type { ImageProvider } from '../../ports/image.js';
@@ -65,6 +66,8 @@ export interface ContentApiDeps {
   renderer: Renderer;
   store: TemplateStore;
   generator: ContentGenerator;
+  /** Fills the `tenant` and `sender` namespaces the caller does not supply. */
+  identity: IdentityResolver;
   packs: PackRegistry;
   /**
    * P12. Optional so the P4-era tests that build this object without a storage
@@ -87,11 +90,23 @@ function handle(
   };
 }
 
-function buildContext(
+/**
+ * The caller's context, over the tenant and sender the engine resolved.
+ *
+ * Engine-resolved identity is the BASE and the caller's fields are spread over
+ * it, which is the same precedence the prompt assembler now enforces: a caller
+ * may add to `tenant` or `sender`, and an absent field falls back to the real
+ * row rather than to nothing.
+ */
+async function buildContext(
+  identity: IdentityResolver,
   tenantId: string,
   supplied: z.infer<typeof contextSchema> | undefined,
-): RenderContext {
-  const base = emptyContext(tenantId);
+): Promise<RenderContext> {
+  const base = await identity.baseContext(
+    { tenantId },
+    (supplied?.sender as { id?: string } | undefined)?.id,
+  );
   return {
     recipient: { ...base.recipient, ...(supplied?.recipient ?? {}) },
     sender: { ...base.sender, ...(supplied?.sender ?? {}) },
@@ -129,7 +144,7 @@ export function createContentRouter(deps: ContentApiDeps): Router {
         throw new ValidationError('Provide either templateId or content');
       }
 
-      const result = await deps.renderer.render(source, buildContext(tenantId, body.data), {
+      const result = await deps.renderer.render(source, await buildContext(deps.identity, tenantId, body.data), {
         format,
         aliases: deps.renderer.aliasesFor(packId),
       });
@@ -163,7 +178,7 @@ export function createContentRouter(deps: ContentApiDeps): Router {
         channel: body.channel,
         playbookKey: body.playbookKey,
         playbookGoal: body.playbookGoal,
-        context: buildContext(tenantId, body.data),
+        context: await buildContext(deps.identity, tenantId, body.data),
         overrides: body.overrides,
       });
 
@@ -274,7 +289,7 @@ export function createContentRouter(deps: ContentApiDeps): Router {
       const body = renderSchema.parse({ ...req.body, templateId: template.id });
       const result = await deps.renderer.render(
         template.content,
-        buildContext(tenantId, body.data),
+        await buildContext(deps.identity, tenantId, body.data),
         {
           format: template.format as 'TEXT' | 'HTML' | 'MARKDOWN' | 'MJML',
           aliases: deps.renderer.aliasesFor(template.packId),

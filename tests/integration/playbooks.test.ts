@@ -31,6 +31,7 @@ import { PolicyService } from '../../src/engine/approvals/policy.service.js';
 import { ComplianceGate } from '../../src/engine/compliance/gate.js';
 import { PreferenceService } from '../../src/engine/compliance/preference.service.js';
 import { ContentGenerator } from '../../src/engine/content/generator.js';
+import { IdentityResolver } from '../../src/engine/content/identity.js';
 import { PromptAssembler } from '../../src/engine/content/prompt-assembler.js';
 import { Renderer } from '../../src/engine/content/renderer.js';
 import { DrizzleTemplateStore } from '../../src/engine/content/store.js';
@@ -175,6 +176,7 @@ beforeAll(async () => {
       assembler: new PromptAssembler(renderer),
       logger,
     }),
+    identity: new IdentityResolver({ db, logger }),
     approvals: new ApprovalService({ db, logger, policies, dispatcher }),
     policies,
     dispatcher,
@@ -364,6 +366,38 @@ describe('an APPOINTMENT_REMINDER, end to end', () => {
     const email = sent.find((s) => s.channel === 'email')!;
     const sms = sent.find((s) => s.channel === 'sms')!;
     expect(sms.body.length).toBeLessThan(email.body.length);
+  });
+
+  /**
+   * The assertion this suite was missing, and the reason a defect that made
+   * every message in the system unsigned went unnoticed through six phases.
+   *
+   * 23 of the 27 medspa templates interpolate `{{tenant.name}}`. The runtime
+   * built its context from `emptyContext()`, which sets `tenant: {id}` and
+   * nothing else, so the clinic's name resolved to the empty string and every
+   * SMS ended `— `. Every test here asserted on the *caller's* context, which
+   * was populated, so all of them passed.
+   */
+  it('signs the message with the tenant’s name, not an empty string', async () => {
+    const recipient = await makeRecipient([
+      { type: 'email', value: 'ada@example.test' },
+      { type: 'sms', value: '+15551234567' },
+    ]);
+
+    await runtime.run(
+      trigger({
+        recipientId: recipient.id,
+        payload: { context: { appointmentDate: 'Tuesday', doctorName: 'Dr Byron' } },
+      }),
+    );
+
+    expect(sent.length).toBeGreaterThan(0);
+    for (const message of sent) {
+      expect(message.body).toContain('Clinic');
+      // The shape of the failure, pinned so a regression is unambiguous: a
+      // dangling separator is what a blank `{{tenant.name}}` leaves behind.
+      expect(message.body).not.toMatch(/—\s*$/);
+    }
   });
 
   it('honours the caller’s channel choice, as every switch case did', async () => {

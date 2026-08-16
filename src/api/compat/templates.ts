@@ -36,7 +36,7 @@ import { Router, type NextFunction, type Request, type Response } from 'express'
 import { z } from 'zod';
 
 import type { ContentApiDeps } from '../v1/content.js';
-import { emptyContext, type RenderContext } from '../../engine/content/render-context.js';
+import type { RenderContext } from '../../engine/content/render-context.js';
 import type { TemplateFormat } from '../../engine/content/renderer.js';
 import {
   Permission,
@@ -158,7 +158,7 @@ export function createLegacyTemplateRouter(deps: ContentApiDeps): Router {
       // Legacy callers pass a flat variable bag, referenced bare in the body.
       const context = {
         ...data,
-        ...emptyContext(tenantId),
+        ...(await deps.identity.baseContext({ tenantId })),
         context: data,
       } as RenderContext;
 
