@@ -168,7 +168,7 @@ describe('/v1/audiences', () => {
 
   it('404s an audience belonging to another tenant', async () => {
     const mine = (await post('/v1/audiences', { name: 'Scoped' })).body;
-    const res = await get(`/v1/audiences/${mine.id}`, gatewayHeaders({ 'x-medspa-id': OTHER_TENANT }));
+    const res = await get(`/v1/audiences/${mine.id}`, gatewayHeaders({ 'x-tenant-id': OTHER_TENANT }));
     expect(res.status).toBe(404);
   });
 });
@@ -281,7 +281,7 @@ describe('/v1/campaigns', () => {
       })
     ).body.id as string;
 
-    const res = await get(`/v1/campaigns/${id}`, gatewayHeaders({ 'x-medspa-id': OTHER_TENANT }));
+    const res = await get(`/v1/campaigns/${id}`, gatewayHeaders({ 'x-tenant-id': OTHER_TENANT }));
     expect(res.status).toBe(404);
   });
 });

@@ -136,7 +136,7 @@ describe('POST /v1/outreach/generate', () => {
   it('is tenant-scoped — another tenant cannot draft for this recipient', async () => {
     const res = await post(
       { recipientId, channel: 'email' },
-      gatewayHeaders({ 'x-medspa-id': '00000000-0000-4000-8000-00000000c002' }),
+      gatewayHeaders({ 'x-tenant-id': '00000000-0000-4000-8000-00000000c002' }),
     );
     expect(res.status).toBe(404);
   });

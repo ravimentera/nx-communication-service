@@ -68,6 +68,13 @@ export class MenteraContextProvider implements ContextProvider {
    * (`:387-390`); `x-gateway-request` is added because the receiving services
    * gate on it, and relying on a bearer token alone is what makes this call
    * fragile when it is made from a worker rather than a request.
+   *
+   * **`x-medspa-id` and `x-location-id` stay here, and are not the aliases P12
+   * dropped (D106).** These are *outbound*, to patient-service and
+   * providers-service, whose own auth middleware reads the medspa spelling and
+   * only that. Removing them to match this service's inbound protocol would
+   * break every context lookup. The generic names go too, so the day those
+   * services generalize, this needs no change.
    */
   private headers(scope: TenantScope, ref: ContextRef): Record<string, string> {
     const bearer = ref.params?.bearerToken;

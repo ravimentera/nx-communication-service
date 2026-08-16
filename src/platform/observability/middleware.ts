@@ -9,7 +9,7 @@
  *  3. Access logs: one structured `http_request` line per completed request,
  *     level scaling with status (info <400, warn 4xx, error 5xx).
  *
- * Divergence: tenant identity is read from x-tenant-id with x-medspa-id as the
+ * Divergence: tenant identity is read from x-tenant-id — the x-medspa-id
  * fallback, matching the auth middleware's dual-header window (§0.7).
  */
 import { randomUUID } from 'node:crypto';
@@ -74,8 +74,8 @@ export function createObservabilityMiddleware(options: ObservabilityOptions): Re
       return runWithContext({ requestId }, () => next());
     }
 
-    const tenantId = header(req, 'x-tenant-id') || header(req, 'x-medspa-id');
-    const subTenantId = header(req, 'x-sub-tenant-id') || header(req, 'x-location-id');
+    const tenantId = header(req, 'x-tenant-id');
+    const subTenantId = header(req, 'x-sub-tenant-id');
     const userId = header(req, 'x-user-id');
     const startTime = process.hrtime.bigint();
 

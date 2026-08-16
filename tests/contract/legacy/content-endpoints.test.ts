@@ -110,7 +110,7 @@ describe('/templates — 6', () => {
   it('is tenant-scoped — the source engine has no tenant predicate at all', async () => {
     // `grep -c "medspaId\\|tenantId" template-engine.ts` returns 0, so today any
     // caller can read, edit or delete any clinic's template by id.
-    const otherHeaders = gatewayHeaders({ 'x-medspa-id': OTHER_TENANT });
+    const otherHeaders = gatewayHeaders({ 'x-tenant-id': OTHER_TENANT });
     expect((await get(`/templates/${templateId}`, otherHeaders)).status).toBe(404);
     expect((await get('/templates/', otherHeaders)).body.templates).toHaveLength(0);
     expect((await del(`/templates/${templateId}`, otherHeaders)).body.success).toBe(false);

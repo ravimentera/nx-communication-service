@@ -153,7 +153,7 @@ describe('GET /v1/usage', () => {
     expect(body.ai.tokensTotal).toBe(540);
     expect(body.ai.costUsd).toBeLessThan(1);
 
-    const other = await get(`/v1/usage${january}`, gatewayHeaders({ 'x-medspa-id': OTHER_TENANT }));
+    const other = await get(`/v1/usage${january}`, gatewayHeaders({ 'x-tenant-id': OTHER_TENANT }));
     expect(other.body.ai).toMatchObject({ calls: 1, tokensTotal: 500, costUsd: 5 });
   });
 

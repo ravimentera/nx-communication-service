@@ -77,9 +77,13 @@ export function gatewayHeaders(
     'x-gateway-request': 'true',
     'x-user-id': 'user-1',
     'x-user-role': 'provider',
-    // Both spellings are accepted for the parallel-run window (§0.7); the
-    // legacy one is what the gateway actually sends today.
-    'x-medspa-id': TENANT,
+    // `x-tenant-id`, not `x-medspa-id`. The gateway forwards both spellings as
+    // of P12 (D106) and this engine now reads only the generic one — a request
+    // carrying just the medspa name has no tenant. `endpoints.test.ts` asserts
+    // that directly; every other suite simply speaks the current protocol.
+    'x-tenant-id': TENANT,
+    // Still an accepted alias for `x-sender-id`: a sender identity, not the
+    // tenancy boundary, and its callers were not established to have moved.
     'x-provider-id': PROVIDER,
     // JSON, not a comma-separated list — `parsePermissions` JSON.parses it.
     'x-user-permissions': JSON.stringify([

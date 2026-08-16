@@ -67,38 +67,63 @@ describe('createAuthMiddleware — gateway mode', () => {
   });
 });
 
-describe('createAuthMiddleware — dual-header tenancy window', () => {
-  it('populates tenantId from x-medspa-id alone', async () => {
-    const res = await request(buildApp()).get('/whoami').set({ ...GATEWAY, 'x-medspa-id': 'm1' });
-    expect((res.body as RequestIdentity).tenantId).toBe('m1');
+/**
+ * The tenancy headers, after P12 dropped the medspa aliases (D106).
+ *
+ * These tests used to assert the opposite — that `x-medspa-id` alone populated
+ * the tenant. That was correct for the extraction window and is exactly the
+ * behaviour being removed, so they are inverted rather than deleted: the alias
+ * being *gone* is the property worth pinning, and a test that merely stopped
+ * mentioning it would not catch someone helpfully adding the fallback back.
+ */
+describe('createAuthMiddleware — tenancy headers', () => {
+  it('populates tenantId from x-tenant-id', async () => {
+    const res = await request(buildApp()).get('/whoami').set({ ...GATEWAY, 'x-tenant-id': 't1' });
+    expect((res.body as RequestIdentity).tenantId).toBe('t1');
   });
 
-  it('lets x-tenant-id win when both are present', async () => {
+  it('does NOT accept x-medspa-id — the alias is gone', async () => {
+    // The gateway forwards both spellings, so nothing real sends only this one.
+    // A request that does has no tenant, and fails at `requireTenant` rather
+    // than being served against an empty string.
+    const res = await request(buildApp()).get('/whoami').set({ ...GATEWAY, 'x-medspa-id': 'm1' });
+    expect((res.body as RequestIdentity).tenantId).toBe('');
+  });
+
+  it('ignores x-medspa-id entirely when both are present', async () => {
     const res = await request(buildApp())
       .get('/whoami')
       .set({ ...GATEWAY, 'x-medspa-id': 'm1', 'x-tenant-id': 't1' });
     expect((res.body as RequestIdentity).tenantId).toBe('t1');
   });
 
-  it('maps x-location-id to subTenantId and x-provider-id to senderId', async () => {
+  it('does NOT accept x-location-id for subTenantId', async () => {
     const res = await request(buildApp())
       .get('/whoami')
-      .set({ ...GATEWAY, 'x-location-id': 'l1', 'x-provider-id': 'p1' });
-    expect((res.body as RequestIdentity).subTenantId).toBe('l1');
+      .set({ ...GATEWAY, 'x-location-id': 'l1' });
+    expect((res.body as RequestIdentity).subTenantId).toBeUndefined();
+  });
+
+  it('reads subTenantId from x-sub-tenant-id', async () => {
+    const res = await request(buildApp())
+      .get('/whoami')
+      .set({ ...GATEWAY, 'x-location-id': 'l1', 'x-sub-tenant-id': 's1' });
+    expect((res.body as RequestIdentity).subTenantId).toBe('s1');
+  });
+
+  it('still accepts x-provider-id for senderId, which was NOT dropped', async () => {
+    // Deliberately untouched: a sender identity is not the tenancy boundary,
+    // and this phase did not establish that its callers had moved.
+    const res = await request(buildApp())
+      .get('/whoami')
+      .set({ ...GATEWAY, 'x-provider-id': 'p1' });
     expect((res.body as RequestIdentity).senderId).toBe('p1');
   });
 
-  it('lets the new names win for subTenantId and senderId too', async () => {
+  it('lets x-sender-id win over x-provider-id', async () => {
     const res = await request(buildApp())
       .get('/whoami')
-      .set({
-        ...GATEWAY,
-        'x-location-id': 'l1',
-        'x-sub-tenant-id': 's1',
-        'x-provider-id': 'p1',
-        'x-sender-id': 'snd1',
-      });
-    expect((res.body as RequestIdentity).subTenantId).toBe('s1');
+      .set({ ...GATEWAY, 'x-provider-id': 'p1', 'x-sender-id': 'snd1' });
     expect((res.body as RequestIdentity).senderId).toBe('snd1');
   });
 });

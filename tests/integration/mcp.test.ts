@@ -419,7 +419,7 @@ describe('the review tools', () => {
     const created = await draft();
     const res = await request(h.app)
       .post('/mcp/tools/approveMessage')
-      .set(gatewayHeaders({ 'x-medspa-id': OTHER_TENANT }))
+      .set(gatewayHeaders({ 'x-tenant-id': OTHER_TENANT }))
       .send({ approvalId: created.body.result.approvalId });
 
     expect(res.status).toBe(404);

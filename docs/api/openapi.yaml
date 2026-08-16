@@ -2019,9 +2019,14 @@ components:
       name: x-gateway-request
       description: |
         The gateway forwards `x-gateway-request: true` plus `x-user-id`,
-        `x-user-role`, `x-user-permissions` (a JSON array), `x-tenant-id` (or
-        the legacy `x-medspa-id`), `x-sub-tenant-id` (or `x-location-id`) and
-        `x-sender-id` (or `x-provider-id`).
+        `x-user-role`, `x-user-permissions` (a JSON array), `x-tenant-id`,
+        `x-sub-tenant-id` and `x-sender-id` (or `x-provider-id`).
+
+        **`x-medspa-id` and `x-location-id` are no longer read.** They were
+        accepted as aliases through the extraction and dropped in P12; a request
+        carrying only the medspa spelling has no tenant and is rejected rather
+        than served. The gateway sends both spellings, so this affects only a
+        caller that talks to this service directly.
 
         A request without `x-gateway-request` is **403**. A request with it but
         no user context is **401**. Scopes listed on an operation are the

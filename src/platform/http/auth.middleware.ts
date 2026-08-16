@@ -4,9 +4,21 @@
  *
  * Two changes worth knowing about:
  *
- *  1. DUAL HEADERS. For the whole parallel-run window the service accepts both
- *     the new names and the Mentera ones (x-tenant-id / x-medspa-id, etc.), new
- *     name winning. P12 removes the fallbacks.
+ *  1. TENANCY HEADERS. **`x-tenant-id` and `x-sub-tenant-id` only** — the
+ *     `x-medspa-id` / `x-location-id` aliases were dropped in P12 (D106) once
+ *     the gateway started sending the generic names. A vertical noun in the
+ *     engine's own wire protocol was the last place "medspa" appeared in
+ *     something every caller has to speak.
+ *
+ *     The alias is NOT deprecated-but-tolerated: a request carrying only
+ *     `x-medspa-id` now has no tenant, which fails at `requireTenant` rather
+ *     than silently serving something. Tolerating it is how a header alias
+ *     survives forever, and the callers are a known, finite set — the gateway,
+ *     three service clients and tera-orchestrator, all of which send both.
+ *
+ *     `x-provider-id` is still accepted as an alias for `x-sender-id`. That one
+ *     is untouched: it is a *sender* identity, not the tenancy boundary, and
+ *     nothing in this phase established that its callers had moved.
  *
  *  2. AUTH_MODE. The source hardcoded "trust the gateway". That is fine inside
  *     Mentera and useless to a vendor with no Mentera gateway in front. `gateway`
@@ -192,8 +204,8 @@ export function createAuthMiddleware(options: AuthMiddlewareOptions): RequestHan
         userId,
         role,
         email: firstHeader(req, 'x-user-email'),
-        tenantId: firstHeader(req, 'x-tenant-id', 'x-medspa-id') ?? '',
-        subTenantId: firstHeader(req, 'x-sub-tenant-id', 'x-location-id'),
+        tenantId: firstHeader(req, 'x-tenant-id') ?? '',
+        subTenantId: firstHeader(req, 'x-sub-tenant-id'),
         senderId: firstHeader(req, 'x-sender-id', 'x-provider-id'),
         permissions: parsePermissions(firstHeader(req, 'x-user-permissions'), logger),
       };
@@ -278,7 +290,7 @@ async function authenticateApiKey(
       userId: `apikey:${verified.keyId}`,
       role: UserRole.SYSTEM,
       tenantId: verified.tenantId,
-      subTenantId: firstHeader(req, 'x-sub-tenant-id', 'x-location-id'),
+      subTenantId: firstHeader(req, 'x-sub-tenant-id'),
       senderId: firstHeader(req, 'x-sender-id', 'x-provider-id'),
       permissions: verified.scopes,
     };

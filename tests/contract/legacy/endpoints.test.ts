@@ -302,7 +302,7 @@ describe('/communications — 6', () => {
   it('GET /communications/:id 404s another tenant’s message', async () => {
     const res = await get(
       `/communications/${messageId}`,
-      gatewayHeaders({ 'x-medspa-id': OTHER_TENANT }),
+      gatewayHeaders({ 'x-tenant-id': OTHER_TENANT }),
     );
     expect(res.status).toBe(404);
   });
@@ -368,3 +368,44 @@ describe('/messages — 2 provider webhooks', () => {
 
 });
 
+/**
+ * The tenancy header, after P12 dropped the medspa alias (D106).
+ *
+ * The gateway forwards `x-tenant-id` and `x-sub-tenant-id` as well as the
+ * legacy names, so nothing real reaches this service with only `x-medspa-id`.
+ * A caller that does is a caller nobody moved, and it must find out — a request
+ * with no tenant that got served against an empty string would be far worse
+ * than one that fails.
+ */
+describe('tenancy headers', () => {
+  const legacyOnly = () => {
+    const h = gatewayHeaders();
+    delete h['x-tenant-id'];
+    return { ...h, 'x-medspa-id': TENANT };
+  };
+
+  it('rejects a caller that sends only x-medspa-id', async () => {
+    const res = await get(`/communications/provider/${PROVIDER}/inbox`, legacyOnly());
+    // Not a 200 over the wrong tenant, and not a 500.
+    expect([400, 401, 403]).toContain(res.status);
+  });
+
+  it('serves the same caller once it sends x-tenant-id', async () => {
+    const res = await get(`/communications/provider/${PROVIDER}/inbox`, {
+      ...legacyOnly(),
+      'x-tenant-id': TENANT,
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it('ignores x-location-id, and reads x-sub-tenant-id', async () => {
+    // A sub-tenant that silently failed to apply would widen every query from
+    // one location to the whole organisation, which is the quiet direction to
+    // fail in.
+    const res = await get(`/communications/provider/${PROVIDER}/inbox`, {
+      ...gatewayHeaders(),
+      'x-location-id': '00000000-0000-4000-8000-0000000000ff',
+    });
+    expect(res.status).toBe(200);
+  });
+});

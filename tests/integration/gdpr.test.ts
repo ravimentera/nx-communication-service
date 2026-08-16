@@ -161,7 +161,7 @@ describe('GET /v1/recipients/:id/export', () => {
   it('403s a tenant without the gdpr profile, naming it', async () => {
     const res = await request(h.app)
       .get(`/v1/recipients/${otherTenantRecipientId}/export`)
-      .set(adminHeaders({ 'x-medspa-id': OTHER_TENANT }));
+      .set(adminHeaders({ 'x-tenant-id': OTHER_TENANT }));
     expect(res.status).toBe(403);
     expect(res.body.error.message).toMatch(/gdpr compliance profile/);
   });
@@ -266,7 +266,7 @@ describe('POST /v1/recipients/:id/erase', () => {
   it('403s a tenant without the gdpr profile', async () => {
     const res = await request(h.app)
       .post(`/v1/recipients/${otherTenantRecipientId}/erase`)
-      .set(adminHeaders({ 'x-medspa-id': OTHER_TENANT }));
+      .set(adminHeaders({ 'x-tenant-id': OTHER_TENANT }));
     expect(res.status).toBe(403);
 
     // And it really did nothing.
