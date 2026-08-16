@@ -733,6 +733,92 @@ describe('the SLA sweeper', () => {
     ]);
   });
 
+  /**
+   * The regression this suite did not have.
+   *
+   * The unit test asserted that the sweeper *called* `approve()` — against a
+   * mock. It did, and `approve()` returned immediately: `AUTO_APPROVED` is in
+   * `APPROVED_STATES`, so the idempotency guard treated an approval the sweeper
+   * had just written as one already handled, and `release()` was never reached.
+   * One of the three documented SLA outcomes sent nothing while the audit trail
+   * said it had been approved. Only a real service and a real queue show it.
+   */
+  it('onExpiry: approve actually dispatches the message', async () => {
+    const [policy] = await db
+      .insert(approvalPolicies)
+      .values({
+        tenantId: TENANT,
+        key: 'test.sla-auto-approve',
+        name: 'Auto-approve on expiry',
+        mode: 'always',
+        approverResolution: { kind: 'agent' },
+        rights: { approve: true },
+        sla: { deadlineMs: 1, onExpiry: 'approve' },
+      })
+      .returning();
+
+    const { approval } = await service.submit(scope, draft({ senderId: 'provider-Auto' }), {
+      policyId: policy!.id,
+    });
+
+    const sweeper = new SlaSweeper({ db, logger, approvals: service, policies });
+    const report = await sweeper.sweep(new Date(Date.now() + 60_000));
+    expect(report).toMatchObject({ approved: 1, failed: 0 });
+
+    const after = await service.getById(scope, approval.id);
+    expect(after!.status).toBe('AUTO_APPROVED');
+    // The policy decided, not a person — and the trail says so.
+    expect(after!.decidedBy).toBe('sla.worker');
+    expect(after!.auditTrail.map((e) => e.to)).toEqual([
+      'PENDING_APPROVAL',
+      'EXPIRED',
+      'AUTO_APPROVED',
+    ]);
+
+    // The assertion that matters: a job exists for this message.
+    expect(queued.map((j) => j.messageId)).toContain(approval.messageId);
+
+    const [row] = await db
+      .select()
+      .from(messages)
+      .where(and(eq(messages.tenantId, TENANT), eq(messages.id, approval.messageId)));
+    expect(row!.status).toBe('QUEUED');
+  });
+
+  it('recovers a row left EXPIRED by a crash between the two writes', async () => {
+    const [policy] = await db
+      .insert(approvalPolicies)
+      .values({
+        tenantId: TENANT,
+        key: 'test.sla-stranded',
+        name: 'Auto-approve on expiry (stranded)',
+        mode: 'always',
+        approverResolution: { kind: 'agent' },
+        rights: { approve: true },
+        sla: { deadlineMs: 1, onExpiry: 'approve' },
+      })
+      .returning();
+
+    const { approval } = await service.submit(scope, draft({ senderId: 'provider-Stranded' }), {
+      policyId: policy!.id,
+    });
+
+    // Exactly what a crash between `markExpired` and its follow-up leaves
+    // behind. The old scan filtered on PENDING_APPROVAL, so from here on the
+    // row was invisible: never sent, never declined, never seen again.
+    await db
+      .update(approvals)
+      .set({ status: 'EXPIRED' })
+      .where(and(eq(approvals.tenantId, TENANT), eq(approvals.id, approval.id)));
+
+    const sweeper = new SlaSweeper({ db, logger, approvals: service, policies });
+    const report = await sweeper.sweep(new Date(Date.now() + 60_000));
+
+    expect(report).toMatchObject({ approved: 1, failed: 0 });
+    expect((await service.getById(scope, approval.id))!.status).toBe('AUTO_APPROVED');
+    expect(queued.map((j) => j.messageId)).toContain(approval.messageId);
+  });
+
   it('leaves an approval with no deadline alone forever', async () => {
     const { approval } = await service.submit(scope, draft({ senderId: 'provider-NoSla' }), {
       key: 'medspa.provider-always',

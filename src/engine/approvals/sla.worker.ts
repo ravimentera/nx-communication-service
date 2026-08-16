@@ -29,7 +29,7 @@
  * ─────────────────────────────────────────────────────────────────────────────
  */
 import { Queue, Worker, type Job } from 'bullmq';
-import { and, asc, eq, isNotNull, lt } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNotNull, lt } from 'drizzle-orm';
 import type { Redis } from 'ioredis';
 import type { Logger } from 'winston';
 
@@ -100,7 +100,14 @@ export class SlaSweeper {
       .from(approvals)
       .where(
         and(
-          eq(approvals.status, 'PENDING_APPROVAL'),
+          // EXPIRED as well as PENDING_APPROVAL, because expiry and the action
+          // that follows it are two writes. A crash between them — or a
+          // `decline`/`approve` that threw — left the row EXPIRED and outside
+          // every subsequent scan, so the message was neither sent nor declined
+          // and nothing ever looked at it again. Re-scanning them makes the
+          // sweep recoverable; `markExpired` is skipped for a row that already
+          // carries the state.
+          inArray(approvals.status, ['PENDING_APPROVAL', 'EXPIRED']),
           isNotNull(approvals.slaDeadline),
           lt(approvals.slaDeadline, now),
         ),
@@ -135,8 +142,18 @@ export class SlaSweeper {
         // Returns the trail as it now stands, INCLUDING the EXPIRED entry. The
         // escalate branch below must append to that and not to the trail read
         // at scan time, or it silently overwrites the expiry it just recorded.
-        const expired = await this.markExpired(scope, row, now);
-        approvalsExpiredTotal.inc({ tenant: row.tenantId, action });
+        const resumed = row.status === 'EXPIRED';
+        const expired = resumed
+          ? { id: row.id, auditTrail: row.auditTrail }
+          : await this.markExpired(scope, row, now);
+
+        if (!resumed) approvalsExpiredTotal.inc({ tenant: row.tenantId, action });
+
+        // A row parked EXPIRED because its policy escalates and names no
+        // fallback is where an operator was asked to look. Saying so once is
+        // information; saying so every sixty seconds forever is noise, and it
+        // would bury the rows this rescan exists to recover.
+        if (resumed && action === 'escalate' && !sla.fallbackApproverRef) continue;
 
         switch (action) {
           case 'decline':
@@ -258,7 +275,16 @@ export class SlaSweeper {
         auditTrail: appendAudit(expired.auditTrail, outcome.entry),
         updatedAt: now,
       })
-      .where(and(eq(approvals.tenantId, scope.tenantId), eq(approvals.id, expired.id)));
+      .where(
+        and(
+          eq(approvals.tenantId, scope.tenantId),
+          eq(approvals.id, expired.id),
+          // Guarded like every other status write. Without it, a human who
+          // cancelled or declined this row between the expiry and here had
+          // their decision reopened as PENDING_APPROVAL and reassigned.
+          eq(approvals.status, 'EXPIRED'),
+        ),
+      );
 
     const notice: EscalationNotice = {
       scope,
@@ -276,35 +302,19 @@ export class SlaSweeper {
     }
   }
 
+  /**
+   * EXPIRED → AUTO_APPROVED → released.
+   *
+   * Both halves belong to the service, and that is the fix rather than a tidy:
+   * this method used to write `AUTO_APPROVED` itself with a bare
+   * `WHERE (tenant, id)` UPDATE and then call `approvals.approve()` to release.
+   * Neither half worked. The write could overwrite a human's DECLINE and erase
+   * its audit entry, and `approve()`'s idempotency guard treats AUTO_APPROVED
+   * as already-approved, so it returned without ever reaching `release()`. The
+   * message was never dispatched and the trail said it had been approved.
+   */
   private async autoApprove(scope: TenantScope, id: string): Promise<void> {
-    const current = await this.deps.approvals.getById(scope, id);
-    if (!current) return;
-
-    // Straight to AUTO_APPROVED — this was the policy's decision, not a
-    // person's, and the audit trail should not claim otherwise.
-    await this.deps.db
-      .update(approvals)
-      .set({
-        status: 'AUTO_APPROVED',
-        decidedAt: new Date(),
-        decidedBy: 'sla.worker',
-        auditTrail: appendAudit(
-          current.auditTrail,
-          transition({
-            from: 'EXPIRED',
-            to: 'AUTO_APPROVED',
-            actor: SYSTEM_ACTOR('sla.worker'),
-            reason: 'policy sla.onExpiry = approve',
-          }).entry,
-        ),
-        updatedAt: new Date(),
-      })
-      .where(and(eq(approvals.tenantId, scope.tenantId), eq(approvals.id, id)));
-
-    // Release through the same path a human approval takes, so the compliance
-    // gate still runs. `approve()` is idempotent on an already-approved row and
-    // returns it untouched, so this cannot double-send.
-    await this.deps.approvals.approve(scope, id, SYSTEM_ACTOR('sla.worker'));
+    await this.deps.approvals.autoApproveOnExpiry(scope, id, SYSTEM_ACTOR('sla.worker'));
   }
 }
 

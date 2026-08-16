@@ -505,6 +505,44 @@ export class ApprovalService {
     return { approval: released.approval, dispatch: released.dispatch };
   }
 
+  /**
+   * The SLA sweeper's `onExpiry: 'approve'`: EXPIRED → AUTO_APPROVED, released.
+   *
+   * This exists because `approve()` cannot serve it. That method's first act is
+   * an idempotency guard on `APPROVED_STATES`, which `AUTO_APPROVED` is a member
+   * of — so a sweeper that wrote the status itself and then called `approve()`
+   * to release it got the guard, an untouched row and no dispatch. One of the
+   * three documented SLA outcomes was a silent no-op: the audit trail said
+   * auto-approved and nothing was ever sent.
+   *
+   * The status write lives here rather than in the sweeper for the same reason.
+   * The sweeper's own UPDATE carried no status predicate, so a human who
+   * declined at the moment the sweep ran had their decision overwritten and
+   * their audit entry replaced. `move()` writes both in one statement, guarded
+   * on the status that was read.
+   */
+  async autoApproveOnExpiry(scope: TenantScope, id: string, actor: Actor): Promise<ActionResult> {
+    const current = await this.require(scope, id);
+
+    if (current.status !== 'EXPIRED') {
+      // Someone decided while the sweep was in flight. Their call stands.
+      return { approval: current, idempotent: true };
+    }
+
+    const body = current.editedContent ?? current.originalContent ?? '';
+    const approval = await this.move(scope, current, {
+      to: 'AUTO_APPROVED',
+      actor,
+      reason: 'policy sla.onExpiry = approve',
+      set: { decidedAt: new Date(), decidedBy: actor.ref },
+    });
+
+    // Through `release()`, so an auto-approval on expiry still faces the
+    // compliance gate — the point of routing it through the service at all.
+    const released = await this.release(scope, approval, body);
+    return { approval: released.approval, dispatch: released.dispatch };
+  }
+
   /** Save an edit without deciding. The row stays PENDING_APPROVAL. */
   async edit(
     scope: TenantScope,
