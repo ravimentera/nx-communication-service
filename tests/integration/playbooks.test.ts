@@ -11,7 +11,7 @@ import { join } from 'node:path';
 
 import { baselineMigrations } from '../helpers/migrations.js';
 
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { Client } from 'pg';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import winston from 'winston';
@@ -47,6 +47,38 @@ import type { OutreachTrigger } from '../../src/engine/playbooks/trigger.js';
 import { RecipientService } from '../../src/engine/recipients/recipient.service.js';
 import { loadPacks } from '../../src/packs/loader.js';
 import type { Channel, ChannelRegistry, ChannelType } from '../../src/ports/channel.js';
+import { SWITCH_CASES } from '../contract/medspa-parity.test.js';
+
+/**
+ * Every field any of the seventeen playbooks' contracts requires, in one bag.
+ *
+ * A single context for all of them rather than one per family: what is under
+ * test is SELECTION — which playbook, which channels, which approval — and a
+ * per-family fixture would drift from the contracts without anything noticing.
+ * A contract violation fails the run loudly, so a missing field here shows up
+ * as a FAILED status rather than a false pass.
+ */
+const PARITY_CONTEXT: Record<string, unknown> = {
+  appointmentDate: 'Tuesday 9 March',
+  appointmentTime: '09:00',
+  oldDate: 'Monday 8 March',
+  newDate: 'Tuesday 9 March',
+  location: 'Suite 2',
+  provider: 'Dr Byron',
+  doctorName: 'Dr Byron',
+  treatmentName: 'Hydrafacial',
+  treatmentDate: '2026-03-09',
+  // An OBJECT, not a string. `medspa.treatment-instructions` requires it that
+  // way, because the source used `instructions` as an object for the email and
+  // read `instructions.summary` for the SMS — the same payload working on one
+  // channel and throwing on the other, which the contract now names.
+  instructions: { summary: 'Rest and hydrate.', detail: 'Avoid direct sun for 48h.' },
+  message: 'A message body',
+  subject: 'A subject',
+  feedbackUrl: 'https://example.test/feedback',
+  offer: 'Spring offer',
+  campaignName: 'Spring',
+};
 
 const logger = winston.createLogger({ silent: true });
 const TENANT = 't-pb';
@@ -729,6 +761,69 @@ describe('priority rules', () => {
 
     expect(sent[0]!.priority).toBe('MEDIUM');
   });
+});
+
+/**
+ * The parity table, executed.
+ *
+ * `tests/contract/medspa-parity.test.ts` reads the pack JSON and compares it to
+ * a table transcribed from `enhanced-event-handler.ts` line by line. That
+ * proves the pack SAYS the right thing. It never starts the engine, so a
+ * matcher that dropped a channel, a trigger whose predicate never fires, or a
+ * template that failed to install would all pass it.
+ *
+ * This drives one real run per PATIENT-directed event family from that same
+ * table — same source of truth, so a row edited there changes what the engine
+ * is asserted to do rather than only what the JSON is asserted to contain.
+ *
+ * Staff- and fixed-target families are excluded here: they resolve their
+ * destination from `$config`, which the suite covers separately above, and
+ * they have no recipient to hang a contact point on.
+ */
+describe('the switch cases, run through the engine', () => {
+  const PATIENT_CASES = SWITCH_CASES.filter((c) => c.recipient === 'patient');
+
+  it('covers every patient-directed family', () => {
+    // Guards the filter: a table row retyped from 'patient' to something else
+    // would otherwise silently drop a family from this suite.
+    expect(PATIENT_CASES.length).toBeGreaterThanOrEqual(11);
+  });
+
+  it.each(PATIENT_CASES.map((c) => [c.eventType, c] as const))(
+    '%s fires its playbook on exactly its channels',
+    async (_eventType, testCase) => {
+      const recipient = await makeRecipient([
+        { type: 'email', value: 'parity@example.test' },
+        { type: 'sms', value: '+15557654321' },
+      ]);
+
+      const results = await runtime.run(
+        trigger({
+          eventType: testCase.eventType,
+          recipientId: recipient.id,
+          // No `channels`, so the playbook's own plan decides — which is what
+          // the parity table describes.
+          payload: { context: PARITY_CONTEXT },
+        }),
+      );
+
+      expect(results.map((r) => r.playbookKey)).toEqual([testCase.playbook]);
+      expect(results[0]!.status).toBe('QUEUED');
+
+      // The channel SET the source produced, no more and no less. A channel
+      // silently added is a message the recipient did not get before; one
+      // silently dropped is one they stop getting.
+      expect(sent.map((s) => s.channel).sort()).toEqual([...testCase.channels].sort());
+
+      // And it sent immediately, with no approval — D53, the regression that
+      // would stop every appointment reminder at cutover.
+      const opened = await db
+        .select({ id: approvals.id })
+        .from(approvals)
+        .where(and(eq(approvals.tenantId, TENANT), inArray(approvals.messageId, results[0]!.messageIds)));
+      expect(opened).toHaveLength(0);
+    },
+  );
 });
 
 describe('the data contract', () => {

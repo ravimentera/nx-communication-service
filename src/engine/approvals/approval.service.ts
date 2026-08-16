@@ -657,6 +657,27 @@ export class ApprovalService {
     return toApproval(row);
   }
 
+  /**
+   * Edit and approve as ONE decision.
+   *
+   * ───────────────────────────────────────────────────────────────────────────
+   * IT WAS TWO CALLS WITH A WINDOW BETWEEN THEM
+   *
+   * `edit()` then `approve()` leaves the row PENDING_APPROVAL with the new
+   * content in between, so a second approver looking at the inbox in that
+   * window could approve text the first was still working on — or decline it,
+   * and the first call's approve would then fail with a confusing
+   * "changed underneath this request".
+   *
+   * The content write and the status move are one guarded UPDATE now:
+   * `move()` matches on the status that was read, so exactly one of two
+   * concurrent deciders wins and the loser is told to re-read.
+   *
+   * The DISPATCH stays outside it, deliberately. Enqueuing inside a database
+   * transaction means either holding the transaction open across a network call
+   * to Redis, or committing a decision whose send has not been accepted —
+   * `release()` already handles the second case properly (D105).
+   */
   async editThenApprove(
     scope: TenantScope,
     id: string,
@@ -664,8 +685,45 @@ export class ApprovalService {
     content: string,
     subject?: string,
   ): Promise<ActionResult> {
-    await this.edit(scope, id, actor, content, subject);
-    return this.approve(scope, id, actor);
+    const current = await this.require(scope, id);
+    await this.authorize(current, actor, 'edit');
+    await this.authorize(current, actor, 'approve');
+
+    if (!content.trim()) {
+      throw new ValidationError('Content is required for an edit');
+    }
+
+    // Already decided: fall through to `approve`, which owns the idempotency
+    // rules — including the retry of a dispatch that never reached the queue.
+    if (current.status !== 'PENDING_APPROVAL') {
+      return this.approve(scope, id, actor);
+    }
+
+    const approval = await this.move(scope, current, {
+      to: 'EDITED_APPROVED',
+      actor,
+      reason: 'edited and approved',
+      contentHash: hashOf(content),
+      set: { decidedAt: new Date(), decidedBy: actor.ref, editedContent: content },
+    });
+
+    // The message row follows, so a reviewer reading `messages.content` and one
+    // reading the approval see the same text. After the status move: if this
+    // fails, the decision still stands and `release()` reads the approval's
+    // own `editedContent`, which is authoritative.
+    await this.deps.db
+      .update(messages)
+      .set({
+        content,
+        ...(subject === undefined
+          ? {}
+          : { metadata: sql`${messages.metadata} || ${JSON.stringify({ subject })}::jsonb` }),
+        updatedAt: new Date(),
+      })
+      .where(and(eq(messages.tenantId, scope.tenantId), eq(messages.id, current.messageId)));
+
+    const released = await this.release(scope, approval, content);
+    return { approval: released.approval, dispatch: released.dispatch };
   }
 
   async decline(
@@ -1010,6 +1068,7 @@ export class ApprovalService {
         decidedAt: Date;
         decidedBy: string;
         declineReason: string | null;
+        editedContent: string;
         approverRef: string;
         approverType: string;
         slaDeadline: Date | null;
@@ -1134,6 +1193,22 @@ export class ApprovalService {
         throw new ForbiddenError('Access denied: you are not a member of this approval group', {
           right,
         });
+      }
+      return;
+    }
+
+    // `round_robin` names one person, exactly as `agent` does — the rotation
+    // picked them. It had no branch here, so after the permission check it fell
+    // straight through and ANY `outreach:approve` holder in the tenant could
+    // act on a message assigned to somebody else. That is the defect D45
+    // records in the source, surviving in the one approver kind nobody wrote a
+    // case for.
+    if (approval.approverType === 'round_robin' && approval.approverRef) {
+      if (identity !== approval.approverRef) {
+        throw new ForbiddenError(
+          'Access denied: this approval is in someone else’s turn of the rotation',
+          { right },
+        );
       }
       return;
     }

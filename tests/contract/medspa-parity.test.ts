@@ -23,6 +23,20 @@
  * above all, a playbook that starts requiring approval when today it sends
  * immediately (D53) — the regression that would stop every appointment reminder
  * at cutover.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHAT IT DOES NOT CATCH ON ITS OWN, AND WHERE THAT IS COVERED
+ *
+ * This file reads the pack JSON. It never starts the engine, so it proves the
+ * pack SAYS the right thing and not that the runtime DOES it — a matcher that
+ * dropped a channel, a trigger whose predicate never fires, a template that
+ * fails to install would all pass here.
+ *
+ * `SWITCH_CASES` is exported for that reason, and
+ * `tests/integration/playbooks.test.ts` drives one real engine run per event
+ * family from this same table. Two files, one source of truth: a row edited
+ * here changes what the engine is asserted to do, rather than only what the
+ * JSON is asserted to contain.
  * ─────────────────────────────────────────────────────────────────────────────
  */
 import { join } from 'node:path';
@@ -59,7 +73,7 @@ function selection(playbook: PlaybookDefinition): Record<string, string> {
  * logic at all (verified: `grep -rn "approval" src/events/ src/services/queue/`
  * returns nothing).
  */
-const SWITCH_CASES = [
+export const SWITCH_CASES = [
   {
     eventType: 'APPOINTMENT_REMINDER',
     source: ':121-164',
