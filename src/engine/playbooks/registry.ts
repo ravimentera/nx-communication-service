@@ -215,10 +215,27 @@ export class PlaybookRegistry {
       .set({ isActive: false, updatedAt: new Date() })
       .where(and(eq(tenantPacks.tenantId, scope.tenantId), eq(tenantPacks.packId, packId)));
 
-    await this.deps.db
-      .update(playbooks)
-      .set({ isActive: false, updatedAt: new Date() })
-      .where(and(eq(playbooks.tenantId, scope.tenantId), eq(playbooks.packId, packId)));
+    // ─────────────────────────────────────────────────────────────────────────
+    // AND NOT `playbooks.is_active = false`, WHICH THIS USED TO DO.
+    //
+    // The matcher already requires the pack: `installedPacks()` reads
+    // `tenant_packs` filtered on `is_active`, and a playbook whose `pack_id` is
+    // not in that list is never a candidate. Deactivating the pack row is
+    // therefore sufficient on its own, and flipping the playbooks was pure
+    // redundancy — with a one-way ratchet attached.
+    //
+    // Reinstalling skips rows that already exist, and even
+    // `overwriteCustomized`'s upsert did not SET `is_active`. So an uninstall
+    // followed by a reinstall left every playbook permanently `false`: install
+    // reported success, the pack looked present, and every event went UNMATCHED
+    // with nothing anywhere saying why.
+    //
+    // Leaving the column alone also preserves the tenant's own decisions. AI
+    // playbooks ship inactive deliberately and a tenant switches them on one at
+    // a time; blanket-flipping on uninstall discarded that, and blanket-flipping
+    // back on reinstall would have been worse — it would silently start sending
+    // model-written messages nobody re-approved.
+    // ─────────────────────────────────────────────────────────────────────────
 
     this.deps.logger.info('pack deactivated', { tenantId: scope.tenantId, packId });
   }
@@ -315,23 +332,58 @@ export class PlaybookRegistry {
 
       if (existing.length > 0 && !overwrite) continue;
 
-      await this.deps.db
+      const values = {
+        mode: policy.mode,
+        name: policy.name,
+        confidenceThreshold:
+          policy.confidenceThreshold === undefined ? null : String(policy.confidenceThreshold),
+        sampleRate: policy.sampleRate === undefined ? null : String(policy.sampleRate),
+        approverResolution: policy.approverResolution ?? { kind: 'agent' },
+        rights: policy.rights ?? {},
+        sla: policy.sla ?? {},
+      };
+
+      // ── OVERWRITE MEANS OVERWRITE ────────────────────────────────────────
+      //
+      // Both branches ended in `.onConflictDoNothing()` and `count += 1`
+      // regardless — so with `overwriteCustomized: true` the partial unique
+      // index swallowed the write, nothing changed, and the install result
+      // reported the policy as updated.
+      //
+      // A pack shipping a corrected `sla.onExpiry` or a tightened
+      // `rights.bulk` therefore never reached a tenant that already had the
+      // policy, and the API said it had. The templates path immediately below
+      // has always had the right shape; this one did not.
+      if (existing.length > 0) {
+        const [updated] = await this.deps.db
+          .update(approvalPolicies)
+          .set({ ...values, packId: pack.id, updatedAt: new Date() })
+          .where(
+            and(
+              eq(approvalPolicies.tenantId, scope.tenantId),
+              eq(approvalPolicies.key, policy.key),
+            ),
+          )
+          .returning({ id: approvalPolicies.id });
+        if (updated) count += 1;
+        continue;
+      }
+
+      const [inserted] = await this.deps.db
         .insert(approvalPolicies)
         .values({
           tenantId: scope.tenantId,
           packId: pack.id,
           key: policy.key,
-          name: policy.name,
-          mode: policy.mode,
-          confidenceThreshold:
-            policy.confidenceThreshold === undefined ? null : String(policy.confidenceThreshold),
-          sampleRate: policy.sampleRate === undefined ? null : String(policy.sampleRate),
-          approverResolution: policy.approverResolution ?? { kind: 'agent' },
-          rights: policy.rights ?? {},
-          sla: policy.sla ?? {},
+          ...values,
         })
-        .onConflictDoNothing();
-      count += 1;
+        // Still guarded: two installs racing must not both insert. The count
+        // now follows what the database actually did rather than what was
+        // attempted.
+        .onConflictDoNothing()
+        .returning({ id: approvalPolicies.id });
+
+      if (inserted) count += 1;
     }
     return count;
   }

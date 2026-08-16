@@ -271,3 +271,108 @@ export function describeIssues(error: z.ZodError): string {
     .map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`)
     .join('; ');
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE OTHER HALF OF THE PACK
+//
+// `docs/PACKS.md` says "Every file is parsed through Zod with `.strict()` at
+// boot". Until P13 that was true of the manifest, policies, templates and
+// playbooks, and false of everything below — prompts, compliance rules, EHR
+// mappings and event types were `JSON.parse` plus a cast.
+//
+// The consequences are not cosmetic, because these shapes are consumed
+// structurally rather than read field by field:
+//
+//   - `constraints` is joined into the system prompt. A string instead of an
+//     array spreads character by character, so the model receives a bulleted
+//     list of single letters where its safety rules should be.
+//   - an EHR rule's `contains` is iterated. A string instead of an array
+//     matches per character, so `"appointment"` matches any event name
+//     containing the letters a, p, p, o… — which is very nearly all of them.
+//   - `phiPatterns` are compiled as regexes. A malformed one throws inside the
+//     compliance gate, on the send path.
+//
+// Every schema is `.strict()` for the reason the file header gives: a
+// misspelled key silently doing nothing is the failure mode that costs a month.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const promptPackSchema = z
+  .object({
+    key: z.string().min(1),
+    version: z.number().int().positive(),
+    persona: z.string().optional(),
+    goal: z.string().optional(),
+    /** An ARRAY. See the note above on what a bare string does here. */
+    constraints: z.array(z.string()).optional(),
+    channelRules: z.record(z.string(), z.string()).optional(),
+    modelHints: z
+      .object({
+        temperature: z.number().min(0).max(2).optional(),
+        maxTokens: z.number().int().positive().optional(),
+        model: z.string().optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+
+export const lintRulesSchema = z
+  .object({
+    prohibitedPhrases: z.array(z.string()).optional(),
+    requiredDisclaimers: z.array(z.string()).optional(),
+    maxLength: z.record(z.string(), z.number().int().positive()).optional(),
+    /**
+     * Compiled as regexes at lint time, so an invalid one is a boot-time
+     * error here rather than a throw inside the compliance gate on a send.
+     */
+    phiPatterns: z
+      .array(
+        z.string().refine(
+          (source) => {
+            try {
+              new RegExp(source, 'i');
+              return true;
+            } catch {
+              return false;
+            }
+          },
+          { message: 'is not a valid regular expression' },
+        ),
+      )
+      .optional(),
+    linkPolicy: z.enum(['any', 'allowlist']).optional(),
+    allowedDomains: z.array(z.string()).optional(),
+  })
+  .strict();
+
+export const ehrMappingSchema = z
+  .object({
+    rules: z.array(
+      z
+        .object({
+          event: z.string().min(1).optional(),
+          /** An ARRAY, and every term must appear. See the note above. */
+          contains: z.array(z.string().min(1)).min(1).optional(),
+          source: z.string().optional(),
+          eventType: z.string().min(1),
+          priority: z.enum(['LOW', 'MEDIUM', 'HIGH', 'URGENT']).optional(),
+          channels: z.array(z.string()).optional(),
+          metadata: z.record(z.string(), z.unknown()).optional(),
+          reason: z.string().optional(),
+        })
+        .strict()
+        // A rule matching on neither an exact name nor a pattern matches
+        // nothing, silently, forever.
+        .refine((rule) => Boolean(rule.event ?? rule.contains?.length), {
+          message: "an EHR rule needs either 'event' or 'contains'",
+        }),
+    ),
+  })
+  .strict();
+
+export const eventTypeCatalogueSchema = z
+  .object({
+    aliases: z.record(z.string(), z.array(z.string().min(1))).optional(),
+    known: z.array(z.string().min(1)).optional(),
+  })
+  .strict();

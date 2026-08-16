@@ -96,10 +96,17 @@ allowed.
 
 ### `$comment` keys are documentation
 
-Any key beginning with `$` is stripped before validation, in every file that
-takes a flat map (`aliases.json`, `compliance.json`, `event-types.json`). Use
-them. A pack file is read by someone six months from now who has no other source
-of truth.
+Any key beginning with `$` is stripped before validation, **in every pack file
+and at every depth** — so `$comment` works at the top of a playbook, inside a
+`modelHints` block, and as a per-field `$comment.<field>` beside the field it
+describes. Use them. A pack file is read by someone six months from now who has
+no other source of truth.
+
+> **Corrected in P13.** This said the convention applied only to the files
+> taking a flat map. Pack authors had already used it in `prompts/*.json` and
+> `ehr-mapping.json`, and were right to — a commenting convention with
+> exceptions is one nobody can rely on. Adding Zod validation to those files
+> turned the discrepancy into seven startup errors, which is how it surfaced.
 
 ---
 
@@ -107,6 +114,17 @@ of truth.
 
 **Every file is parsed through Zod with `.strict()` at boot**, and a failure
 names the file and the field path.
+
+> **True as of P13.** It was written aspirationally: the manifest, policies,
+> templates and playbooks were validated, while `prompts/*.json`,
+> `compliance.json`, `ehr-mapping.json` and `event-types.json` were
+> `JSON.parse` plus a cast. That mattered because those shapes are consumed
+> *structurally*, not field by field — a prompt pack's `constraints` given as a
+> string instead of an array spreads character by character into the system
+> prompt, and an EHR rule's `contains` given as a string matches per character,
+> so `"appointment"` matches almost every event name there is. `phiPatterns`
+> are now compiled at load, so an invalid regex is a named startup error rather
+> than a throw inside the compliance gate on the send path.
 
 Strictness matters more than it looks. A `templateKey` misspelled `template_key`
 would be silently ignored by a permissive parser, and the playbook would render

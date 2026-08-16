@@ -18,6 +18,7 @@ import winston from 'winston';
 
 import { createDb, type Db } from '../../src/db/index.js';
 import {
+  approvalPolicies,
   approvals,
   messages,
   playbookRuns,
@@ -326,6 +327,152 @@ describe('installing the medspa pack', () => {
     expect((row?.config as { emergencyContacts: string[] }).emergencyContacts).toEqual([
       'oncall@clinic.test',
     ]);
+  });
+});
+
+describe('uninstall and reinstall', () => {
+  /**
+   * Uninstall set `playbooks.is_active = false` as well as deactivating the
+   * pack. Reinstall skips rows that already exist, and even
+   * `overwriteCustomized`'s upsert omitted `is_active` from its SET — so the
+   * cycle left every playbook permanently inactive. Install reported success,
+   * `GET /v1/packs` showed the pack present, and every event went UNMATCHED
+   * with nothing anywhere saying why.
+   *
+   * The pack row alone is sufficient: the matcher requires an active
+   * `tenant_packs` entry, so flipping the playbooks was redundant — with a
+   * one-way ratchet attached.
+   */
+  it('leaves a tenant’s playbooks working after a round trip', async () => {
+    const fresh = { tenantId: 't-pb-cycle' };
+    await db.insert(tenants).values({ id: fresh.tenantId, name: 'Cycle' });
+    await registry.installPack(fresh, 'medspa', {
+      config: {
+        emergencyContacts: ['ops@clinic.test'],
+        slackChannels: { staffAlerts: '#s', emergencyAlerts: '#e', systemAlerts: '#y' },
+      },
+    });
+
+    const activeBefore = (await registry.listPlaybooks(fresh, { active: true })).length;
+    expect(activeBefore).toBeGreaterThan(0);
+
+    await registry.uninstallPack(fresh, 'medspa');
+
+    // Uninstalled means unreachable — the pack row is what the matcher checks.
+    expect(
+      await runtime.run({
+        type: 'event',
+        tenantId: fresh.tenantId,
+        eventType: 'APPOINTMENT_REMINDER',
+        payload: {},
+        correlationId: `cycle-off-${Math.random()}`,
+      }),
+    ).toHaveLength(0);
+
+    await registry.installPack(fresh, 'medspa', {
+      config: {
+        emergencyContacts: ['ops@clinic.test'],
+        slackChannels: { staffAlerts: '#s', emergencyAlerts: '#e', systemAlerts: '#y' },
+      },
+    });
+
+    // The same playbooks are active again, and matching again.
+    expect((await registry.listPlaybooks(fresh, { active: true })).length).toBe(activeBefore);
+
+    const recipient = await db
+      .insert(recipients)
+      .values({
+        tenantId: fresh.tenantId,
+        externalRef: { system: 'test', id: 'cycle-r' },
+        displayName: 'Ada',
+        contactPoints: [{ type: 'sms', value: '+15550001111' }],
+      })
+      .returning();
+
+    const results = await runtime.run({
+      type: 'event',
+      tenantId: fresh.tenantId,
+      eventType: 'APPOINTMENT_REMINDER',
+      channels: ['sms'],
+      recipientId: recipient[0]!.id,
+      payload: { context: { appointmentDate: 'Tuesday' } },
+      correlationId: `cycle-on-${Math.random()}`,
+    });
+    expect(results).toHaveLength(1);
+    expect(results[0]!.status).toBe('QUEUED');
+  });
+
+  /**
+   * A tenant that deliberately switched a playbook off keeps it off. AI
+   * playbooks ship inactive and are enabled one at a time; a reinstall that
+   * blanket-reactivated would silently start sending model-written messages
+   * nobody re-approved.
+   */
+  /**
+   * The overwrite path ended in `onConflictDoNothing()` and incremented its
+   * count regardless — so a pack shipping a corrected `sla.onExpiry` or a
+   * tightened `rights.bulk` never reached a tenant that already had the policy,
+   * and the install result said it had.
+   */
+  it('overwriteCustomized actually updates an approval policy', async () => {
+    const fresh = { tenantId: 't-pb-policy' };
+    await db.insert(tenants).values({ id: fresh.tenantId, name: 'Policy' });
+    const config = {
+      emergencyContacts: ['ops@clinic.test'],
+      slackChannels: { staffAlerts: '#s', emergencyAlerts: '#e', systemAlerts: '#y' },
+    };
+    await registry.installPack(fresh, 'medspa', { config });
+
+    // Stand in for a tenant edit, or for the previous version of the pack.
+    await db
+      .update(approvalPolicies)
+      .set({ mode: 'none', rights: { bulk: false }, name: 'Stale name' })
+      .where(
+        and(
+          eq(approvalPolicies.tenantId, fresh.tenantId),
+          eq(approvalPolicies.key, 'medspa.provider-always'),
+        ),
+      );
+
+    await registry.installPack(fresh, 'medspa', { config, overwriteCustomized: true });
+
+    const [after] = await db
+      .select({
+        mode: approvalPolicies.mode,
+        rights: approvalPolicies.rights,
+        name: approvalPolicies.name,
+      })
+      .from(approvalPolicies)
+      .where(
+        and(
+          eq(approvalPolicies.tenantId, fresh.tenantId),
+          eq(approvalPolicies.key, 'medspa.provider-always'),
+        ),
+      );
+
+    // The pack's own values are back, which is what "overwrite" was reporting
+    // while doing nothing at all.
+    expect(after!.mode).toBe('always');
+    expect(after!.name).toBe('Provider approves everything');
+    expect(after!.rights).toMatchObject({ bulk: true, approve: true });
+  });
+
+  it('does not resurrect a playbook the tenant turned off', async () => {
+    const fresh = { tenantId: 't-pb-choice' };
+    await db.insert(tenants).values({ id: fresh.tenantId, name: 'Choice' });
+    const config = {
+      emergencyContacts: ['ops@clinic.test'],
+      slackChannels: { staffAlerts: '#s', emergencyAlerts: '#e', systemAlerts: '#y' },
+    };
+    await registry.installPack(fresh, 'medspa', { config });
+
+    await registry.setActive(fresh, 'medspa.appointment-reminder', false);
+    await registry.installPack(fresh, 'medspa', { config, overwriteCustomized: true });
+
+    const [row] = await registry.listPlaybooks(fresh, { packId: 'medspa' }).then((rows) =>
+      rows.filter((r) => r.key === 'medspa.appointment-reminder'),
+    );
+    expect(row!.isActive).toBe(false);
   });
 });
 
