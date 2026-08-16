@@ -28,6 +28,7 @@ const creds = (values: Record<string, string>, from?: string): ChannelCredential
 
 const email: RenderedMessage = { subject: 'Hi', body: 'hello' };
 const sms: RenderedMessage = { body: 'hello' };
+import { maskDestination } from '../../../src/adapters/channels/base.js';
 
 describe('dry run', () => {
   it.each([
@@ -156,5 +157,33 @@ describe('capabilities describe what each channel can carry', () => {
   it('smtp cannot produce a correlatable receipt but sendgrid can', () => {
     expect(new SmtpChannel(live).capabilities.supportsDeliveryReceipts).toBe(false);
     expect(new SendGridChannel(live).capabilities.supportsDeliveryReceipts).toBe(true);
+  });
+});
+
+/**
+ * Destinations in logs.
+ *
+ * Every adapter logged `to.value` at info — a patient's phone number or email
+ * address in plaintext, in a logger with no redaction and a file transport
+ * available. Subjects went with them, and a subject line routinely names the
+ * treatment.
+ */
+describe('maskDestination', () => {
+  it('keeps an email diagnosable without carrying the address', () => {
+    expect(maskDestination('ada.lovelace@example.com')).toBe('a***e@example.com');
+    // The domain survives: it is the tenant's own mail provider far more often
+    // than it is identifying, and it is what makes a bounce diagnosable.
+    expect(maskDestination('a@example.com')).toBe('a***@example.com');
+  });
+
+  it('keeps the last four of a phone number, as a card receipt does', () => {
+    expect(maskDestination('+15551234567')).toBe('+155***4567');
+    expect(maskDestination('5551234567')).toBe('***4567');
+  });
+
+  it('does not leak a short or absent value', () => {
+    expect(maskDestination('abc')).toBe('***');
+    expect(maskDestination(undefined)).toBe('(none)');
+    expect(maskDestination('')).toBe('(none)');
   });
 });

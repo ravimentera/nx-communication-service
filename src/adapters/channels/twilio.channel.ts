@@ -22,7 +22,7 @@ import type {
   RenderedMessage,
   ValidationOutcome,
 } from '../../ports/channel.js';
-import { dryRunResult, failure, retryableForStatus, type ChannelDeps } from './base.js';
+import { maskDestination, dryRunResult, failure, retryableForStatus, type ChannelDeps } from './base.js';
 
 /**
  * Twilio error codes that will never succeed on retry, however many times we
@@ -113,13 +113,13 @@ export class TwilioChannel implements Channel {
 
     try {
       const message = await this.client(accountSid, authToken).messages.create({
-        to: to.value,
+        to: maskDestination(to.value),
         from: creds.from,
         body: msg.body,
       });
 
       this.deps.logger.info('sms sent', {
-        to: to.value,
+        to: maskDestination(to.value),
         providerMessageId: message.sid,
         credentialSource: creds.source,
       });

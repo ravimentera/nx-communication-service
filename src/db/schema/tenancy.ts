@@ -97,6 +97,19 @@ export const tenantChannelConfigs = pgTable(
     sendgridEnabled: boolean('sendgrid_enabled').notNull().default(false),
 
     slackBotToken: text('slack_bot_token'),
+
+    /**
+     * Outbound webhook signing key. Here rather than on the message, because a
+     * secret in a message is a secret in the BullMQ job payload in Redis, in
+     * plaintext, for the queue's retention window. Sealed by 0013 with the rest.
+     */
+    webhookSigningSecret: text('webhook_signing_secret'),
+    /**
+     * Hosts this tenant's webhooks may reach, suffix-matched. NULL means the
+     * engine default — any public address, no private or link-local ranges.
+     * See `adapters/channels/url-guard.ts`. Added in 0020.
+     */
+    webhookAllowedHosts: text('webhook_allowed_hosts').array(),
     slackDefaultChannel: text('slack_default_channel'),
     slackEnabled: boolean('slack_enabled').notNull().default(false),
 

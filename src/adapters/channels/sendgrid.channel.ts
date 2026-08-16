@@ -27,7 +27,7 @@ import type {
   RenderedMessage,
   ValidationOutcome,
 } from '../../ports/channel.js';
-import { dryRunResult, failure, retryableForStatus, type ChannelDeps } from './base.js';
+import { maskDestination, dryRunResult, failure, retryableForStatus, type ChannelDeps } from './base.js';
 
 interface SendGridResponse {
   statusCode?: number;
@@ -96,7 +96,7 @@ export class SendGridChannel implements Channel {
 
     try {
       const [response] = (await this.client(apiKey).send({
-        to: to.value,
+        to: maskDestination(to.value),
         from: creds.values.fromName
           ? { email: creds.from, name: creds.values.fromName }
           : creds.from,
@@ -119,7 +119,7 @@ export class SendGridChannel implements Channel {
       const providerMessageId = Array.isArray(header) ? header[0] : header;
 
       this.deps.logger.info('email sent', {
-        to: to.value,
+        to: maskDestination(to.value),
         providerMessageId,
         credentialSource: creds.source,
       });

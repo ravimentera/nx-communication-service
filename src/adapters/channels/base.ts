@@ -23,6 +23,54 @@ export interface ChannelDeps {
    * explicit flag, injected, defaulting to on.
    */
   dryRun: boolean;
+  /**
+   * Let the webhook adapter reach private and loopback addresses.
+   *
+   * For local development against `localhost` and for tests. The composition
+   * root derives it from `NODE_ENV`, so a production image cannot turn it on
+   * by configuration — which is the point, since it disables the SSRF guard.
+   */
+  allowPrivateWebhookTargets?: boolean;
+}
+
+/**
+ * A destination safe to write to a log.
+ *
+ * Every adapter logged `to.value` at info — a patient's phone number or email
+ * address, in plaintext, in a logger that has no redaction and supports a file
+ * transport. Subjects went with them, and a subject line routinely names the
+ * treatment.
+ *
+ * Enough survives to correlate a log line with a delivery receipt and to tell
+ * two recipients apart; not enough to contact anybody or to identify them from
+ * the log alone.
+ *
+ *   ada.lovelace@example.com  ->  a***e@example.com
+ *   +15551234567              ->  +1555***4567
+ */
+export function maskDestination(value: string | undefined): string {
+  if (!value) return '(none)';
+
+  const at = value.lastIndexOf('@');
+  if (at > 0) {
+    const local = value.slice(0, at);
+    const domain = value.slice(at);
+    // The domain stays: it is the tenant's own mail provider far more often
+    // than it is identifying, and it is what makes a bounce diagnosable.
+    const head = local[0] ?? '';
+    const tail = local.length > 1 ? local[local.length - 1] : '';
+    return `${head}***${tail}${domain}`;
+  }
+
+  // A phone number. Keep the last four, as a card receipt does, plus the
+  // country prefix so a misrouted send is still recognisable.
+  const digits = value.replace(/\D/g, '');
+  if (digits.length >= 4) {
+    const prefix = value.startsWith('+') ? value.slice(0, Math.min(4, value.length - 4)) : '';
+    return `${prefix}***${digits.slice(-4)}`;
+  }
+
+  return '***';
 }
 
 export function dryRunResult(
@@ -34,10 +82,13 @@ export function dryRunResult(
 ): DeliveryResult {
   logger.info('dry run — message not sent', {
     channel,
-    to: to.value,
+    to: maskDestination(to.value),
     from: creds.from,
     credentialSource: creds.source,
-    subject: msg.subject,
+    // The subject is not logged: it routinely names the treatment, which is
+    // the most identifying line in the whole message. Its length is enough to
+    // tell "a subject was set" from "one was not".
+    subjectLength: msg.subject?.length ?? 0,
     bodyLength: msg.body.length,
   });
   return {

@@ -118,6 +118,11 @@ async function main(): Promise<void> {
     logger,
     db,
     dryRun: config.channels.dryRun,
+    // Derived from NODE_ENV rather than read from a setting: this switch turns
+    // off the outbound-webhook SSRF guard, and a production image must not be
+    // able to turn it on by configuration. Local development needs it to reach
+    // a webhook receiver on localhost.
+    allowPrivateWebhookTargets: !config.server.isProduction,
     preferSmtp: !config.channels.sendgrid.apiKey && Boolean(config.channels.smtp.host),
   });
 

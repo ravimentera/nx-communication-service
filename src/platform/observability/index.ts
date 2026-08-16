@@ -17,6 +17,5 @@ export {
 } from './metrics.js';
 export {
   createObservabilityMiddleware,
-  normalizeRoutePath,
   type ObservabilityOptions,
 } from './middleware.js';

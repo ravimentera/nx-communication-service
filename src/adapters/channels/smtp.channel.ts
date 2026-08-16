@@ -15,7 +15,7 @@ import type {
   RenderedMessage,
   ValidationOutcome,
 } from '../../ports/channel.js';
-import { dryRunResult, failure, type ChannelDeps } from './base.js';
+import { maskDestination, dryRunResult, failure, type ChannelDeps } from './base.js';
 
 export class SmtpChannel implements Channel {
   readonly type: ChannelType = 'email';
@@ -83,7 +83,7 @@ export class SmtpChannel implements Channel {
 
     try {
       const info = await this.transport(creds.values).sendMail({
-        to: to.value,
+        to: maskDestination(to.value),
         from: creds.from,
         subject: msg.subject ?? '',
         text: msg.body,
@@ -100,7 +100,7 @@ export class SmtpChannel implements Channel {
       });
 
       this.deps.logger.info('email sent via smtp', {
-        to: to.value,
+        to: maskDestination(to.value),
         providerMessageId: info.messageId,
       });
       return { success: true, dispatched: true, providerMessageId: info.messageId };

@@ -1,5 +1,5 @@
 import cors from 'cors';
-import express, { type Express } from 'express';
+import express, { type Express, type Request } from 'express';
 import helmet from 'helmet';
 import type pg from 'pg';
 import type { Logger } from 'winston';
@@ -96,6 +96,19 @@ export interface AppDeps {
  *   4. The legacy compat surface is mounted LAST, so a root-mounted legacy
  *      router can never shadow a `/v1` path.
  */
+/**
+ * The socket's own peer address.
+ *
+ * Deliberately NOT `req.ip`, which honours `X-Forwarded-For` once
+ * `trust proxy` is set — and a header any caller can send is not an access
+ * control. The metrics allow-list has to be about who actually connected.
+ */
+function callerIp(req: Request): string {
+  const raw = req.socket.remoteAddress ?? '';
+  // Node reports IPv4 peers over a dual-stack socket as ::ffff:127.0.0.1.
+  return raw.startsWith('::ffff:') ? raw.slice('::ffff:'.length) : raw;
+}
+
 export function createApp(deps: AppDeps): Express {
   const { config, logger } = deps;
   const app = express();
@@ -111,7 +124,23 @@ export function createApp(deps: AppDeps): Express {
   );
 
   // (1) Pre-auth: Prometheus has no gateway headers.
+  //
+  // ALLOW-LISTED BY SOURCE ADDRESS, because pre-auth and tenant-labelled is a
+  // bad pair. Eight metric families carry a `tenant` label, so one
+  // unauthenticated GET returns the tenant roster along with each one's send
+  // volume and model spend. Defaults to loopback — a sidecar scrape keeps
+  // working, an exposed pod stops answering — and `METRICS_ALLOWED_IPS=*`
+  // restores the old behaviour where the network perimeter already handles it.
+  const metricsAllowed = new Set(config.observability.metricsAllowedIps);
+  const metricsOpen = metricsAllowed.has('*');
+
   app.get('/metrics', (req, res) => {
+    if (!metricsOpen && !metricsAllowed.has(callerIp(req))) {
+      // 404, not 403: whether this deployment exposes metrics at all is not
+      // something an unauthorized caller needs confirmed.
+      res.status(404).end();
+      return;
+    }
     void metricsHandler(req, res);
   });
 

@@ -94,13 +94,43 @@ const slackMapper: CredentialMapper = {
 };
 
 /**
- * push / webhook / in_app carry no shared secret: push targets a device token,
- * webhook targets a URL supplied per message, in_app writes to our own table.
- * They resolve trivially so the dispatcher can treat every channel alike.
+ * push / in_app carry no shared secret: push targets a device token, in_app
+ * writes to our own table. They resolve trivially so the dispatcher can treat
+ * every channel alike.
  */
 const secretlessMapper: CredentialMapper = {
   fromAgent: () => null,
   fromTenant: () => null,
+  fromEnv: () => ({ values: {} }),
+};
+
+/**
+ * Webhook. It was in the secretless group, which is how its signing secret came
+ * to ride on `msg.metadata.secret` — in the message, therefore in the BullMQ job
+ * payload, therefore in Redis in plaintext for the queue's retention window.
+ *
+ * There is no env-level fallback and no agent level. A signing key is a
+ * statement about one tenant's relationship with one endpoint; a global one
+ * would let every tenant forge every other tenant's signatures.
+ *
+ * `values` also carries the allow-list, because the resolver is the one thing
+ * the adapter is already handed and threading a second lookup through the
+ * dispatcher for it would be a second way to reach the same row.
+ */
+const webhookMapper: CredentialMapper = {
+  fromAgent: () => null,
+  fromTenant: (tenant) => ({
+    values: {
+      ...(tenant.webhookSigningSecret ? { signingSecret: tenant.webhookSigningSecret } : {}),
+      ...(tenant.webhookAllowedHosts?.length
+        ? { allowedHosts: tenant.webhookAllowedHosts.join(',') }
+        : {}),
+    },
+  }),
+  // An unconfigured tenant still sends webhooks; they are simply unsigned, and
+  // the URL guard's default rules apply. Returning null here would make the
+  // dispatcher refuse the channel outright, which is a bigger change than the
+  // defect being fixed.
   fromEnv: () => ({ values: {} }),
 };
 
@@ -110,7 +140,7 @@ export function createCredentialMappers(): CredentialMappers {
     ['email', emailMapper],
     ['slack', slackMapper],
     ['push', secretlessMapper],
-    ['webhook', secretlessMapper],
+    ['webhook', webhookMapper],
     ['in_app', secretlessMapper],
   ]);
 }

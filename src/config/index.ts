@@ -158,6 +158,18 @@ const envSchema = z.object({
   // --- compliance ---
   UNSUBSCRIBE_BASE_URL: str('http://localhost:5007/unsubscribe'),
   DEFAULT_TIMEZONE: str('America/Los_Angeles'),
+  /**
+   * Who may scrape `/metrics`. A comma-separated list of CIDR-less IPs or
+   * `*` for everyone.
+   *
+   * `/metrics` is mounted before auth — Prometheus carries no gateway headers —
+   * and eight metric families carry a `tenant` label, so one unauthenticated
+   * GET returns the tenant roster plus each one's send volume and model spend.
+   * Defaulting to loopback means a pod scraped by a sidecar keeps working and
+   * an internet-exposed one stops leaking; `*` restores the old behaviour for
+   * a deployment whose network perimeter already handles it.
+   */
+  METRICS_ALLOWED_IPS: str('127.0.0.1,::1'),
   ENFORCE_QUIET_HOURS: bool(true),
   RETENTION_DRY_RUN: bool(true),
   COMPLIANCE_SHADOW_MODE: bool(true),
@@ -281,6 +293,9 @@ function shape(env: Env) {
     observability: {
       serviceName: env.SERVICE_NAME,
       logLevel: env.LOG_LEVEL,
+      metricsAllowedIps: env.METRICS_ALLOWED_IPS.split(',')
+        .map((v) => v.trim())
+        .filter(Boolean),
       logDir: env.LOG_DIR,
       logToFile: env.LOG_TO_FILE,
     },

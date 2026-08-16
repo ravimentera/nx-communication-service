@@ -68,8 +68,26 @@ export function createResultRecorder(db: Db, logger: Logger, deps: ResultRecorde
 
     // Only a real send closes an approval. A failure leaves it APPROVED so a
     // retry — or a human — can still act on it.
+    //
+    // GUARDED, because this runs AFTER the provider accepted the message.
+    // Anything that throws from here reaches BullMQ, which retries the job —
+    // and the job's work is "call the provider", so the retry sends the SMS
+    // again. Up to five times, ten for URGENT, with no idempotency key on the
+    // provider side to catch it.
+    //
+    // `approvals.markSent` happens to swallow its own errors today, so the
+    // path is not currently reachable. That is a property of one implementation
+    // of an injected hook, not of this code — and it is the wrong thing to be
+    // relying on at the point where a duplicate costs a real message.
     if (result.success && deps.onSent) {
-      await deps.onSent(job);
+      try {
+        await deps.onSent(job);
+      } catch (error) {
+        logger.error('post-send bookkeeping failed; the message was already sent', {
+          messageId: job.messageId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
   };
 }
