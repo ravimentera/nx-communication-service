@@ -93,6 +93,22 @@ beforeAll(async () => {
     unsubscribeBaseUrl: 'https://example.test/unsubscribe',
   });
   recipientService = new RecipientService({ db, logger });
+
+  // ── THE TENANT'S OPT-IN POSTURE IS STATED, NOT INHERITED ──────────────────
+  //
+  // `require_opt_in` is `NOT NULL DEFAULT true` and the gate now honours that
+  // default for a tenant with NO config row — previously a missing row read as
+  // `false`, so the least-configured tenant got the most permissive treatment.
+  //
+  // Most cases in this file are about a different check entirely, so the row
+  // says `false` and the two suites that care about consent flip it explicitly.
+  // Relying on the absence of a row to mean "no opt-in required" is exactly the
+  // accident the gate change removes.
+  await db.insert(tenantChannelConfigs).values({
+    tenantId: TENANT,
+    name: 'cfg',
+    requireOptIn: false,
+  });
 }, 240_000);
 
 afterAll(async () => {
@@ -163,11 +179,10 @@ describe('check 3 — channel preference and consent', () => {
   });
 
   it('requires a consent record when the tenant sets require_opt_in', async () => {
-    await db.insert(tenantChannelConfigs).values({
-      tenantId: TENANT,
-      name: 'cfg',
-      requireOptIn: true,
-    });
+    await db
+      .update(tenantChannelConfigs)
+      .set({ requireOptIn: true })
+      .where(eq(tenantChannelConfigs.tenantId, TENANT));
     const recipient = await makeRecipient();
 
     const blocked = await gate(false).check(input(recipient.id));
@@ -184,6 +199,77 @@ describe('check 3 — channel preference and consent', () => {
     expect((await gate(false).check(input(recipient.id))).allow).toBe(true);
 
     await db.update(tenantChannelConfigs).set({ requireOptIn: false }).where(eq(tenantChannelConfigs.tenantId, TENANT));
+  });
+});
+
+/**
+ * The tenant nobody has configured.
+ *
+ * `require_opt_in` is `NOT NULL DEFAULT true`, so every row that exists says
+ * opt-in is required. `loadTenantConfig()` returns null when there is no row,
+ * and `tenantConfig?.requireOptIn` made that `undefined` — falsy — so the one
+ * tenant state that has never been configured was the one that skipped the
+ * check entirely.
+ *
+ * Backwards in the direction that matters: a brand-new tenant, least likely to
+ * have consent records or a considered policy, got the most permissive
+ * treatment — and it contradicted what the schema promises anyone reading it.
+ */
+describe('a tenant with no channel config at all', () => {
+  const FRESH = 't-comp-fresh';
+
+  beforeAll(async () => {
+    await db.insert(tenants).values({ id: FRESH, name: 'Fresh' }).onConflictDoNothing();
+  });
+
+  const freshInput = (recipientId: string) =>
+    ({
+      scope: { tenantId: FRESH },
+      channel: 'email' as const,
+      priority: 'MEDIUM' as const,
+      recipientId,
+      rendered: { body: 'hello' },
+    }) as Parameters<ComplianceGate['check']>[0];
+
+  async function freshRecipient() {
+    const [row] = await db
+      .insert(recipients)
+      .values({
+        tenantId: FRESH,
+        externalRef: { system: 'test', id: `f-${Math.random().toString(36).slice(2)}` },
+        displayName: 'Grace',
+      })
+      .returning();
+    return row!;
+  }
+
+  it('requires consent, matching the column default rather than ignoring it', async () => {
+    const recipient = await freshRecipient();
+    const verdict = await gate(false).check(freshInput(recipient.id));
+
+    expect(verdict.allow).toBe(false);
+    if (!verdict.allow) expect(verdict.reason).toBe('CONSENT_REQUIRED');
+  });
+
+  it('sends once consent is recorded — the state is reachable, not a dead end', async () => {
+    const recipient = await freshRecipient();
+    await new ConsentService({ db, logger }).grant({ tenantId: FRESH }, recipient.id, {
+      channels: ['email'],
+      source: 'signup_form',
+    });
+
+    expect((await gate(false).check(freshInput(recipient.id))).allow).toBe(true);
+  });
+
+  it('is still only a shadow warning while shadow mode is on', async () => {
+    // Which is why turning this default around is safe to ship: nothing is
+    // blocked until an operator enforces per tenant, and the runbook has them
+    // read 9011's unconsented count first.
+    const recipient = await freshRecipient();
+    const verdict = await gate(true).check(freshInput(recipient.id));
+
+    expect(verdict.allow).toBe(true);
+    if (verdict.allow) expect(verdict.shadowed).toBe('CONSENT_REQUIRED');
   });
 });
 
@@ -206,12 +292,9 @@ describe('the consent writer', () => {
 
   async function requiringOptIn<T>(run: () => Promise<T>): Promise<T> {
     await db
-      .insert(tenantChannelConfigs)
-      .values({ tenantId: TENANT, name: 'cfg', requireOptIn: true })
-      .onConflictDoUpdate({
-        target: tenantChannelConfigs.tenantId,
-        set: { requireOptIn: true },
-      });
+      .update(tenantChannelConfigs)
+      .set({ requireOptIn: true })
+      .where(eq(tenantChannelConfigs.tenantId, TENANT));
     try {
       return await run();
     } finally {

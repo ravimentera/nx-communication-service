@@ -142,6 +142,15 @@ export interface ComplianceGateDeps {
  */
 const CONSUMES_QUOTA = ['QUEUED', 'SENT', 'DELIVERED'];
 
+/**
+ * What a tenant with no `tenant_channel_configs` row gets.
+ *
+ * Mirrors the column's own `NOT NULL DEFAULT true`. Named rather than inlined
+ * so the two cannot drift: if the column's default ever changes, this is the
+ * line that has to change with it.
+ */
+const REQUIRE_OPT_IN_DEFAULT = true;
+
 export class ComplianceGate {
   constructor(private readonly deps: ComplianceGateDeps) {}
 
@@ -223,10 +232,24 @@ export class ComplianceGate {
     if (!this.deps.preferences.channelAllowed(prefs, input.channel)) {
       return this.block('CHANNEL_OPTED_OUT');
     }
-    // GDPR widens this: marketing needs a consent record whatever the tenant's
-    // `require_opt_in` column says, because under GDPR consent is the lawful
-    // basis rather than a tenant preference.
-    if (recipientId && (tenantConfig?.requireOptIn || gdprRequiresConsent(profile, input))) {
+    // ── A MISSING CONFIG MEANS THE COLUMN'S DEFAULT, NOT `false` ────────────
+    //
+    // `require_opt_in` is `NOT NULL DEFAULT true`, so every row that exists
+    // says opt-in is required. `loadTenantConfig()` returns null for a tenant
+    // with no row at all, and `tenantConfig?.requireOptIn` made that `undefined`
+    // — falsy — so the ONE tenant state that has never been configured was the
+    // one that skipped the check entirely.
+    //
+    // That is backwards in the direction that matters: a brand-new tenant, the
+    // least likely to have consent records or a considered policy, got the
+    // most permissive treatment, and it contradicted what the schema promises
+    // anyone reading it.
+    //
+    // GDPR widens this again: marketing needs a consent record whatever the
+    // column says, because there consent is the lawful basis rather than a
+    // tenant preference.
+    const requireOptIn = tenantConfig?.requireOptIn ?? REQUIRE_OPT_IN_DEFAULT;
+    if (recipientId && (requireOptIn || gdprRequiresConsent(profile, input))) {
       const consented = await this.hasConsent(scope, recipientId, input.channel);
       if (!consented) return this.block('CONSENT_REQUIRED');
     }

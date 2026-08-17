@@ -199,3 +199,62 @@ describe('requirePermissions', () => {
     expect(res.status).toBe(200);
   });
 });
+
+/**
+ * Two bypass rules on one path.
+ *
+ * `bypassRules` was `Record<path, rule>`, so declaring an unauthenticated
+ * `GET /x` and a separate rule for `POST /x` kept only whichever was written
+ * second — and the loser was either unreachable or unprotected depending on the
+ * order. A security control whose shape cannot express its own domain is one
+ * waiting to be got wrong.
+ *
+ * Nothing in the service passes `bypassRules` today: the unsubscribe link is
+ * served by mounting its router before the auth middleware. These pin the
+ * option's contract so the next caller gets a working one.
+ */
+describe('createAuthMiddleware — bypass rules', () => {
+  function appWithBypasses(): Express {
+    const app = express();
+    app.use(
+      createAuthMiddleware({
+        config: { mode: 'gateway' },
+        logger,
+        bypassRules: [
+          { method: 'GET', path: '/thing', param: 'token', value: 'abc' },
+          { method: 'POST', path: '/thing', param: 'token', value: 'xyz' },
+        ],
+      }),
+    );
+    app.get('/thing', (_req, res) => void res.json({ via: 'get' }));
+    app.post('/thing', (_req, res) => void res.json({ via: 'post' }));
+    app.use(createErrorHandler({ logger, production: true }));
+    return app;
+  }
+
+  it('honours BOTH rules on the same path — the collision', async () => {
+    const app = appWithBypasses();
+
+    // Under the old shape one of these was 403, and which one depended purely
+    // on declaration order.
+    expect((await request(app).get('/thing?token=abc')).status).toBe(200);
+    expect((await request(app).post('/thing?token=xyz')).status).toBe(200);
+  });
+
+  it('does not let one method’s token open another method', async () => {
+    const app = appWithBypasses();
+    expect((await request(app).get('/thing?token=xyz')).status).toBe(403);
+    expect((await request(app).post('/thing?token=abc')).status).toBe(403);
+  });
+
+  it('still requires the parameter to match', async () => {
+    const app = appWithBypasses();
+    expect((await request(app).get('/thing')).status).toBe(403);
+    expect((await request(app).get('/thing?token=wrong')).status).toBe(403);
+  });
+
+  it('leaves every other path authenticated', async () => {
+    const app = appWithBypasses();
+    expect((await request(app).get('/other?token=abc')).status).toBe(403);
+  });
+});

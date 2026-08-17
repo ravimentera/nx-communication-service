@@ -630,19 +630,47 @@ async function main(): Promise<void> {
     shuttingDown = true;
     logger.info('shutting down', { signal });
 
-    server.close(() => {
-      void (async () => {
-        // Drain the workers before dropping the connections they use.
-        await queue.close();
-        await eventQueue.close();
-        await slaWorker.close();
-        await deferralWorker.close();
-        await retentionWorker.close();
-        await redis.close();
-        await closeDb(pool, logger);
-        process.exit(0);
-      })();
+    // ── WORKERS FIRST, IN PARALLEL WITH THE SERVER CLOSING ──────────────────
+    //
+    // These used to run INSIDE the `server.close()` callback, which fires only
+    // once every open HTTP connection has finished. With keep-alive connections
+    // or a slow request in flight — routine during a rolling deploy — that is
+    // seconds, and the workers went on pulling jobs off the queue the whole
+    // time. When the container's grace period ran out the process took SIGKILL
+    // mid-dispatch, leaving a message half-sent and its row saying QUEUED.
+    //
+    // Closing them first is the point: a worker that has stopped pulling cannot
+    // start work it will not be allowed to finish. `Worker.close()` waits for
+    // the jobs already in hand, so in-flight sends complete rather than being
+    // abandoned — which is the opposite of what the old ordering achieved.
+    //
+    // In parallel with `server.close()`, not before it: draining a worker and
+    // draining HTTP are independent, and doing them in sequence doubles the
+    // window in which the grace period can expire.
+    const stopAcceptingWork = Promise.all([
+      queue.close(),
+      eventQueue.close(),
+      slaWorker.close(),
+      deferralWorker.close(),
+      retentionWorker.close(),
+    ]).catch((error: unknown) => {
+      logger.error('a worker did not close cleanly', {
+        error: error instanceof Error ? error.message : String(error),
+      });
     });
+
+    const stopAcceptingRequests = new Promise<void>((resolve) => {
+      server.close(() => resolve());
+    });
+
+    void (async () => {
+      await Promise.all([stopAcceptingWork, stopAcceptingRequests]);
+      // Connections last: everything above uses them.
+      await redis.close();
+      await closeDb(pool, logger);
+      logger.info('shutdown complete');
+      process.exit(0);
+    })();
 
     // Don't hang forever on a stuck connection.
     setTimeout(() => {

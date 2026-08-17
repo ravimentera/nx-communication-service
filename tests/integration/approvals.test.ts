@@ -156,6 +156,20 @@ beforeAll(async () => {
     await client.query(readFileSync(join(dir, file), 'utf8'));
   }
   await client.query(`INSERT INTO tenants (id, name, timezone) VALUES ('${TENANT}','Appr','UTC')`);
+  // ── THE TENANT'S OPT-IN POSTURE IS STATED, NOT INHERITED ────────────────────
+  //
+  // `require_opt_in` is `NOT NULL DEFAULT true`, and the gate honours that
+  // default for a tenant with no config row — a missing row used to read as
+  // `false`, so the least-configured tenant got the most permissive treatment.
+  //
+  // This suite is about approvals, not consent, and it enforces compliance for
+  // real (see `dispatcher(true)`). Without a row saying otherwise every approval
+  // here would be CANCELLED by a CONSENT_REQUIRED block, which would be the gate
+  // working and the test measuring the wrong thing.
+  await client.query(
+    `INSERT INTO tenant_channel_configs (tenant_id, name, require_opt_in)
+     VALUES ('${TENANT}', 'appr-cfg', false)`,
+  );
   await client.end();
 
   const handle = createDb({ url: container.getConnectionUri() }, logger);
