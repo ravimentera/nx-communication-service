@@ -29,6 +29,7 @@ import {
   requireTenant,
 } from '../../platform/http/auth.middleware.js';
 import { AuthError, ForbiddenError, NotFoundError } from '../../platform/http/errors.js';
+import { uuidParam } from '../../platform/http/params.js';
 
 const listQuerySchema = z.object({
   approverRef: z.string().optional(),
@@ -161,6 +162,10 @@ function approverRefFor(req: Request, requested: string | undefined): string | u
 
 export function createApprovalRouter(deps: ApprovalApiDeps): Router {
   const router = Router();
+
+  // Every `:id` on this router is a uuid column. Registered as a param handler
+  // rather than per-route so a route added later cannot forget it (params.ts).
+  router.param('id', uuidParam());
 
   // ── approvals ─────────────────────────────────────────────────────────────
 

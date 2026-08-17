@@ -18,6 +18,7 @@ import { NotFoundError, ValidationError } from '../../platform/http/errors.js';
 import { Permission, requirePermissions, requireTenant } from '../../platform/http/auth.middleware.js';
 import { CHANNEL_TYPES } from '../../ports/channel.js';
 import type { TemplateStore } from '../../ports/template-store.js';
+import { requireUuidParams } from '../../platform/http/params.js';
 
 const contextSchema = z.object({
   recipient: z.record(z.unknown()).optional(),
@@ -238,8 +239,17 @@ export function createContentRouter(deps: ContentApiDeps): Router {
     }),
   );
 
+  // ── uuid-only, unlike their GET sibling ───────────────────────────────────
+  //
+  // `store.get` accepts an id OR a key and branches on the shape, so a non-uuid
+  // on `GET /templates/:id` and `POST /templates/:id/render` is a legitimate
+  // key lookup and must reach the store. `update`, `delete`, `setDefault` and
+  // `versions` take the value straight to a `uuid` column, so the same input
+  // there was a 500. Guarded per route rather than on the router for exactly
+  // that reason (params.ts).
   router.put(
     '/templates/:id',
+    requireUuidParams('id'),
     requirePermissions(Permission.TEMPLATES_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
@@ -256,6 +266,7 @@ export function createContentRouter(deps: ContentApiDeps): Router {
 
   router.delete(
     '/templates/:id',
+    requireUuidParams('id'),
     requirePermissions(Permission.TEMPLATES_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
@@ -267,6 +278,7 @@ export function createContentRouter(deps: ContentApiDeps): Router {
 
   router.post(
     '/templates/:id/default',
+    requireUuidParams('id'),
     requirePermissions(Permission.TEMPLATES_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
@@ -276,6 +288,7 @@ export function createContentRouter(deps: ContentApiDeps): Router {
 
   router.get(
     '/templates/:id/versions',
+    requireUuidParams('id'),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       res.json({ versions: await deps.store.versions(scope, req.params.id as string) });

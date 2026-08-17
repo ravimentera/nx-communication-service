@@ -46,6 +46,7 @@ import {
 } from '../../platform/http/auth.middleware.js';
 import { NotFoundError } from '../../platform/http/errors.js';
 import { CHANNEL_TYPES } from '../../ports/channel.js';
+import { uuidParam } from '../../platform/http/params.js';
 
 const audienceSchema = z.object({
   name: z.string().min(1),
@@ -127,6 +128,10 @@ function handle(
 
 export function createCampaignRouter(deps: CampaignApiDeps): Router {
   const router = Router();
+
+  // Every `:id` on this router is a uuid column. Registered as a param handler
+  // rather than per-route so a route added later cannot forget it (params.ts).
+  router.param('id', uuidParam());
 
   // ── audiences ─────────────────────────────────────────────────────────────
 

@@ -30,6 +30,7 @@ import { Permission, requireTenant } from '../../platform/http/auth.middleware.j
 import { ForbiddenError, NotFoundError } from '../../platform/http/errors.js';
 import type { TenantScope } from '../../platform/db/tenant-scope.js';
 import { deprecate } from './index.js';
+import { uuidParam } from '../../platform/http/params.js';
 
 const contentSchema = z.object({
   content: z.string().min(1),
@@ -80,6 +81,11 @@ function assertOwnQueue(req: Request, pathProviderId: string): void {
 
 export function createLegacyApprovalRouter(deps: ApprovalApiDeps): Router {
   const router = Router();
+
+  // The legacy routes key on the MESSAGE id, not the approval id — two
+  // different identifiers for one decision. `:providerId` beside it is a
+  // sender string, not a uuid, so it stays unguarded.
+  router.param('messageId', uuidParam());
   router.use(deprecate('/approvals', '/v1/approvals'));
 
   /** message id in, approval id out. 404 when this tenant owns neither. */

@@ -12,6 +12,7 @@ import type { ApiKeyService } from '../../engine/tenancy/api-key.service.js';
 import type { UsageService } from '../../engine/tenancy/usage.service.js';
 import { Permission, requirePermissions, requireTenant } from '../../platform/http/auth.middleware.js';
 import { ValidationError } from '../../platform/http/errors.js';
+import { uuidParam } from '../../platform/http/params.js';
 
 const createSchema = z.object({
   name: z.string().min(1).max(120),
@@ -57,6 +58,10 @@ function handle(
 
 export function createTenancyRouter(deps: TenancyApiDeps): Router {
   const router = Router();
+
+  // Every `:id` on this router is a uuid column. Registered as a param handler
+  // rather than per-route so a route added later cannot forget it (params.ts).
+  router.param('id', uuidParam());
 
   /**
    * Readable by any authenticated caller in the tenant, not just an admin: a

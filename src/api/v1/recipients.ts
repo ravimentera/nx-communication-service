@@ -27,6 +27,7 @@ import {
 } from '../../platform/http/auth.middleware.js';
 import { NotFoundError, NotImplementedError } from '../../platform/http/errors.js';
 import { CHANNEL_TYPES } from '../../ports/channel.js';
+import { uuidParam } from '../../platform/http/params.js';
 
 const preferenceSchema = z.object({
   allowCommunications: z.boolean().optional(),
@@ -104,6 +105,11 @@ function handle(
 
 export function createRecipientRouter(deps: RecipientApiDeps): Router {
   const router = Router();
+
+  // `:id` is always a recipient uuid here. `:system` and `:externalId` on the
+  // by-external-ref route are deliberately NOT uuids — that route exists to
+  // look a recipient up by someone else's identifier.
+  router.param('id', uuidParam());
 
   router.get(
     '/recipients',

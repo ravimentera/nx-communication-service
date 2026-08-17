@@ -20,6 +20,7 @@ import type { RecipientService } from '../../engine/recipients/recipient.service
 import { Permission, requirePermissions, requireTenant } from '../../platform/http/auth.middleware.js';
 import { NotFoundError, ValidationError } from '../../platform/http/errors.js';
 import { CHANNEL_TYPES } from '../../ports/channel.js';
+import { uuidParam } from '../../platform/http/params.js';
 
 const sendSchema = z.object({
   channel: z.enum(CHANNEL_TYPES),
@@ -86,6 +87,12 @@ function handle(
 
 export function createMessagingRouter(deps: MessagingApiDeps): Router {
   const router = Router();
+
+  // `:id` is a message uuid; `:recipientId` on the conversation routes is a
+  // recipient uuid. `:senderId` beside it is NOT — a sender is an opaque
+  // string like `sender-1`, so it is left unguarded on purpose.
+  router.param('id', uuidParam());
+  router.param('recipientId', uuidParam());
 
   // ── messages ──────────────────────────────────────────────────────────────
 

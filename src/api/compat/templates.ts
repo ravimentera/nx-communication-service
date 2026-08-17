@@ -46,6 +46,7 @@ import {
 import { NotFoundError, ValidationError } from '../../platform/http/errors.js';
 import type { TemplateRecord } from '../../ports/template-store.js';
 import { deprecate } from './index.js';
+import { requireUuidParams } from '../../platform/http/params.js';
 
 const createSchema = z.object({
   name: z.string().min(1),
@@ -190,8 +191,11 @@ export function createLegacyTemplateRouter(deps: ContentApiDeps): Router {
     }),
   );
 
+  // uuid-only, unlike the GET above — same split as the /v1 router: `store.get`
+  // takes an id or a key, `update` and `delete` take a uuid column (params.ts).
   router.put(
     '/:id',
+    requireUuidParams('id'),
     requirePermissions(Permission.TEMPLATES_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
@@ -217,6 +221,7 @@ export function createLegacyTemplateRouter(deps: ContentApiDeps): Router {
 
   router.delete(
     '/:id',
+    requireUuidParams('id'),
     requirePermissions(Permission.TEMPLATES_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
