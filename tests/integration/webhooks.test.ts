@@ -16,7 +16,7 @@
  */
 import { createHmac } from 'node:crypto';
 
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import request from 'supertest';
 
 import winston from 'winston';
@@ -461,5 +461,55 @@ describe('Slack', () => {
       .post('/v1/webhooks/slack')
       .send({ type: 'url_verification', challenge: 'abc123' });
     expect(res.status).toBe(401);
+  });
+});
+
+/**
+ * One tenant owns a Twilio account.
+ *
+ * `getTenantConfigByTwilioAccount` resolves an inbound callback to a tenant by
+ * Account SID with `LIMIT 1` and no ORDER BY, and nothing stopped two rows
+ * carrying the same SID — so the answer was whichever row the planner returned.
+ *
+ * The routing bug is the smaller half. `twilio_account_sid` is settable through
+ * `PUT /v1/channels/config`, which a tenant may call for itself, so tenant B
+ * could enter tenant A's SID and be resolved as the owner of A's callbacks.
+ * Ownership cannot be verified against Twilio from here; first-registrant-wins
+ * is the honest approximation and `0021` is what makes it true.
+ */
+describe('a Twilio account belongs to one tenant', () => {
+  it('refuses a second tenant claiming an account already configured', async () => {
+    const OTHER = 'twilio-claimant';
+    await h.db.insert(tenants).values({ id: OTHER, name: 'Claimant' }).onConflictDoNothing();
+
+    await expect(
+      h.channelConfigs.upsertTenantConfig(OTHER, {
+        name: 'claimant',
+        // The SID the suite's own tenant registered in `beforeAll`.
+        twilioAccountSid: 'ACcontracttest',
+      }),
+    ).rejects.toThrow(/already configured by another tenant/);
+  });
+
+  it('lets the owning tenant re-save its own account', async () => {
+    // Idempotent: a PUT that re-sends the same config must not trip the check
+    // against the row it is itself updating.
+    await expect(
+      h.channelConfigs.upsertTenantConfig(TENANT, {
+        name: 'Webhook tenant',
+        twilioAccountSid: 'ACcontracttest',
+      }),
+    ).resolves.toMatchObject({ tenantId: TENANT });
+  });
+
+  it('is enforced by the database, not only by the check', async () => {
+    // The check is for the message; the constraint is the guarantee. A path
+    // that bypassed the service would otherwise reintroduce the ambiguity.
+    await expect(
+      h.db.execute(
+        sql`INSERT INTO tenant_channel_configs (tenant_id, name, twilio_account_sid)
+            VALUES ('twilio-direct', 'direct', 'ACcontracttest')`,
+      ),
+    ).rejects.toThrow(/unique/i);
   });
 });

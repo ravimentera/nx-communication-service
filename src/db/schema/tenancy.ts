@@ -4,7 +4,16 @@
  * §0.7 vocabulary: medspa -> tenant, location -> sub-tenant, provider -> agent.
  */
 import { sql } from 'drizzle-orm';
-import { boolean, index, integer, jsonb, pgTable, text, unique } from 'drizzle-orm/pg-core';
+import {
+  boolean,
+  index,
+  integer,
+  jsonb,
+  pgTable,
+  text,
+  unique,
+  uniqueIndex,
+} from 'drizzle-orm/pg-core';
 
 import { createdAt, id, subTenantId, tenantId, ts, updatedAt } from './_shared.js';
 
@@ -86,6 +95,14 @@ export const tenantChannelConfigs = pgTable(
     tenantId: tenantId(),
     name: text('name').notNull(),
 
+    /**
+     * The Twilio account this tenant owns.
+     *
+     * UNIQUE among active rows (0021). It is what an inbound callback is
+     * resolved by, and it is settable through `PUT /v1/channels/config` — so
+     * without the constraint one tenant could enter another's SID and be
+     * resolved as the owner of their callbacks.
+     */
     twilioAccountSid: text('twilio_account_sid'),
     twilioAuthToken: text('twilio_auth_token'),
     twilioPhoneNumber: text('twilio_phone_number'),
@@ -147,6 +164,12 @@ export const tenantChannelConfigs = pgTable(
     // One config row per tenant, matching medspa_configurations' UNIQUE(medspa_id).
     unique('tenant_channel_configs_tenant_unique').on(t.tenantId),
     index('idx_tenant_channel_configs_active').on(t.isActive),
+    // One tenant owns a Twilio account. Partial on
+    // `twilio_account_sid IS NOT NULL AND is_active` — declared in 0021, and
+    // the predicate is not expressible here. It is what makes the inbound
+    // callback lookup deterministic, and what stops a tenant claiming another's
+    // account through the config API.
+    uniqueIndex('tenant_channel_configs_twilio_account_unique').on(t.twilioAccountSid),
   ],
 );
 

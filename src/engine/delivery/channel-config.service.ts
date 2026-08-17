@@ -14,7 +14,9 @@
  * divergent views and a config write only invalidates the instance that served
  * it. Caching moves to Redis, shared, with explicit invalidation.
  */
-import { and, eq, sql } from 'drizzle-orm';
+import { and, asc, eq, sql } from 'drizzle-orm';
+
+import { ConflictError } from '../../platform/http/errors.js';
 import type { Logger } from 'winston';
 
 import type { Db } from '../../db/index.js';
@@ -136,8 +138,20 @@ export class ChannelConfigService {
    * cached: it runs once per callback and a stale hit here would reject real
    * traffic after a credential rotation.
    */
+  /**
+   * The tenant that owns a Twilio account.
+   *
+   * `tenant_channel_configs_twilio_account_unique` (0021) makes this at most
+   * one row, which is what the `LIMIT 1` here has always assumed and nothing
+   * enforced: two rows carrying the same SID resolved to whichever the planner
+   * returned, and that is not stable between two executions of the same query.
+   *
+   * The `ORDER BY` is belt-and-braces for a database the migration has not
+   * reached yet — an unordered `LIMIT 1` should never be the shape of a lookup
+   * that decides which tenant a callback belongs to.
+   */
   async getTenantConfigByTwilioAccount(accountSid: string): Promise<TenantChannelConfig | null> {
-    const [row] = await this.db
+    const rows = await this.db
       .select()
       .from(tenantChannelConfigs)
       .where(
@@ -146,8 +160,24 @@ export class ChannelConfigService {
           eq(tenantChannelConfigs.isActive, true),
         ),
       )
-      .limit(1);
-    return row ?? null;
+      .orderBy(asc(tenantChannelConfigs.tenantId))
+      .limit(2);
+
+    if (rows.length > 1) {
+      // Only reachable before 0021 is applied. Say so loudly rather than
+      // picking one: callbacks for this account are being attributed to a
+      // tenant chosen by the planner, and no downstream check will notice.
+      this.logger.error(
+        'more than one active tenant claims this Twilio account — callbacks are being routed nondeterministically',
+        {
+          accountSid: `***${accountSid.slice(-4)}`,
+          tenants: rows.map((r) => r.tenantId),
+          hint: 'apply migrations/0021_twilio_account_uniqueness.sql',
+        },
+      );
+    }
+
+    return rows[0] ?? null;
   }
 
   /** ← `provider-config.service.ts:333 getProvidersByMedspa`. */
@@ -202,6 +232,26 @@ export class ChannelConfigService {
     values: Partial<TenantChannelConfigInput>,
     actor?: string,
   ): Promise<TenantChannelConfig> {
+    // ── ONE TENANT OWNS A TWILIO ACCOUNT ──────────────────────────────────
+    //
+    // Checked here as well as constrained in the database, because the two
+    // answer different questions. The unique index (0021) guarantees it; this
+    // says WHY in a message a caller can act on, instead of surfacing
+    // `duplicate key value violates unique constraint` as a 500.
+    //
+    // It matters because this endpoint is callable by a tenant for itself: a
+    // tenant entering another's Account SID would otherwise be resolved as the
+    // owner of their inbound callbacks.
+    if (values.twilioAccountSid) {
+      const owner = await this.getTenantConfigByTwilioAccount(values.twilioAccountSid);
+      if (owner && owner.tenantId !== tenantId) {
+        throw new ConflictError(
+          'That Twilio Account SID is already configured by another tenant. An account belongs to one tenant, because inbound callbacks are routed by it.',
+          { field: 'twilioAccountSid' },
+        );
+      }
+    }
+
     // Seal on write when a cipher is configured, so a credential set through the
     // API never lands as plaintext even while the backfill is still working
     // through the rows that arrived before it.

@@ -28,6 +28,7 @@ import { loadConfig } from '../../../src/config/index.js';
 import { createDb, type Db } from '../../../src/db/index.js';
 import { ApprovalService } from '../../../src/engine/approvals/approval.service.js';
 import { PolicyService } from '../../../src/engine/approvals/policy.service.js';
+import { ConsentService } from '../../../src/engine/compliance/consent.service.js';
 import { ComplianceGate } from '../../../src/engine/compliance/gate.js';
 import { ErasureService } from '../../../src/engine/compliance/erasure.service.js';
 import { PreferenceService } from '../../../src/engine/compliance/preference.service.js';
@@ -104,6 +105,8 @@ export interface Harness {
   db: Db;
   receipts: ReceiptService;
   queue: NotificationQueue;
+  /** Exposed so a suite can assert the Twilio-account ownership check (0021). */
+  channelConfigs: ChannelConfigService;
   stop: () => Promise<void>;
 }
 
@@ -271,6 +274,7 @@ export async function startHarness(): Promise<Harness> {
   const recipientDeps = {
     recipients,
     preferences,
+    consent: new ConsentService({ db, logger }),
     gate,
     erasure: new ErasureService({ db, logger }),
   };
@@ -357,6 +361,7 @@ export async function startHarness(): Promise<Harness> {
 
   return {
     app,
+    channelConfigs,
     db,
     receipts,
     queue,
