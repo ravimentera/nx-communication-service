@@ -30,6 +30,31 @@ describe('createRedis degradation', () => {
     expect(await redis.isConnected()).toBe(false);
     await redis.close();
   });
+
+  /**
+   * The degradation has to be FAST, not merely eventual.
+   *
+   * One connection served both BullMQ and the cache, and BullMQ requires
+   * `maxRetriesPerRequest: null` — which means *unlimited retries*, not a limit.
+   * So a `store.get()` while Redis was down waited instead of failing, and every
+   * Express handler doing a cache lookup waited with it. The in-memory fallback
+   * exists so HTTP keeps serving; a lookup that blocks defeats it.
+   *
+   * The bound here is deliberately loose. What is being asserted is "returns
+   * promptly", not a latency figure — a tight threshold would be a flaky test
+   * on a loaded CI box, and the defect this catches was measured in seconds.
+   */
+  it('degrades within a request budget rather than blocking on a dead server', async () => {
+    const started = Date.now();
+    const redis = await createRedis({ ...base, url: 'redis://127.0.0.1:1' }, logger);
+
+    // Reads and writes both, since the hang was on either.
+    await redis.store.set('k', 'v');
+    await redis.store.get('k');
+    await redis.close();
+
+    expect(Date.now() - started).toBeLessThan(3_000);
+  });
 });
 
 describe('in-memory store semantics', () => {
