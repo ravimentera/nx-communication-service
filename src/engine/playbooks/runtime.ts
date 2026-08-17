@@ -671,7 +671,7 @@ export class PlaybookRuntime {
       // source achieved the same split by hand, building a different
       // `variables` object per channel inside every case.
       const key = entry.templateKey ?? source.templateKey;
-      const template = await this.deps.templates.get(scope.tenantId, key);
+      const template = await this.deps.templates.get(scope, key);
 
       if (!template) {
         throw new Error(
@@ -693,7 +693,7 @@ export class PlaybookRuntime {
         // Falls back to the body template's `subject`, which is what every
         // playbook that does not declare one relies on.
         const subjectSource = source.subjectTemplateKey
-          ? (await this.deps.templates.get(scope.tenantId, source.subjectTemplateKey))?.content
+          ? (await this.deps.templates.get(scope, source.subjectTemplateKey))?.content
           : template.subject;
 
         if (source.subjectTemplateKey && subjectSource === undefined) {

@@ -98,8 +98,8 @@ export function createLegacyTemplateRouter(deps: ContentApiDeps): Router {
   router.get(
     '/',
     handle(async (req, res) => {
-      const { tenantId } = requireTenant(req);
-      const templates = await deps.store.list(tenantId, {
+      const scope = requireTenant(req);
+      const templates = await deps.store.list(scope, {
         category: req.query.category as string | undefined,
         channel: req.query.channel as string | undefined,
       });
@@ -123,11 +123,12 @@ export function createLegacyTemplateRouter(deps: ContentApiDeps): Router {
     '/',
     requirePermissions(Permission.TEMPLATES_WRITE),
     handle(async (req, res) => {
-      const { tenantId, subTenantId } = requireTenant(req);
+      const scope = requireTenant(req);
+      const { subTenantId } = scope;
       const body = createSchema.parse(req.body);
 
       const created = await deps.store.create(
-        tenantId,
+        scope,
         {
           ...body,
           subTenantId,
@@ -145,14 +146,15 @@ export function createLegacyTemplateRouter(deps: ContentApiDeps): Router {
   router.post(
     '/:id/render',
     handle(async (req, res) => {
-      const { tenantId } = requireTenant(req);
+      const scope = requireTenant(req);
+      const { tenantId } = scope;
       const { data, options } = (req.body ?? {}) as {
         data?: Record<string, unknown>;
         options?: { format?: string };
       };
       if (!data) throw new ValidationError('Data object is required');
 
-      const template = await deps.store.get(tenantId, req.params.id as string);
+      const template = await deps.store.get(scope, req.params.id as string);
       if (!template) throw new NotFoundError(`Template '${req.params.id}' not found`);
 
       // Legacy callers pass a flat variable bag, referenced bare in the body.
@@ -178,8 +180,8 @@ export function createLegacyTemplateRouter(deps: ContentApiDeps): Router {
   router.get(
     '/:id',
     handle(async (req, res) => {
-      const { tenantId } = requireTenant(req);
-      const template = await deps.store.get(tenantId, req.params.id as string);
+      const scope = requireTenant(req);
+      const template = await deps.store.get(scope, req.params.id as string);
       if (!template) throw new NotFoundError(`Template '${req.params.id}' not found`);
 
       const legacy = toLegacyTemplate(template);
@@ -192,14 +194,14 @@ export function createLegacyTemplateRouter(deps: ContentApiDeps): Router {
     '/:id',
     requirePermissions(Permission.TEMPLATES_WRITE),
     handle(async (req, res) => {
-      const { tenantId } = requireTenant(req);
+      const scope = requireTenant(req);
       const patch = createSchema.partial().parse(req.body ?? {});
       if (!patch.content && !patch.metadata && Object.keys(patch).length === 0) {
         throw new ValidationError('Content or metadata is required');
       }
 
       const updated = await deps.store.update(
-        tenantId,
+        scope,
         req.params.id as string,
         {
           ...patch,
@@ -217,8 +219,8 @@ export function createLegacyTemplateRouter(deps: ContentApiDeps): Router {
     '/:id',
     requirePermissions(Permission.TEMPLATES_WRITE),
     handle(async (req, res) => {
-      const { tenantId } = requireTenant(req);
-      const deleted = await deps.store.delete(tenantId, req.params.id as string);
+      const scope = requireTenant(req);
+      const deleted = await deps.store.delete(scope, req.params.id as string);
       res.json({ success: deleted });
     }),
   );

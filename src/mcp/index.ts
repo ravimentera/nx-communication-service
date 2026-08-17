@@ -29,6 +29,7 @@ import type { ApprovalService } from '../engine/approvals/approval.service.js';
 import type { Actor } from '../engine/approvals/state-machine.js';
 import type { CampaignOrchestrator } from '../engine/campaigns/orchestrator.js';
 import type { Dispatcher } from '../engine/delivery/dispatcher.js';
+import type { TenantScope } from '../platform/db/tenant-scope.js';
 import type { NotificationQueue } from '../engine/delivery/notification-queue.js';
 import type { ConversationService } from '../engine/messaging/conversation.service.js';
 import type { DraftService } from '../engine/outreach/draft.service.js';
@@ -61,7 +62,7 @@ export interface McpDeps {
   authenticate: RequestHandler;
   /** Renders a template id/key to a body. Shared with the compat send routers. */
   render: (
-    tenantId: string,
+    scope: TenantScope,
     input: { templateId?: string; variables?: Record<string, unknown>; message?: string; subject?: string },
   ) => Promise<{ subject?: string; body: string; html?: string; templateId?: string }>;
 
@@ -218,7 +219,7 @@ export function createMcpRouter(deps: McpDeps): Router {
     switch (toolName) {
       case 'sendEmail': {
         const input = sendEmailSchema.parse(args);
-        const rendered = await deps.render(scope.tenantId, input);
+        const rendered = await deps.render(scope, input);
         return deps.dispatcher.dispatch({
           tenantId: scope.tenantId,
           subTenantId: scope.subTenantId,
@@ -233,7 +234,7 @@ export function createMcpRouter(deps: McpDeps): Router {
 
       case 'sendSMS': {
         const input = sendSmsSchema.parse(args);
-        const rendered = await deps.render(scope.tenantId, input);
+        const rendered = await deps.render(scope, input);
         return deps.dispatcher.dispatch({
           tenantId: scope.tenantId,
           subTenantId: scope.subTenantId,

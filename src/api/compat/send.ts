@@ -27,6 +27,7 @@ import type { IdentityResolver } from '../../engine/content/identity.js';
 import type { RenderContext } from '../../engine/content/render-context.js';
 import type { Renderer, TemplateFormat } from '../../engine/content/renderer.js';
 import { requireTenant } from '../../platform/http/auth.middleware.js';
+import type { TenantScope } from '../../platform/db/tenant-scope.js';
 import { NotFoundError, ValidationError } from '../../platform/http/errors.js';
 import type { TemplateStore } from '../../ports/template-store.js';
 import { deprecate } from './index.js';
@@ -79,7 +80,7 @@ export function createBodyResolver(deps: {
   renderer: Renderer;
   senderIdentity: IdentityResolver;
 }): (
-  tenantId: string,
+  scope: TenantScope,
   input: {
     templateId?: string;
     variables?: Record<string, unknown>;
@@ -89,7 +90,7 @@ export function createBodyResolver(deps: {
   },
 ) => Promise<{ subject?: string; body: string; html?: string; templateId?: string }> {
   return async function resolveBody(
-    tenantId: string,
+    scope: TenantScope,
     input: {
       templateId?: string;
       variables?: Record<string, unknown>;
@@ -105,7 +106,7 @@ export function createBodyResolver(deps: {
       return { subject: input.subject, body: input.message, html: input.html };
     }
 
-    const template = await deps.templates.get(tenantId, input.templateId);
+    const template = await deps.templates.get(scope, input.templateId);
     if (!template) throw new NotFoundError(`Template '${input.templateId}' not found`);
 
     // Legacy templates reference variables bare — `{{firstName}}`, not
@@ -114,7 +115,7 @@ export function createBodyResolver(deps: {
     // variable that happens to be called `tenant` cannot shadow one.
     const context = {
       ...(input.variables ?? {}),
-      ...(await deps.senderIdentity.baseContext({ tenantId })),
+      ...(await deps.senderIdentity.baseContext(scope)),
       context: input.variables ?? {},
     } as RenderContext;
     const rendered = await deps.renderer.render(template.content, context, {
@@ -151,7 +152,7 @@ export function createLegacySendRouters(deps: SendCompatDeps): {
       // per message, so an array fans out and the first result is reported —
       // which is what `sendTemplatedEmail` did with its single boolean.
       const addresses = Array.isArray(body.to) ? body.to : [body.to];
-      const rendered = await resolveBody(scope.tenantId, body);
+      const rendered = await resolveBody(scope, body);
       const recipientId = body.patientId
         ? await deps.identity.ensure(scope, body.patientId, { email: addresses[0] })
         : undefined;
