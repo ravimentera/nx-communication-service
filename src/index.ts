@@ -13,6 +13,7 @@ import { InlineContextProvider } from './adapters/context/inline.provider.js';
 import { MenteraContextProvider } from './adapters/context/mentera.provider.js';
 import { BedrockProvider } from './adapters/llm/bedrock.provider.js';
 import { RecordingLlmProvider } from './adapters/llm/recording.provider.js';
+import { StubLlmProvider } from './adapters/llm/stub.provider.js';
 import { createStorageProvider } from './adapters/storage/index.js';
 import { tenantPacks } from './db/schema.js';
 import { ApprovalService } from './engine/approvals/approval.service.js';
@@ -388,16 +389,27 @@ async function main(): Promise<void> {
   const packs = loadPacks(join(process.cwd(), 'packs'), logger);
   const renderer = new Renderer({ logger, aliases: packs.aliasMaps() });
   const templateStore = new DrizzleTemplateStore(db, logger);
+  // `stub` still goes through RecordingLlmProvider, deliberately: the audit row
+  // and the usage counters are part of what a local tester needs to exercise,
+  // and skipping the decorator would make `GET /v1/usage` untestable in exactly
+  // the mode built for testing it.
   const llm = new RecordingLlmProvider(
-    new BedrockProvider({
-      config: {
-        region: config.llm.region,
-        defaultModel: config.llm.defaultModel,
-        maxRetries: config.llm.maxRetries,
-        timeoutMs: config.llm.timeoutMs,
-      },
-      logger,
-    }),
+    config.llm.provider === 'stub'
+      ? new StubLlmProvider({
+          logger,
+          defaultModel: config.llm.defaultModel,
+          failMode: config.llm.stubFail,
+          latencyMs: config.llm.stubLatencyMs,
+        })
+      : new BedrockProvider({
+          config: {
+            region: config.llm.region,
+            defaultModel: config.llm.defaultModel,
+            maxRetries: config.llm.maxRetries,
+            timeoutMs: config.llm.timeoutMs,
+          },
+          logger,
+        }),
     db,
     logger,
   );

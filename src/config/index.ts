@@ -92,7 +92,14 @@ const envSchema = z.object({
   GATEWAY_ONLY: bool(true),
 
   // --- llm ---
-  LLM_PROVIDER: str('bedrock'),
+  // `stub` is local-testing only: synthetic, deterministic content, no AWS
+  // account. Enumerated rather than free text so a typo is a boot error
+  // instead of a silent fall-through to Bedrock.
+  LLM_PROVIDER: z.enum(['bedrock', 'stub']).default('bedrock'),
+  /** `stub` only: make every call throw, to exercise the model-outage paths. */
+  STUB_LLM_FAIL: bool(false),
+  /** `stub` only: artificial latency in ms. */
+  STUB_LLM_LATENCY_MS: int(0),
   AWS_REGION: str('us-east-1'),
   AWS_BEDROCK_REGION: optionalString,
   AWS_BEDROCK_MODEL_ID: str('amazon.nova-pro-v1:0'),
@@ -276,6 +283,8 @@ function shape(env: Env) {
       agentAliasId: env.AWS_BEDROCK_AGENT_ALIAS_ID,
       timeoutMs: env.AI_REQUEST_TIMEOUT,
       maxRetries: env.AI_MAX_RETRIES,
+      stubFail: env.STUB_LLM_FAIL,
+      stubLatencyMs: env.STUB_LLM_LATENCY_MS,
     },
     channels: {
       dryRun: env.CHANNEL_DRY_RUN,
