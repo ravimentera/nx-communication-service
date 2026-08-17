@@ -49,12 +49,49 @@ A loop rather than a list, deliberately. This section used to name `0001`,
 wrong from the moment the next phase adds a file — silently, because a database
 missing a migration fails much later and somewhere else.
 
-`0013` and `0014` are skipped because they are not baseline schema. `0013`
-retires the plaintext credential columns and belongs after a data load
-(`docs/MIGRATION_RUNBOOK.md` §8b); `0014` is a no-op against the current `0001`.
-`npm run migrate:print` prints the same split, and
-`tests/helpers/migrations.ts` is what the test harnesses use — all three agree
-by construction.
+`0013` and `0014` are skipped by the loop because neither is baseline schema —
+but they are skipped for **opposite reasons**, and the difference matters.
+
+`0013` retires the plaintext credential columns. It must not be applied until
+after a data load, and it needs `CREDENTIAL_ENCRYPTION_KEYS` set. Leave it alone
+locally; `docs/MIGRATION_RUNBOOK.md` §8b has the ordered steps.
+
+`0014` is the opposite: every statement is `IF EXISTS`, so it is safe at any
+time — and it is **required** if your database was created before P12.
+
+> **Idempotent is not the same as an upgrade path.** `0001` is
+> `CREATE TABLE IF NOT EXISTS`, so re-running the baseline does **not** apply a
+> change made by *editing* an earlier file. P12 removed
+> `messages.queued_message` from `0001`; a database created before that keeps
+> the column forever, while a fresh deploy has never had it. `0014` is the only
+> thing that removes it, and this page used to tell you to skip it.
+
+Check whether yours needs it:
+
+```bash
+docker compose exec -T postgres psql -U outreach -d outreach -tAc \
+  "SELECT 1 FROM information_schema.columns
+    WHERE table_name='messages' AND column_name='queued_message'"
+```
+
+A row back means apply it, once:
+
+```bash
+docker compose exec -T postgres psql -U outreach -d outreach \
+  -v ON_ERROR_STOP=1 -f /migrations/0014_drop_queued_message.sql
+```
+
+No rows means you are already clean and there is nothing to do.
+
+**The general check, which does not depend on knowing about `0014`:** build a
+throwaway database beside yours, apply the baseline to it, and diff the two
+schemas. That catches this class of drift whatever causes it — see
+`testing/TEST_PLAN.md` §0.4 for the commands.
+
+`npm run migrate:print` prints the same split with the same reasoning, and
+`tests/helpers/migrations.ts` is what the test harnesses use.
+`tests/unit/platform/migrations.test.ts` fails if the three disagree, and now
+also fails if a non-baseline file is added without saying why it is excluded.
 
 Order matters: `0002` and `0003` add foreign keys whose other side is created
 earlier. Every file is idempotent and wrapped in a transaction, so re-running

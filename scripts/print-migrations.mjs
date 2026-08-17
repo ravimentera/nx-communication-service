@@ -26,11 +26,60 @@ const files = readdirSync(dir)
  * `0013` retires the plaintext credential columns and belongs after a data
  * load, so an operator following this output in order sealed their credentials
  * before `9003_channel_configs.sql` had inserted any.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * BUT THEY ARE EXCLUDED FOR OPPOSITE REASONS, AND SAYING SO MATTERS
+ *
+ * This used to print both under one heading — "applied deliberately, read the
+ * runbook first". That reads as "risky, leave it alone" and it is true of
+ * `0013` and false of `0014`:
+ *
+ *   0013  DANGEROUS AT THE WRONG TIME. Needs a key, must follow the data load,
+ *         and sealing credentials early breaks every send.
+ *
+ *   0014  HARMLESS ALWAYS, AND REQUIRED ON AN OLD DATABASE. Every statement is
+ *         `IF EXISTS`. It is a genuine no-op against the current `0001` — and
+ *         because `0001` is `CREATE TABLE IF NOT EXISTS`, re-running the
+ *         baseline does NOT remove a column that a *previous* `0001` created.
+ *         So a database made before P12 keeps `messages.queued_message`
+ *         forever while a fresh deploy has never had it, and the operator
+ *         following this output has no way to find that out.
+ *
+ * One heading for both is how a schema silently diverges from production. Each
+ * file now carries its own reason and its own instruction.
+ * ─────────────────────────────────────────────────────────────────────────────
  */
-const NON_BASELINE = ['0013_encrypt_credentials.sql', '0014_drop_queued_message.sql'];
+const NON_BASELINE = {
+  '0013_encrypt_credentials.sql': {
+    heading: 'Applied deliberately, INSIDE the cutover window — read the runbook first:',
+    note: [
+      'Retires the plaintext credential columns. It must run AFTER the data',
+      'load: applying it before 9003_channel_configs.sql has inserted anything',
+      'seals credentials that do not exist yet, and every send then fails.',
+      'Needs CREDENTIAL_ENCRYPTION_KEYS set. See docs/MIGRATION_RUNBOOK.md §8b.',
+    ],
+  },
+  '0014_drop_queued_message.sql': {
+    heading: 'Safe to apply at any time — REQUIRED if your database predates P12:',
+    note: [
+      'Every statement is IF EXISTS, so this is a no-op on a database built',
+      'from the current 0001 and does exactly the needed cleanup on an older',
+      'one. Re-running the baseline cannot do it for you: 0001 is CREATE TABLE',
+      'IF NOT EXISTS, so a column removed by EDITING 0001 never leaves a',
+      'database that already exists.',
+      '',
+      'Check whether yours needs it:',
+      '',
+      '  psql "$DATABASE_URL" -tAc "SELECT 1 FROM information_schema.columns \\',
+      '    WHERE table_name=\'messages\' AND column_name=\'queued_message\'"',
+      '',
+      'One row back means apply it. No rows means you are already clean.',
+    ],
+  },
+};
 
-const schema = files.filter((f) => !f.startsWith('9') && !NON_BASELINE.includes(f));
-const nonBaseline = files.filter((f) => NON_BASELINE.includes(f));
+const schema = files.filter((f) => !f.startsWith('9') && !(f in NON_BASELINE));
+const nonBaseline = files.filter((f) => f in NON_BASELINE);
 const data = files.filter((f) => f.startsWith('9'));
 
 console.log('Migrations are NEVER run by tooling. Run these yourself, in order:\n');
@@ -41,10 +90,15 @@ if (schema.length === 0 && data.length === 0) {
   for (const f of schema) {
     console.log(`  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/${f}`);
   }
-  if (nonBaseline.length > 0) {
-    console.log('\nNot baseline, and applied deliberately — read the runbook first:\n');
-    for (const f of nonBaseline) {
-      console.log(`  migrations/${f}`);
+  // One block per file, not one heading for the set. See the note on
+  // NON_BASELINE: these are excluded for opposite reasons, and collapsing them
+  // is what let a stale column survive in a local database indefinitely.
+  for (const f of nonBaseline) {
+    const { heading, note } = NON_BASELINE[f];
+    console.log(`\n${heading}\n`);
+    console.log(`  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/${f}\n`);
+    for (const line of note) {
+      console.log(line ? `  ${line}` : '');
     }
   }
   if (data.length > 0) {

@@ -86,10 +86,24 @@ services:
           echo "  psql \"\$$DATABASE_URL\" -v ON_ERROR_STOP=1 -f migrations/$$(basename $$f)"
         done
         echo
-        echo "Not baseline, and applied deliberately — read the runbook first:"
-        for f in /migrations/0013_*.sql /migrations/0014_*.sql; do
+        # 0013 and 0014 are BOTH excluded from the loop above and excluded for
+        # opposite reasons, so they get separate headings. One shared heading —
+        # "applied deliberately, read the runbook" — reads as "risky, skip it",
+        # which is right for 0013 and wrong for 0014, and following it leaves a
+        # pre-P12 database carrying a column a fresh deploy has never had.
+        echo "Applied deliberately, INSIDE the cutover window — read the runbook first:"
+        for f in /migrations/0013_*.sql; do
           [ -e "$$f" ] && echo "  migrations/$$(basename $$f)"
         done
+        echo
+        echo "Safe any time, REQUIRED if this database predates P12:"
+        for f in /migrations/0014_*.sql; do
+          [ -e "$$f" ] && echo "  migrations/$$(basename $$f)"
+        done
+        echo "  check:  SELECT 1 FROM information_schema.columns"
+        echo "          WHERE table_name='messages' AND column_name='queued_message';"
+        echo "  a row back means apply it. 0001 is CREATE TABLE IF NOT EXISTS,"
+        echo "  so re-running the baseline cannot drop it for you."
         echo
         echo "One-shot data migrations from mentera-core"
         echo "(read docs/MIGRATION_RUNBOOK.md first):"

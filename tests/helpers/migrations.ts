@@ -34,6 +34,19 @@ export const NON_BASELINE_MIGRATIONS = new Set([
   // drops. It exists for a development database built from the older file, so
   // applying it in a harness would prove nothing and hide the fact that the
   // baseline is already clean. See D103.
+  //
+  // EXCLUDING IT **HERE** IS CORRECT AND IS NOT ADVICE TO ANYONE ELSE. A
+  // harness builds an empty container from the current `0001` every time, so
+  // this file has nothing to do and running it would mask a regression that
+  // re-added the column. An EXISTING database is the opposite case: `0001` is
+  // `CREATE TABLE IF NOT EXISTS`, so it cannot drop a column a previous `0001`
+  // created, and `0014` is the only thing that will.
+  //
+  // The two audiences were collapsed into one instruction — "skip 0013 and
+  // 0014" — and a local database kept `messages.queued_message` indefinitely
+  // as a result. `scripts/print-migrations.mjs` now prints a separate reason
+  // per file, and `tests/unit/platform/migrations.test.ts` fails if a future
+  // exclusion arrives without one.
   '0014_drop_queued_message.sql',
 ]);
 
