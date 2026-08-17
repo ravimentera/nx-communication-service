@@ -182,8 +182,48 @@ untouched by a test run. Docker must be running for it.
 
 ## Seed data
 
-There is none yet, by design: nothing before P5 owns the shape of a `recipients`
-row, and a seed written now would be rewritten twice. When a phase needs
-fixtures, they belong in `tests/` (throwaway container) or in a `packs/` seed
-applied through the pack loader (P7) — not in an ad-hoc SQL file that drifts
-from the schema the way the §0.5 Seam D ghost tables did.
+`testing/` holds it. There is no create-a-tenant endpoint — tenants arrive
+through the `9xxx` load or an insert — so without this a local service boots
+against an empty database with no way to exercise anything.
+
+```bash
+docker compose exec -T postgres psql -U outreach -d outreach \
+  -v ON_ERROR_STOP=1 -f /testing/seed-local.sql
+./testing/seed-packs.sh          # installs packs through the API, not by insert
+node testing/bootstrap.mjs        # drafts, a campaign, an API key
+```
+
+Three tenants: `t-alpha` for the happy path, `t-beta` as the other side of every
+isolation test, and `t-gdpr` carrying a compliance profile so the data-rights
+endpoints are reachable at all. Recipients cover the branches the compliance
+gate takes — email-only, unsubscribed, and one in Asia/Tokyo so quiet hours are
+observable from a US-hours laptop. Re-running the seed is the intended way to
+reset fixture state; it restores every seeded column.
+
+> **This section used to say there was no seed, "by design"** — because nothing
+> before P5 owned the shape of a `recipients` row, and the concern was an
+> ad-hoc SQL file drifting from the schema the way the §0.5 Seam D ghost tables
+> did. The first half expired when the phases finished. **The second half was
+> right**, and is why `tests/integration/seed.test.ts` exists: it applies this
+> file to a throwaway container and asserts the fixtures still mean what the
+> engine reads — that contact points use `phone` rather than the channel name
+> `sms`, and that `external_ref.system` matches what the compat shim resolves.
+> The fixture shipped wrong on both counts, and both inserted perfectly happily.
+
+**Two files in `testing/` are generated and gitignored** — the Postman
+collection and its environment. A fresh clone builds them:
+
+```bash
+node testing/build-postman.mjs    # from docs/api/openapi.yaml
+node testing/bootstrap.mjs        # writes the environment, incl. an API key
+```
+
+The collection is ~300KB of generated output and the environment holds a
+plaintext key the API returns once, so neither belongs in git. Regenerating is
+cheap and `tests/contract/openapi.test.ts` already fails if the spec drifts from
+the registered routes.
+
+`node testing/smoke.mjs` replays all 150 requests against your running service
+and reports anything 5xx. It is **not** a test suite — `npm test` is that. This
+one knows only what a plausible answer looks like, and exists to answer "did I
+break anything across the surface" in a few seconds against a real stack.

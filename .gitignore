@@ -11,6 +11,25 @@ uploads/
 .env.local
 .env.*.local
 
+# ── generated testing artifacts ──────────────────────────────────────────────
+#
+# Both are OUTPUT. The generators are committed; these are not.
+#
+# The collection is ~300KB regenerated from docs/api/openapi.yaml, so committing
+# it means a large diff every time a route changes — and a stale copy is worse
+# than none, because a request that 404s reads as a bug in the service rather
+# than as a file nobody re-ran. `node testing/build-postman.mjs` rebuilds it,
+# and tests/contract/openapi.test.ts already fails if the spec drifts from the
+# registered routes, so the regenerated file is correct by construction.
+#
+# The environment file exists to hold ids minted by testing/bootstrap.mjs —
+# INCLUDING A PLAINTEXT API KEY, which the API returns exactly once. It is
+# local-only and worthless against any deployment, but a committed file whose
+# purpose is to carry a credential is a habit worth not forming, and it trips
+# secret scanners. Re-run bootstrap.mjs to mint a fresh one.
+testing/outreach.postman_collection.json
+testing/outreach.postman_environment.json
+
 .DS_Store
 .idea/
 .vscode/

@@ -15,6 +15,10 @@ services:
       # migrations/README.md is run from inside this container against the same
       # files. Read-only mount = the container can never rewrite a migration.
       - ./migrations:/migrations:ro
+      # Read-only, same reasoning. `testing/` holds fixtures for manual testing,
+      # NOT schema — nothing in it ships, and it is deliberately outside the
+      # numbered series so that series stays readable as "the schema, in order".
+      - ./testing:/testing:ro
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U outreach -d outreach']
       interval: 10s
