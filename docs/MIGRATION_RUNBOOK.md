@@ -95,6 +95,7 @@ The files:
       | `0018` | `playbook_runs` status `RUNNING` | the run reservation writes it |
       | `0019` | `UNIQUE (campaign_id, recipient_id)` | campaign expansion upserts against it |
       | `0020` | webhook credential columns on `tenant_channel_configs` | none — but `9003` should not be re-run after it without re-reading §8b |
+      | `0021` | `UNIQUE` on active `twilio_account_sid` | **refuses to apply** while two tenants share one — decide who owns each account first |
       ```bash
       npm run migrate:print          # prints the exact commands, runs nothing
       ```
@@ -122,6 +123,23 @@ The files:
       Until P13 there was nothing to decide: `consent_records` had no writer at
       all, so leaving shadow mode would have blocked essentially every send with
       `CONSENT_REQUIRED` and there was no API to clear a single one.
+
+      **`require_opt_in` now defaults to `true` for a tenant with no
+      `tenant_channel_configs` row.** It always did in the column; the gate read
+      a missing row as `false`, so the least-configured tenant got the most
+      permissive treatment. The count above is therefore not the whole picture —
+      a tenant that never configured a channel needs consent too:
+
+      ```sql
+      SELECT t.id
+      FROM tenants t
+      LEFT JOIN tenant_channel_configs c ON c.tenant_id = t.id AND c.is_active
+      WHERE t.is_active AND c.tenant_id IS NULL;
+      ```
+
+      Each of those either records consent, or gets a config row saying
+      `require_opt_in = false` — deliberately, as a decision somebody made
+      rather than as the absence of a row.
 - [ ] **Decide `CHANNEL_DRY_RUN` before the window, not during it.** Approving a
       message sends for real in the new engine and sent nothing in the old one
       (D44), so the first approval after the repoint is the first real send this
