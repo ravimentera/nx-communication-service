@@ -106,12 +106,12 @@ function harness(sla: ApprovalSla, due: Row[] = [dueRow()]) {
   const policy: ApprovalPolicy = { ...FALLBACK_POLICY, id: 'pol-1', sla };
 
   const decline = spy<[unknown, string, unknown, string?], Promise<unknown>>(async () => ({}));
-  const approve = spy<[unknown, string, unknown], Promise<unknown>>(async () => ({}));
+  const autoApproveOnExpiry = spy<[unknown, string, unknown], Promise<unknown>>(async () => ({}));
   const notify = spy<[EscalationNotice], Promise<void>>(async () => {});
 
   const approvals = {
     decline,
-    approve,
+    autoApproveOnExpiry,
     getById: async () => ({ id: 'a-1', auditTrail: [] }),
   } as unknown as ApprovalService;
 
@@ -125,7 +125,7 @@ function harness(sla: ApprovalSla, due: Row[] = [dueRow()]) {
     notify,
   });
 
-  return { sweeper, writes, decline, approve, notify };
+  return { sweeper, writes, decline, autoApproveOnExpiry, notify };
 }
 
 describe('expiry is recorded before anything is decided', () => {
@@ -157,20 +157,55 @@ describe('onExpiry: decline', () => {
 });
 
 describe('onExpiry: approve', () => {
-  it('auto-approves and releases through the normal path, so compliance still runs', async () => {
-    const { sweeper, approve, writes } = harness({ onExpiry: 'approve' });
+  it('hands the whole move to the service, which is what makes it release', async () => {
+    const { sweeper, autoApproveOnExpiry, writes } = harness({ onExpiry: 'approve' });
     const report = await sweeper.sweep(NOW);
 
     expect(report).toMatchObject({ scanned: 1, approved: 1 });
-    // AUTO_APPROVED, not APPROVED: this was the policy's decision, and the
-    // audit trail must not claim a person made it.
-    expect(writes.sets.some((s) => s.status === 'AUTO_APPROVED')).toBe(true);
-    expect(writes.sets.find((s) => s.status === 'AUTO_APPROVED')).toMatchObject({
-      decidedBy: 'sla.worker',
-    });
-    // Released via approve(), which is the only path that reaches the dispatcher
-    // and therefore the compliance gate.
-    expect(approve.calls).toHaveLength(1);
+
+    // EXPIRED is written here, and it is the LAST status this file writes. The
+    // AUTO_APPROVED move belongs to the service, together with the release —
+    // this used to write the status itself and then call `approve()`, whose
+    // idempotency guard sees AUTO_APPROVED as already-approved and returns
+    // without dispatching. The message was never sent and the trail said it was.
+    expect(writes.sets.some((s) => s.status === 'EXPIRED')).toBe(true);
+    expect(writes.sets.some((s) => s.status === 'AUTO_APPROVED')).toBe(false);
+
+    expect(autoApproveOnExpiry.calls).toHaveLength(1);
+    expect(autoApproveOnExpiry.calls[0]![1]).toBe('a-1');
+    expect(autoApproveOnExpiry.calls[0]![2]).toMatchObject({ type: 'system', ref: 'sla.worker' });
+  });
+});
+
+describe('rows stranded EXPIRED', () => {
+  it('are rescanned, so a crash between the expiry and its action is recoverable', async () => {
+    // The row expired on a previous sweep and the action that should have
+    // followed never ran. The old scan filtered on PENDING_APPROVAL alone, so
+    // this row was invisible from then on: never sent, never declined, never
+    // looked at again.
+    const { sweeper, autoApproveOnExpiry, writes } = harness({ onExpiry: 'approve' }, [
+      dueRow({ status: 'EXPIRED' }),
+    ]);
+    const report = await sweeper.sweep(NOW);
+
+    expect(report).toMatchObject({ scanned: 1, approved: 1 });
+    // Not expired a second time — it already carries the state and the trail.
+    expect(writes.sets.some((s) => s.status === 'EXPIRED')).toBe(false);
+    expect(autoApproveOnExpiry.calls).toHaveLength(1);
+  });
+
+  it('are left alone when they are parked waiting for an operator', async () => {
+    // `escalate` with no fallback is a deliberate parking state, logged once
+    // when it happens. Re-reporting it every sixty seconds would bury the rows
+    // the rescan exists to recover.
+    const { sweeper, notify, writes } = harness({ onExpiry: 'escalate' }, [
+      dueRow({ status: 'EXPIRED' }),
+    ]);
+    const report = await sweeper.sweep(NOW);
+
+    expect(report).toMatchObject({ scanned: 1, escalated: 0, failed: 0 });
+    expect(notify.calls).toHaveLength(0);
+    expect(writes.sets).toHaveLength(0);
   });
 });
 

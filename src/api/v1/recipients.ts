@@ -10,6 +10,12 @@ import { Router, type NextFunction, type Request, type Response } from 'express'
 import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
 
+import { isValidTimezone, TIMEZONE_ERROR } from '../../domain/timezone.js';
+
+import {
+  CONSENT_SOURCES,
+  type ConsentService,
+} from '../../engine/compliance/consent.service.js';
 import type { ComplianceGate } from '../../engine/compliance/gate.js';
 import type { ErasureService } from '../../engine/compliance/erasure.service.js';
 import type { PreferenceService } from '../../engine/compliance/preference.service.js';
@@ -21,6 +27,7 @@ import {
 } from '../../platform/http/auth.middleware.js';
 import { NotFoundError, NotImplementedError } from '../../platform/http/errors.js';
 import { CHANNEL_TYPES } from '../../ports/channel.js';
+import { uuidParam } from '../../platform/http/params.js';
 
 const preferenceSchema = z.object({
   allowCommunications: z.boolean().optional(),
@@ -30,7 +37,11 @@ const preferenceSchema = z.object({
   preferredTimeOfDay: z.string().optional(),
   quietHoursStart: z.string().regex(/^([01]?\d|2[0-3]):[0-5]\d$/).nullable().optional(),
   quietHoursEnd: z.string().regex(/^([01]?\d|2[0-3]):[0-5]\d$/).nullable().optional(),
-  quietHoursTimezone: z.string().nullable().optional(),
+  quietHoursTimezone: z
+    .string()
+    .refine(isValidTimezone, TIMEZONE_ERROR)
+    .nullable()
+    .optional(),
   eventOptOuts: z.array(z.string()).optional(),
 });
 
@@ -39,7 +50,7 @@ const recipientSchema = z.object({
   displayName: z.string().optional(),
   firstName: z.string().optional(),
   lastName: z.string().optional(),
-  timezone: z.string().optional(),
+  timezone: z.string().refine(isValidTimezone, TIMEZONE_ERROR).optional(),
   locale: z.string().optional(),
   contactPoints: z
     .array(
@@ -64,10 +75,25 @@ const checkSchema = z.object({
 export interface RecipientApiDeps {
   recipients: RecipientService;
   preferences: PreferenceService;
+  /** P13. The write side of `consent_records`, which had none until now. */
+  consent: ConsentService;
   gate: ComplianceGate;
   /** P12. Absent means the two GDPR routes answer 501 rather than 404. */
   erasure?: ErasureService;
 }
+
+const grantConsentSchema = z.object({
+  channels: z.array(z.enum(CHANNEL_TYPES)).min(1),
+  source: z.enum(CONSENT_SOURCES),
+  /** When they agreed, which for an import is not when this call was made. */
+  grantedAt: z.string().datetime().optional(),
+  proof: z.record(z.unknown()).optional(),
+});
+
+const revokeConsentSchema = z.object({
+  channels: z.array(z.enum(CHANNEL_TYPES)).optional(),
+  reason: z.string().max(500).optional(),
+});
 
 function handle(
   fn: (req: Request, res: Response) => Promise<void>,
@@ -79,6 +105,11 @@ function handle(
 
 export function createRecipientRouter(deps: RecipientApiDeps): Router {
   const router = Router();
+
+  // `:id` is always a recipient uuid here. `:system` and `:externalId` on the
+  // by-external-ref route are deliberately NOT uuids — that route exists to
+  // look a recipient up by someone else's identifier.
+  router.param('id', uuidParam());
 
   router.get(
     '/recipients',
@@ -96,6 +127,7 @@ export function createRecipientRouter(deps: RecipientApiDeps): Router {
 
   router.post(
     '/recipients',
+    requirePermissions(Permission.CONFIG_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       const body = recipientSchema.parse(req.body);
@@ -160,6 +192,7 @@ export function createRecipientRouter(deps: RecipientApiDeps): Router {
 
   router.put(
     '/recipients/:id/preferences',
+    requirePermissions(Permission.CONFIG_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       const body = preferenceSchema.parse(req.body);
@@ -181,12 +214,65 @@ export function createRecipientRouter(deps: RecipientApiDeps): Router {
 
   router.post(
     '/recipients/:id/unsubscribe',
+    requirePermissions(Permission.SEND),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       const id = req.params.id as string;
       await deps.preferences.unsubscribe(scope, id, req.body?.reason);
       await deps.recipients.setStatus(scope, id, 'unsubscribed');
       res.status(204).end();
+    }),
+  );
+
+  // ── consent ────────────────────────────────────────────────────────────────
+  //
+  // `consent_records` has existed since 0001 and had no writer until P13: the
+  // compliance gate read a table nothing could fill, so `require_opt_in` —
+  // which defaults to true — would have blocked every send the moment an
+  // operator turned shadow mode off, with no way to record a single consent.
+  //
+  // Gated on SEND rather than a consent-specific permission: whoever may cause
+  // a message to go out is the same person who records the basis for it, and a
+  // permission nobody has been granted is a gate that gets worked around.
+
+  router.get(
+    '/recipients/:id/consent',
+    handle(async (req, res) => {
+      const scope = requireTenant(req);
+      res.json({ consent: await deps.consent.list(scope, req.params.id as string) });
+    }),
+  );
+
+  router.post(
+    '/recipients/:id/consent',
+    requirePermissions(Permission.SEND),
+    handle(async (req, res) => {
+      const scope = requireTenant(req);
+      const body = grantConsentSchema.parse(req.body);
+      const records = await deps.consent.grant(scope, req.params.id as string, {
+        channels: body.channels,
+        source: body.source,
+        ...(body.grantedAt ? { grantedAt: new Date(body.grantedAt) } : {}),
+        ...(body.proof ? { proof: body.proof } : {}),
+      });
+      res.status(201).json({ consent: records });
+    }),
+  );
+
+  router.post(
+    '/recipients/:id/consent/revoke',
+    requirePermissions(Permission.SEND),
+    handle(async (req, res) => {
+      const scope = requireTenant(req);
+      const body = revokeConsentSchema.parse(req.body ?? {});
+      // No channels named means all of them, which is what a withdrawal means.
+      const records = await deps.consent.revoke(
+        scope,
+        req.params.id as string,
+        body.channels,
+        body.reason,
+      );
+      res.json({ revoked: records.length, consent: records });
     }),
   );
 

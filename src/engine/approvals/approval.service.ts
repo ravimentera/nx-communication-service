@@ -45,11 +45,16 @@ import { and, asc, count, desc, eq, gte, inArray, lt, sql, type SQL } from 'driz
 import type { Logger } from 'winston';
 
 import type { Db } from '../../db/index.js';
-import { approvals, messages } from '../../db/schema.js';
+import { approvals, messages, tenants } from '../../db/schema.js';
 import type { ApprovalStatus } from '../../db/schema/approvals.js';
 import type { Priority } from '../../domain/index.js';
 import type { TenantScope } from '../../platform/db/tenant-scope.js';
-import { ForbiddenError, NotFoundError, ValidationError } from '../../platform/http/errors.js';
+import {
+  ConflictError,
+  ForbiddenError,
+  NotFoundError,
+  ValidationError,
+} from '../../platform/http/errors.js';
 import { normalizeChannel, type ChannelType, type ContactPoint, type RenderedMessage } from '../../ports/channel.js';
 import type { Dispatcher, DispatchResult } from '../delivery/dispatcher.js';
 import {
@@ -344,6 +349,43 @@ export class ApprovalService {
     return row ? toView(row) : null;
   }
 
+  /**
+   * One approval, authorized for this actor.
+   *
+   * `getById` applies the tenant predicate and nothing else, which is right for
+   * an internal caller and was wrong for the route: `GET /v1/approvals/:id` used
+   * it directly, so any authenticated user in the tenant could read any
+   * approval by id — including the message body waiting for someone else's
+   * decision. The mutations have been authorized per row since P6; the read was
+   * simply missed, and the polarity is the same.
+   *
+   * NotFound rather than Forbidden when the actor may not see it. Answering 403
+   * would confirm that an approval with that id exists in this tenant, which is
+   * more than a caller who cannot read it should learn.
+   */
+  async getByIdFor(scope: TenantScope, id: string, actor: Actor): Promise<ApprovalView | null> {
+    const view = await this.getById(scope, id);
+    if (!view) return null;
+
+    // `outreach:approve` widens a READ to the whole tenant, and deliberately
+    // does not widen a write. The list route has always let a holder ask for
+    // another approver's queue (`approverRefFor`), so refusing them the row they
+    // can already see in that list would be incoherent — they would read a
+    // summary and get a 404 opening it.
+    //
+    // The asymmetry with the mutations is the point rather than an oversight:
+    // seeing a colleague's queue is what a clinic lead does; *deciding* on their
+    // behalf is what D45 exists to prevent, and `authorize` still refuses it.
+    if (this.isAdmin(actor) || actor.permissions?.includes(PERMISSION_APPROVE)) return view;
+
+    try {
+      await this.authorize(view, actor, 'read');
+    } catch {
+      return null;
+    }
+    return view;
+  }
+
   async getByMessageId(scope: TenantScope, messageId: string): Promise<Approval | null> {
     const [row] = await this.deps.db
       .select()
@@ -405,6 +447,16 @@ export class ApprovalService {
   }
 
   /** Counts by status, priority and age, for the approver's dashboard header. */
+  /**
+   * `startOfToday` is computed in the TENANT's timezone, not the server's.
+   *
+   * `new Date(); setHours(0,0,0,0)` is midnight where the process runs, which
+   * for a pod in UTC and a New York clinic means "today" starts at 7pm the
+   * previous evening — so the dashboard's `approvedToday` counted a chunk of
+   * yesterday and dropped this evening's. Exactly the class of defect D34
+   * introduced `formatDate`'s timezone resolution to prevent, in the one place
+   * that computes a boundary rather than formats one.
+   */
   async dashboard(
     scope: TenantScope,
     approverRef?: string,
@@ -420,10 +472,15 @@ export class ApprovalService {
     const base: SQL[] = [eq(approvals.tenantId, scope.tenantId)];
     if (approverRef) base.push(eq(approvals.approverRef, approverRef));
 
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
+    const [tenantRow] = await this.deps.db
+      .select({ timezone: tenants.timezone })
+      .from(tenants)
+      .where(eq(tenants.id, scope.tenantId))
+      .limit(1);
+
+    const startOfToday = startOfDayIn(tenantRow?.timezone ?? 'UTC');
     const startOfWeek = new Date(startOfToday);
-    startOfWeek.setDate(startOfWeek.getDate() - startOfWeek.getDay());
+    startOfWeek.setUTCDate(startOfWeek.getUTCDate() - startOfWeek.getUTCDay());
 
     const decided = ['APPROVED', 'EDITED_APPROVED', 'AUTO_APPROVED', 'SENT'];
 
@@ -505,6 +562,44 @@ export class ApprovalService {
     return { approval: released.approval, dispatch: released.dispatch };
   }
 
+  /**
+   * The SLA sweeper's `onExpiry: 'approve'`: EXPIRED → AUTO_APPROVED, released.
+   *
+   * This exists because `approve()` cannot serve it. That method's first act is
+   * an idempotency guard on `APPROVED_STATES`, which `AUTO_APPROVED` is a member
+   * of — so a sweeper that wrote the status itself and then called `approve()`
+   * to release it got the guard, an untouched row and no dispatch. One of the
+   * three documented SLA outcomes was a silent no-op: the audit trail said
+   * auto-approved and nothing was ever sent.
+   *
+   * The status write lives here rather than in the sweeper for the same reason.
+   * The sweeper's own UPDATE carried no status predicate, so a human who
+   * declined at the moment the sweep ran had their decision overwritten and
+   * their audit entry replaced. `move()` writes both in one statement, guarded
+   * on the status that was read.
+   */
+  async autoApproveOnExpiry(scope: TenantScope, id: string, actor: Actor): Promise<ActionResult> {
+    const current = await this.require(scope, id);
+
+    if (current.status !== 'EXPIRED') {
+      // Someone decided while the sweep was in flight. Their call stands.
+      return { approval: current, idempotent: true };
+    }
+
+    const body = current.editedContent ?? current.originalContent ?? '';
+    const approval = await this.move(scope, current, {
+      to: 'AUTO_APPROVED',
+      actor,
+      reason: 'policy sla.onExpiry = approve',
+      set: { decidedAt: new Date(), decidedBy: actor.ref },
+    });
+
+    // Through `release()`, so an auto-approval on expiry still faces the
+    // compliance gate — the point of routing it through the service at all.
+    const released = await this.release(scope, approval, body);
+    return { approval: released.approval, dispatch: released.dispatch };
+  }
+
   /** Save an edit without deciding. The row stays PENDING_APPROVAL. */
   async edit(
     scope: TenantScope,
@@ -562,6 +657,27 @@ export class ApprovalService {
     return toApproval(row);
   }
 
+  /**
+   * Edit and approve as ONE decision.
+   *
+   * ───────────────────────────────────────────────────────────────────────────
+   * IT WAS TWO CALLS WITH A WINDOW BETWEEN THEM
+   *
+   * `edit()` then `approve()` leaves the row PENDING_APPROVAL with the new
+   * content in between, so a second approver looking at the inbox in that
+   * window could approve text the first was still working on — or decline it,
+   * and the first call's approve would then fail with a confusing
+   * "changed underneath this request".
+   *
+   * The content write and the status move are one guarded UPDATE now:
+   * `move()` matches on the status that was read, so exactly one of two
+   * concurrent deciders wins and the loser is told to re-read.
+   *
+   * The DISPATCH stays outside it, deliberately. Enqueuing inside a database
+   * transaction means either holding the transaction open across a network call
+   * to Redis, or committing a decision whose send has not been accepted —
+   * `release()` already handles the second case properly (D105).
+   */
   async editThenApprove(
     scope: TenantScope,
     id: string,
@@ -569,8 +685,45 @@ export class ApprovalService {
     content: string,
     subject?: string,
   ): Promise<ActionResult> {
-    await this.edit(scope, id, actor, content, subject);
-    return this.approve(scope, id, actor);
+    const current = await this.require(scope, id);
+    await this.authorize(current, actor, 'edit');
+    await this.authorize(current, actor, 'approve');
+
+    if (!content.trim()) {
+      throw new ValidationError('Content is required for an edit');
+    }
+
+    // Already decided: fall through to `approve`, which owns the idempotency
+    // rules — including the retry of a dispatch that never reached the queue.
+    if (current.status !== 'PENDING_APPROVAL') {
+      return this.approve(scope, id, actor);
+    }
+
+    const approval = await this.move(scope, current, {
+      to: 'EDITED_APPROVED',
+      actor,
+      reason: 'edited and approved',
+      contentHash: hashOf(content),
+      set: { decidedAt: new Date(), decidedBy: actor.ref, editedContent: content },
+    });
+
+    // The message row follows, so a reviewer reading `messages.content` and one
+    // reading the approval see the same text. After the status move: if this
+    // fails, the decision still stands and `release()` reads the approval's
+    // own `editedContent`, which is authoritative.
+    await this.deps.db
+      .update(messages)
+      .set({
+        content,
+        ...(subject === undefined
+          ? {}
+          : { metadata: sql`${messages.metadata} || ${JSON.stringify({ subject })}::jsonb` }),
+        updatedAt: new Date(),
+      })
+      .where(and(eq(messages.tenantId, scope.tenantId), eq(messages.id, current.messageId)));
+
+    const released = await this.release(scope, approval, content);
+    return { approval: released.approval, dispatch: released.dispatch };
   }
 
   async decline(
@@ -620,6 +773,27 @@ export class ApprovalService {
     }
     if (sendAt.getTime() <= Date.now()) {
       throw new ValidationError('sendAt must be in the future');
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ALREADY RELEASED MEANS THERE IS NOTHING LEFT TO SCHEDULE.
+    //
+    // `approve()` has an idempotency guard and this had none, while
+    // APPROVED → SCHEDULED is a legal transition — so calling schedule after an
+    // approve ran `release()` a second time. That enqueued a second BullMQ job,
+    // and `dispatcher.persist()` reset the message row from SENT back to QUEUED,
+    // so the recipient got the message twice and the log showed one send.
+    //
+    // 409 rather than a silent no-op: the caller asked for a send time that is
+    // not going to be honoured, and telling them so is the only way they find
+    // out. A message that is genuinely still waiting can be rescheduled — that
+    // is the SCHEDULED → SCHEDULED case, which is not this one.
+    // ─────────────────────────────────────────────────────────────────────────
+    if (APPROVED_STATES.includes(current.status) || current.status === 'SENT') {
+      throw new ConflictError(
+        `Approval '${id}' has already been released for delivery and cannot be scheduled`,
+        { status: current.status },
+      );
     }
 
     const body = current.editedContent ?? current.originalContent ?? '';
@@ -702,10 +876,49 @@ export class ApprovalService {
       throw new ForbiddenError('Bulk approval requires the outreach:approve:bulk permission');
     }
 
+    // ── AND THE POLICY'S OWN RIGHT, WHICH THE DOCSTRING ABOVE PROMISED ──────
+    //
+    // `rights.bulk` was loaded, typed and documented here as required — and
+    // never read. The two are not redundant, and the difference is the point:
+    // a PERMISSION is granted per user, usually broadly, while the RIGHT is
+    // authored per policy by the tenant. A clinic that decides messages under
+    // one policy must be read one at a time was overridden by any admin holding
+    // a broad permission, which is the exact thing `rights` exists to prevent.
+    //
+    // Checked per row, because a batch can span policies: the ones that forbid
+    // it report their own error and the rest proceed, rather than one strict
+    // policy failing the whole call.
+    const rightsByPolicy = new Map<string, boolean>();
+    const bulkAllowed = async (approval: Approval): Promise<boolean> => {
+      if (!approval.policyId) return true; // the fallback policy permits it
+      const cached = rightsByPolicy.get(approval.policyId);
+      if (cached !== undefined) return cached;
+
+      const policy = await this.deps.policies.load(this.scopeOf(approval), {
+        policyId: approval.policyId,
+      });
+      const allowed = policy?.rights?.bulk !== false;
+      rightsByPolicy.set(approval.policyId, allowed);
+      return allowed;
+    };
+
     const results: { id: string; ok: boolean; status?: ApprovalStatus; error?: string }[] = [];
 
     for (const id of ids) {
       try {
+        if (!this.isAdmin(actor)) {
+          const approval = await this.require(scope, id);
+          if (!(await bulkAllowed(approval))) {
+            results.push({
+              id,
+              ok: false,
+              error:
+                'This approval’s policy does not permit bulk actions; it must be decided individually',
+            });
+            continue;
+          }
+        }
+
         const outcome =
           action === 'approve'
             ? await this.approve(scope, id, actor)
@@ -823,8 +1036,9 @@ export class ApprovalService {
 
     // Compliance said no, permanently. The approval is cancelled rather than
     // left looking approved-and-pending forever, and the audit trail records
-    // why. Deferrals are left alone: `retryAt` means later, not never, and P7's
-    // scheduler picks them back up.
+    // why. Deferrals are left alone: `retryAt` means later, not never, and
+    // `DeferralWorker` re-dispatches them (D90) — which it genuinely does now.
+    // This said "P7's scheduler" for six phases while no such thing existed.
     if (!dispatch.queued && dispatch.skipped && !dispatch.deferrable) {
       const cancelled = await this.move(this.scopeOf(approval), approval, {
         to: 'CANCELLED',
@@ -854,6 +1068,7 @@ export class ApprovalService {
         decidedAt: Date;
         decidedBy: string;
         declineReason: string | null;
+        editedContent: string;
         approverRef: string;
         approverType: string;
         slaDeadline: Date | null;
@@ -896,11 +1111,30 @@ export class ApprovalService {
     return toApproval(row);
   }
 
+  /**
+   * The row every mutation starts from — scoped to the sub-tenant as well as
+   * the tenant.
+   *
+   * `filterClause` has applied `subTenantId` to every LIST since P6 and this
+   * applied only `tenantId`, so a caller scoped to one location could not SEE
+   * another location's approvals and could act on any of them by id. That is
+   * the same asymmetry D45 records in the source — the check on the list and
+   * nowhere else — reintroduced one level down.
+   *
+   * A scope with no `subTenantId` is org-wide and matches every row, which is
+   * what an admin without a location header should get.
+   */
   private async require(scope: TenantScope, id: string): Promise<Approval> {
     const [row] = await this.deps.db
       .select()
       .from(approvals)
-      .where(and(eq(approvals.tenantId, scope.tenantId), eq(approvals.id, id)))
+      .where(
+        and(
+          eq(approvals.tenantId, scope.tenantId),
+          eq(approvals.id, id),
+          ...(scope.subTenantId ? [eq(approvals.subTenantId, scope.subTenantId)] : []),
+        ),
+      )
       .limit(1);
     if (!row) throw new NotFoundError(`Approval '${id}' not found`);
     return toApproval(row);
@@ -959,6 +1193,22 @@ export class ApprovalService {
         throw new ForbiddenError('Access denied: you are not a member of this approval group', {
           right,
         });
+      }
+      return;
+    }
+
+    // `round_robin` names one person, exactly as `agent` does — the rotation
+    // picked them. It had no branch here, so after the permission check it fell
+    // straight through and ANY `outreach:approve` holder in the tenant could
+    // act on a message assigned to somebody else. That is the defect D45
+    // records in the source, surviving in the one approver kind nobody wrote a
+    // case for.
+    if (approval.approverType === 'round_robin' && approval.approverRef) {
+      if (identity !== approval.approverRef) {
+        throw new ForbiddenError(
+          'Access denied: this approval is in someone else’s turn of the rotation',
+          { right },
+        );
       }
       return;
     }
@@ -1060,7 +1310,14 @@ export class ApprovalService {
   }
 }
 
-type ApprovalRightsShape = { approve: true; edit: true; decline: true; reschedule: true };
+type ApprovalRightsShape = {
+  approve: true;
+  edit: true;
+  decline: true;
+  reschedule: true;
+  /** Reading one approval. Same polarity as the mutations — see `getByIdFor`. */
+  read: true;
+};
 
 type ApprovalRow = typeof approvals.$inferSelect;
 
@@ -1112,6 +1369,35 @@ function toView(row: {
     senderId: row.senderId,
     messageStatus: row.messageStatus,
   };
+}
+
+/**
+ * Midnight today, in the given IANA zone, as an instant.
+ *
+ * Built by formatting `now` into the zone's calendar date and reading it back
+ * as UTC — the only way to get a zone's day boundary without a date library,
+ * and correct across DST because the formatter does the conversion.
+ *
+ * An unknown zone falls back to UTC rather than throwing: a dashboard is not
+ * worth failing over a misconfigured timezone, and the compliance gate is where
+ * a bad zone must be caught (it is validated at the edge now).
+ */
+function startOfDayIn(timezone: string): Date {
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(new Date());
+
+    const get = (type: string) => parts.find((p) => p.type === type)?.value ?? '01';
+    return new Date(`${get('year')}-${get('month')}-${get('day')}T00:00:00.000Z`);
+  } catch {
+    const utc = new Date();
+    utc.setUTCHours(0, 0, 0, 0);
+    return utc;
+  }
 }
 
 /** Short, stable fingerprint of a body, so an edit is provable from the trail. */

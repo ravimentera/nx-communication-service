@@ -73,6 +73,9 @@ export interface QueueRetryConfig {
   urgentAttempts: number;
   backoffDelayMs: number;
   concurrency: number;
+  /** Jobs this worker will start per `limiterIntervalMs`. See the limiter note. */
+  maxPerInterval: number;
+  limiterIntervalMs: number;
 }
 
 export interface NotificationQueueDeps {
@@ -148,14 +151,74 @@ function jobOptions(priority: Priority, retry: QueueRetryConfig, options?: Enque
   return {
     priority: JOB_PRIORITY[priority],
     attempts: urgent ? retry.urgentAttempts : retry.attempts,
-    // Urgent messages must not back off exponentially into minutes.
-    backoff: urgent
-      ? { type: 'fixed' as const, delay: retry.backoffDelayMs }
-      : { type: 'exponential' as const, delay: retry.backoffDelayMs },
+    // ── JITTERED ────────────────────────────────────────────────────────────
+    //
+    // A provider outage fails every in-flight job at once, and a deterministic
+    // backoff then retries all of them at the same instant — and again, and
+    // again, in a thundering herd that keeps the provider down and burns every
+    // attempt in lockstep. `custom` spreads them.
+    //
+    // Urgent messages keep a FIXED base rather than exponential, so they do not
+    // back off into minutes (the source's own choice, preserved). They get
+    // jitter too: simultaneity is the problem, not the curve.
+    backoff: {
+      type: 'custom' as const,
+      delay: retry.backoffDelayMs,
+    },
     removeOnComplete: { age: 24 * 3600, count: 1000 },
     removeOnFail: { age: 7 * 24 * 3600 },
     ...(options?.delayMs && options.delayMs > 0 ? { delay: options.delayMs } : {}),
   };
+}
+
+/**
+ * How long BullMQ lets a worker hold a job before deciding it stalled and
+ * handing it to somebody else.
+ */
+const LOCK_DURATION_MS = 30_000;
+
+/**
+ * The deadline on one provider call. Comfortably below `LOCK_DURATION_MS`, so a
+ * hung provider produces a failure this worker owns rather than a reclaim that
+ * puts two workers on the same send.
+ */
+const SEND_TIMEOUT_MS = 20_000;
+
+/**
+ * Bound a provider call.
+ *
+ * Only the webhook and push adapters set their own timeout; the Twilio,
+ * SendGrid and Slack SDKs use their defaults, which for a hung connection can
+ * exceed `LOCK_DURATION_MS`. When that happens BullMQ decides the job stalled
+ * and gives it to another worker while the first is still inside the provider
+ * call — and both send.
+ *
+ * The timeout is a RETRYABLE failure. A provider slow once is usually not slow
+ * twice, and dropping the message after one attempt is the more expensive
+ * mistake.
+ *
+ * NOTE it does not cancel the underlying request; nothing at this layer can. It
+ * stops the WORKER waiting, which is what keeps the job inside its lock. A
+ * provider that eventually accepts a message we gave up on is the one duplicate
+ * this cannot prevent, and it is far less likely than the reclaim it does.
+ */
+async function withDeadline<T>(work: Promise<T>, ms: number, channel: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${channel} provider did not respond within ${ms}ms`)),
+          ms,
+        );
+      }),
+    ]);
+  } finally {
+    // Cleared on both paths. An uncleared timer is what D30 records the source
+    // getting wrong, and it keeps the event loop alive past shutdown.
+    if (timer) clearTimeout(timer);
+  }
 }
 
 export class BullNotificationQueue implements NotificationQueue {
@@ -177,7 +240,42 @@ export class BullNotificationQueue implements NotificationQueue {
       {
         connection: connection.duplicate(),
         concurrency: deps.retry.concurrency,
-        lockDuration: 30_000,
+        lockDuration: LOCK_DURATION_MS,
+        // ── FAIRNESS ─────────────────────────────────────────────────────────
+        //
+        // Without a limiter, one tenant launching a 50,000-recipient campaign
+        // fills the queue and every other tenant's appointment reminder waits
+        // behind it. BullMQ's limiter caps the whole worker's throughput, which
+        // does not partition by tenant — but it does bound how fast any single
+        // producer can drain the workers, and it is the mechanism the queue
+        // actually offers. Per-tenant fairness needs a queue per tenant or a
+        // group key; both are a larger change than the starvation warrants
+        // today, and this is recorded rather than pretended away.
+        //
+        // It also protects the providers: Twilio and SendGrid rate-limit, and
+        // hitting those limits produces retries that make the burst worse.
+        limiter: {
+          max: deps.retry.maxPerInterval,
+          duration: deps.retry.limiterIntervalMs,
+        },
+        settings: {
+          // The `custom` backoff declared in `jobOptions`.
+          backoffStrategy: (
+            attemptsMade: number,
+            _type?: string,
+            _err?: Error,
+            job?: { opts?: { backoff?: unknown }; data?: unknown },
+          ) => {
+            const base = (job?.opts?.backoff as { delay?: number } | undefined)?.delay ?? 5_000;
+            const urgent = (job?.data as SendJob | undefined)?.priority === 'URGENT';
+            // Urgent stays flat; everything else doubles.
+            const window = urgent ? base : base * 2 ** Math.max(0, attemptsMade - 1);
+            // Full jitter: anywhere in [0, window). Spreads a synchronised
+            // failure across the whole window rather than bunching it at the
+            // end, which is what a "delay ± 10%" scheme does.
+            return Math.round(Math.random() * window);
+          },
+        },
       },
     );
 
@@ -213,7 +311,24 @@ export class BullNotificationQueue implements NotificationQueue {
       senderId: data.senderId,
     });
 
-    const result = await channel.send(data.rendered, data.to, credentials);
+    // ─────────────────────────────────────────────────────────────────────────
+    // A PROVIDER CALL GETS A DEADLINE.
+    //
+    // Only the webhook and push adapters set their own; the Twilio, SendGrid
+    // and Slack SDKs use their defaults, which for a hung connection can exceed
+    // BullMQ's 30-second `lockDuration`. When it does, the queue decides the
+    // job stalled and hands it to another worker — while the first is still
+    // inside the provider call. Both then send.
+    //
+    // The bound is below `lockDuration` on purpose, so a slow provider produces
+    // a retryable failure this worker owns, rather than a second worker
+    // holding the same job.
+    // ─────────────────────────────────────────────────────────────────────────
+    const result = await withDeadline(
+      channel.send(data.rendered, data.to, credentials),
+      SEND_TIMEOUT_MS,
+      data.channel,
+    );
 
     const seconds = Number(process.hrtime.bigint() - started) / 1e9;
     const status = result.success ? 'sent' : 'failed';

@@ -36,7 +36,8 @@
  */
 import type { ApprovalService } from '../approvals/approval.service.js';
 import type { ContentGenerator } from '../content/generator.js';
-import { emptyContext, type RenderContext } from '../content/render-context.js';
+import type { IdentityResolver } from '../content/identity.js';
+import type { RenderContext } from '../content/render-context.js';
 import type { PackRegistry } from '../../packs/loader.js';
 import type { RecipientService } from '../recipients/recipient.service.js';
 import type { TenantScope } from '../../platform/db/tenant-scope.js';
@@ -86,6 +87,8 @@ export interface DraftResult {
 
 export interface DraftServiceDeps {
   generator: ContentGenerator;
+  /** Fills the `tenant` and `sender` namespaces of the prompt context. */
+  identity: IdentityResolver;
   packs: PackRegistry;
   recipients: RecipientService;
   approvals: ApprovalService;
@@ -110,8 +113,13 @@ export class DraftService {
 
     const recipient = await this.resolveRecipient(scope, input);
 
+    // The tenant name and the sender's display name come from the database,
+    // not from `emptyContext()` — the prompt packs interpolate both, and a
+    // model told it is "writing on behalf of  at " will write exactly that.
+    const base = await this.deps.identity.baseContext(scope, input.senderId);
+
     const renderContext: RenderContext = {
-      ...emptyContext(scope.tenantId),
+      ...base,
       recipient: {
         id: recipient.id,
         displayName: recipient.displayName ?? undefined,
@@ -120,7 +128,7 @@ export class DraftService {
         timezone: recipient.timezone ?? undefined,
         locale: recipient.locale ?? undefined,
       },
-      sender: { id: input.senderId },
+      sender: { ...base.sender, id: input.senderId },
       context: { ...(input.context ?? {}) },
     };
 

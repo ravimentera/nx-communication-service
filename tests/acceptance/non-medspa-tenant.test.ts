@@ -42,6 +42,7 @@ import { TenantConfigAuthorizationProvider } from '../../src/engine/approvals/au
 import { PolicyService } from '../../src/engine/approvals/policy.service.js';
 import { AudienceService } from '../../src/engine/campaigns/audience.service.js';
 import { CampaignOrchestrator } from '../../src/engine/campaigns/orchestrator.js';
+import { ConsentService } from '../../src/engine/compliance/consent.service.js';
 import { ComplianceGate } from '../../src/engine/compliance/gate.js';
 import { PreferenceService } from '../../src/engine/compliance/preference.service.js';
 import { ContentGenerator } from '../../src/engine/content/generator.js';
@@ -53,6 +54,7 @@ import { Dispatcher } from '../../src/engine/delivery/dispatcher.js';
 import type { NotificationQueue } from '../../src/engine/delivery/notification-queue.js';
 import { PlaybookMatcher } from '../../src/engine/playbooks/matcher.js';
 import { PlaybookRegistry } from '../../src/engine/playbooks/registry.js';
+import { IdentityResolver } from '../../src/engine/content/identity.js';
 import { PlaybookRuntime } from '../../src/engine/playbooks/runtime.js';
 import { RecipientService } from '../../src/engine/recipients/recipient.service.js';
 import { loadPacks } from '../../src/packs/loader.js';
@@ -268,6 +270,8 @@ beforeAll(async () => {
     }),
   };
 
+  const identity = new IdentityResolver({ db, logger });
+
   const runtime = new PlaybookRuntime({
     db,
     logger,
@@ -283,6 +287,7 @@ beforeAll(async () => {
       assembler: new PromptAssembler(renderer),
       logger,
     }),
+    identity,
     approvals: new ApprovalService({ db, logger, policies, dispatcher, authorization }),
     policies,
     dispatcher,
@@ -484,5 +489,122 @@ describe('a real-estate tenant, with only the lead-generation pack', () => {
     for (const word of ['patient', 'treatment', 'clinic', 'provider', 'medspa', 'hipaa']) {
       expect(all).not.toContain(word);
     }
+  });
+
+  /**
+   * The assertion this file's own header has claimed since P11 and did not make.
+   *
+   * "`git diff --stat` for this phase must show no file under
+   * `src/engine/{playbooks,content,approvals,compliance,delivery}`" was prose.
+   * A criterion nobody can fail is not a criterion, and this one is the whole
+   * argument that the engine is general: two constraints in this suite exist
+   * *because* of it, and both would have been quietly patched away instead.
+   *
+   * It cannot be a diff — the phase it refers to is over, and P13 changed engine
+   * files deliberately to fix defects. What it CAN assert, and what the prose
+   * was really reaching for, is that no engine file names a vertical.
+   */
+  it('no engine file names a vertical — the criterion the header states', () => {
+    const engineDirs = [
+      'src/engine/playbooks',
+      'src/engine/content',
+      'src/engine/approvals',
+      'src/engine/compliance',
+      'src/engine/delivery',
+      'src/engine/campaigns',
+      'src/db',
+    ];
+
+    const offenders: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(path);
+          continue;
+        }
+        if (!entry.name.endsWith('.ts')) continue;
+
+        readFileSync(path, 'utf8')
+          .split('\n')
+          .forEach((line, i) => {
+            // Vertical nouns in CODE. Comments and example key strings are
+            // fine and expected — the files document what they replaced, and
+            // 'medspa.appointment-reminder' is data, not schema (§0.10).
+            const code = line.replace(/\/\/.*$/, '').replace(/\*.*$/, '');
+            if (/\b(patient|medspa|clinic|treatment)\b/i.test(code) && !/['"`]/.test(code)) {
+              offenders.push(`${path}:${i + 1}: ${line.trim()}`);
+            }
+          });
+      }
+    };
+    for (const dir of engineDirs) walk(join(process.cwd(), dir));
+
+    expect(offenders).toEqual([]);
+  });
+
+  /**
+   * One leg with the gate ENFORCING, which this suite never had.
+   *
+   * Every run above uses `shadowMode: true`, so the gate evaluated and allowed
+   * regardless — which means none of them proved a consent record is what makes
+   * a send legal for a tenant that requires opt-in. Given `consent_records` had
+   * no writer at all until P13, that gap and that defect were the same gap.
+   */
+  it('enforces consent for real when shadow mode is off', async () => {
+    await db
+      .insert(tenantChannelConfigs)
+      .values({ tenantId: ACME, name: 'acme-optin', requireOptIn: true })
+      .onConflictDoUpdate({
+        target: tenantChannelConfigs.tenantId,
+        set: { requireOptIn: true },
+      });
+
+    const enforcing = new ComplianceGate({
+      db,
+      logger,
+      // Its own instance: `preferences` is local to the setup closure, and the
+      // gate only reads through it here.
+      preferences: new PreferenceService({
+        db,
+        logger,
+        defaultTimezone: 'UTC',
+        unsubscribeBaseUrl: 'https://acme.example/u',
+      }),
+      shadowMode: false,
+      unsubscribeUrl: async () => 'https://acme.example/u/tok',
+    });
+
+    const [lead] = await db
+      .select({ id: recipients.id })
+      .from(recipients)
+      .where(eq(recipients.tenantId, ACME))
+      .limit(1);
+
+    const check = (): Promise<{ allow: boolean }> =>
+      enforcing.check({
+        scope: { tenantId: ACME },
+        channel: 'email',
+        priority: 'MEDIUM',
+        recipientId: lead!.id,
+        rendered: { body: 'A follow-up about your listing' },
+      }) as Promise<{ allow: boolean }>;
+
+    // Blocked: the tenant requires opt-in and this lead has no consent record.
+    expect((await check()).allow).toBe(false);
+
+    await new ConsentService({ db, logger }).grant({ tenantId: ACME }, lead!.id, {
+      channels: ['email'],
+      source: 'import',
+      proof: { file: 'acme-leads.csv' },
+    });
+
+    // And allowed once the basis is recorded — the whole point of the gate.
+    expect((await check()).allow).toBe(true);
+
+    await db
+      .update(tenantChannelConfigs)
+      .set({ requireOptIn: false })
+      .where(eq(tenantChannelConfigs.tenantId, ACME));
   });
 });

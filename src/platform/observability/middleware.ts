@@ -29,28 +29,6 @@ export interface ObservabilityOptions {
   ignorePaths?: string[];
 }
 
-const UUID_SEGMENT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const HEX_SEGMENT = /^[0-9a-f]{16,}$/i;
-const NUMERIC_SEGMENT = /^\d+$/;
-
-/**
- * Collapse high-cardinality path segments (UUIDs, numeric ids, long hex tokens)
- * to `:id` so Prometheus route labels stay bounded.
- */
-export function normalizeRoutePath(pathname: string): string {
-  const queryIndex = pathname.indexOf('?');
-  const cleanPath = queryIndex === -1 ? pathname : pathname.slice(0, queryIndex);
-  const normalized = cleanPath
-    .split('/')
-    .map((segment) =>
-      UUID_SEGMENT.test(segment) || NUMERIC_SEGMENT.test(segment) || HEX_SEGMENT.test(segment)
-        ? ':id'
-        : segment,
-    )
-    .join('/');
-  return normalized || '/';
-}
-
 const DEFAULT_IGNORE = ['/health', '/metrics', '/favicon.ico'];
 
 function header(req: Request, name: string): string | undefined {
@@ -90,9 +68,20 @@ export function createObservabilityMiddleware(options: ObservabilityOptions): Re
       const durationSeconds = Number(process.hrtime.bigint() - startTime) / 1e9;
       // Prefer the matched Express route (bounded cardinality); fall back to a
       // normalized raw path for unmatched requests.
+      // A MATCHED route, or the single label `unmatched`.
+      //
+      // The fallback used to be a normalized raw path, which collapsed ids and
+      // so bounded the obvious cases — but every distinct WORD path still
+      // became a label, pre-auth, from anyone who could reach the port. A few
+      // thousand requests to /aaa, /bbb, … is unbounded cardinality in a
+      // process that holds its metrics in memory.
+      //
+      // An unmatched request is a 404. Which 404 is not a metric; it is in the
+      // request log below, with the real path, where there is no cardinality
+      // budget to blow.
       const route = req.route?.path
         ? `${req.baseUrl || ''}${req.route.path}`
-        : normalizeRoutePath(req.originalUrl || req.path);
+        : 'unmatched';
 
       const labels = {
         service: serviceName,

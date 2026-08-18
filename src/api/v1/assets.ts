@@ -26,6 +26,7 @@ import {
   ValidationError,
 } from '../../platform/http/errors.js';
 import type { ImageProvider } from '../../ports/image.js';
+import { uuidParam } from '../../platform/http/params.js';
 
 const generateImageSchema = z.object({
   prompt: z.string().min(1),
@@ -73,6 +74,10 @@ function translateUploadErrors(
 
 export function createAssetRouter(deps: AssetApiDeps): Router {
   const router = Router();
+
+  // Every `:id` on this router is a uuid column. Registered as a param handler
+  // rather than per-route so a route added later cannot forget it (params.ts).
+  router.param('id', uuidParam());
 
   const upload = multer({
     storage: multer.memoryStorage(),

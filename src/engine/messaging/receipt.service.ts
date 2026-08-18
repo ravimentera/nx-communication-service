@@ -36,6 +36,16 @@ export interface Receipt {
   providerMessageId: string;
   event: ReceiptEvent;
   at: Date;
+  /**
+   * The tenant whose signing key verified this callback.
+   *
+   * Optional only because the SendGrid path currently verifies against one
+   * global public key and cannot name a tenant (see the webhook router). When
+   * present it scopes the message lookup, and it must be: a provider message id
+   * is the provider's namespace, so without it a validly-signed callback from
+   * one tenant can act on another tenant's message.
+   */
+  tenantId?: string;
   /** Provider's own reason string, kept verbatim on the analytics row. */
   reason?: string;
   clickedLink?: string;
@@ -73,6 +83,18 @@ const STATUS_FOR: Partial<Record<ReceiptEvent, string>> = {
   spam: 'SPAM',
 };
 
+/**
+ * Statuses nothing may move a message out of.
+ *
+ * The comment above has claimed since P8b that "a late `delivered` after a
+ * `bounced` must not resurrect it", and the code applied `STATUS_FOR`
+ * unconditionally, so it did exactly that. Providers deliver receipts
+ * out of order routinely, and Twilio replays them — its callback carries no
+ * timestamp, so this guard plus the inbound upsert IS the replay defence
+ * (`signature.ts`).
+ */
+const TERMINAL_STATUSES = new Set(['BOUNCED', 'SPAM', 'CANCELLED']);
+
 export class ReceiptService {
   constructor(private readonly deps: { db: Db; logger: Logger }) {}
 
@@ -82,6 +104,25 @@ export class ReceiptService {
    * during a parallel run, not an error.
    */
   async apply(receipt: Receipt): Promise<{ applied: boolean; messageId?: string }> {
+    // ─────────────────────────────────────────────────────────────────────────
+    // THE TENANT PREDICATE IS THE SECURITY BOUNDARY, NOT AN OPTIMISATION
+    //
+    // The webhook verifies a signature against the tenant that owns the
+    // provider account, and then this looked the message up by
+    // `provider_message_id` ALONE — globally, across every tenant. Provider
+    // message ids are the provider's namespace, not ours: two tenants with
+    // their own Twilio accounts can be handed the same id, and a tenant that
+    // controls its own Twilio account can put any id it likes in a callback it
+    // signs correctly with its own token.
+    //
+    // Either way, tenant A's validly-signed callback could flip tenant B's
+    // message to FAILED and — through `markBounced` below — set B's recipient
+    // to `bounced`, which is a PERMANENT send block on a real person that no
+    // one would think to look for in the other tenant's webhook traffic.
+    //
+    // `receipt.tenantId` comes from the signature check, so scoping to it is
+    // scoping to what was actually proven.
+    // ─────────────────────────────────────────────────────────────────────────
     const [row] = await this.deps.db
       .select({
         id: messages.id,
@@ -91,7 +132,12 @@ export class ReceiptService {
         status: messages.status,
       })
       .from(messages)
-      .where(eq(messages.providerMessageId, receipt.providerMessageId))
+      .where(
+        and(
+          eq(messages.providerMessageId, receipt.providerMessageId),
+          ...(receipt.tenantId ? [eq(messages.tenantId, receipt.tenantId)] : []),
+        ),
+      )
       .limit(1);
 
     if (!row) {
@@ -103,7 +149,7 @@ export class ReceiptService {
     }
 
     const status = STATUS_FOR[receipt.event];
-    if (status) {
+    if (status && !TERMINAL_STATUSES.has(row.status)) {
       await this.deps.db
         .update(messages)
         .set({
@@ -223,6 +269,18 @@ export class ReceiptService {
     to?: string;
     providerMessageId?: string;
   }): Promise<InboundResult> {
+    // UPSERT, not INSERT.
+    //
+    // Twilio retries a callback it did not get a 2xx for, and its payload has no
+    // timestamp to reject a replay with — so an unguarded insert turned every
+    // retry into a second copy of the same patient reply, sitting in the thread
+    // a provider reads. `messages_inbound_provider_id_unique` (0017) is what
+    // makes this collapse; before it the index on (tenant, provider_message_id)
+    // was non-unique and nothing deduped.
+    //
+    // A reply with no provider message id — which the legacy internal envelope
+    // at `/messages/webhook/*` produces — has nothing to key on and simply
+    // inserts, as it did before.
     const [inserted] = await this.deps.db
       .insert(messages)
       .values({
@@ -240,7 +298,42 @@ export class ReceiptService {
         participantPhone: input.channel.toLowerCase() === 'sms' ? (input.from ?? null) : null,
         metadata: { messageType: 'REPLY', from: input.from, to: input.to },
       })
+      // `where` is the partial index's own predicate, which Postgres needs to
+      // match the arbiter — 0017's index is partial on direction/NOT NULL.
+      .onConflictDoNothing({
+        target: [messages.tenantId, messages.providerMessageId],
+        where: sql`${messages.direction} = 'inbound' AND ${messages.providerMessageId} IS NOT NULL`,
+      })
       .returning({ id: messages.id });
+
+    if (!inserted) {
+      // The retry lost the race, or arrived after the original. Either way this
+      // reply is already in the thread; report it rather than pretending a
+      // second one arrived.
+      const [existing] = await this.deps.db
+        .select({ id: messages.id })
+        .from(messages)
+        .where(
+          and(
+            eq(messages.tenantId, input.tenantId),
+            eq(messages.providerMessageId, input.providerMessageId ?? ''),
+            eq(messages.direction, 'inbound'),
+          ),
+        )
+        .limit(1);
+
+      this.deps.logger.debug('duplicate inbound message ignored', {
+        tenantId: input.tenantId,
+        providerMessageId: input.providerMessageId,
+      });
+      return {
+        recorded: false,
+        reason: 'duplicate',
+        tenantId: input.tenantId,
+        ...(existing ? { messageId: existing.id } : {}),
+        ...(input.recipientId ? { recipientId: input.recipientId } : {}),
+      };
+    }
 
     // Mark the most recent outbound message in this conversation replied-to, so
     // engagement reporting can tell a reply from silence.
@@ -350,14 +443,40 @@ export class ReceiptService {
   private async resolveDestination(
     to: string,
   ): Promise<{ tenantId: string; senderId?: string } | null> {
+    // ─────────────────────────────────────────────────────────────────────────
+    // ORDERED, AND FILTERED ON is_active. BOTH MATTER.
+    //
+    // This was `UNION ALL … LIMIT 1` with no ORDER BY, which in Postgres means
+    // "whichever row the plan yields first" — not a stable answer, and free to
+    // differ between two executions of the same query. A phone number that
+    // appears at both the agent and the tenant level, or one reassigned from one
+    // agent to another, had its inbound replies attributed to a tenant chosen by
+    // the planner. Nothing would ever look wrong; the reply would simply land in
+    // somebody else's thread, sometimes.
+    //
+    // `is_active` was missing too, so a deactivated config kept claiming its
+    // number — which is exactly the row you would expect to lose after a
+    // reassignment.
+    //
+    // The precedence is deliberate: agent before tenant, because an agent's own
+    // number is the more specific claim, and within a tier the most recently
+    // updated row wins, because that is the one a reassignment touched.
+    // ─────────────────────────────────────────────────────────────────────────
     const result = await this.deps.db.execute(sql`
-      SELECT tenant_id AS "tenantId", sender_id AS "senderId"
-      FROM agent_channel_configs
-      WHERE twilio_phone_number = ${to} OR email_from_address = ${to}
-      UNION ALL
-      SELECT tenant_id AS "tenantId", NULL AS "senderId"
-      FROM tenant_channel_configs
-      WHERE twilio_phone_number = ${to} OR sendgrid_from_email = ${to}
+      SELECT "tenantId", "senderId" FROM (
+        SELECT tenant_id AS "tenantId", sender_id AS "senderId",
+               0 AS tier, updated_at
+        FROM agent_channel_configs
+        WHERE is_active
+          AND (twilio_phone_number = ${to} OR email_from_address = ${to})
+        UNION ALL
+        SELECT tenant_id AS "tenantId", NULL AS "senderId",
+               1 AS tier, updated_at
+        FROM tenant_channel_configs
+        WHERE is_active
+          AND (twilio_phone_number = ${to} OR sendgrid_from_email = ${to})
+      ) owners
+      ORDER BY tier, updated_at DESC
       LIMIT 1
     `);
     const row = result.rows[0] as { tenantId?: string; senderId?: string } | undefined;

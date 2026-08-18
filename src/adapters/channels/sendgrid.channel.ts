@@ -27,7 +27,7 @@ import type {
   RenderedMessage,
   ValidationOutcome,
 } from '../../ports/channel.js';
-import { dryRunResult, failure, retryableForStatus, type ChannelDeps } from './base.js';
+import { maskDestination, dryRunResult, failure, retryableForStatus, type ChannelDeps } from './base.js';
 
 interface SendGridResponse {
   statusCode?: number;
@@ -96,7 +96,7 @@ export class SendGridChannel implements Channel {
 
     try {
       const [response] = (await this.client(apiKey).send({
-        to: to.value,
+        to: maskDestination(to.value),
         from: creds.values.fromName
           ? { email: creds.from, name: creds.values.fromName }
           : creds.from,
@@ -119,19 +119,30 @@ export class SendGridChannel implements Channel {
       const providerMessageId = Array.isArray(header) ? header[0] : header;
 
       this.deps.logger.info('email sent', {
-        to: to.value,
+        to: maskDestination(to.value),
         providerMessageId,
         credentialSource: creds.source,
       });
 
       return { success: true, dispatched: true, providerMessageId, raw: response?.statusCode };
     } catch (error) {
-      const status = (error as { code?: number })?.code;
+      // `code` is an HTTP status for an API rejection and a STRING for a
+      // network failure — 'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND'. It went
+      // straight into `retryableForStatus`, where `'ECONNRESET' >= 500` is
+      // false, so every transient network blip was classified permanent and
+      // the mail was dropped after one attempt.
+      //
+      // A numeric code is a real status. Anything else is the transport, and
+      // the transport is exactly what is worth retrying.
+      const raw = (error as { code?: unknown })?.code;
+      const status = typeof raw === 'number' ? raw : undefined;
+      const transport = status === undefined;
+
       return failure(
         {
-          code: `SENDGRID_${status ?? 'ERROR'}`,
+          code: `SENDGRID_${status ?? (typeof raw === 'string' ? raw : 'ERROR')}`,
           message: error instanceof Error ? error.message : String(error),
-          retryable: retryableForStatus(status),
+          retryable: transport ? true : retryableForStatus(status),
         },
         error,
       );

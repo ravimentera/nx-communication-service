@@ -3,24 +3,32 @@
 Migrations in this directory are **NEVER** run by tooling or by an agent.
 No `drizzle-kit push`. No `drizzle-kit migrate`. No `psql -f` from a script.
 
-Apply in numeric order:
+Apply in numeric order. **Get the list from the tooling, not from this page:**
 
+```bash
+npm run migrate:print
 ```
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0001_core_schema.sql
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0002_approvals.sql
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0003_playbooks.sql
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0005_compliance.sql
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0006_approval_policies.sql
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0007_playbook_runs.sql
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0008_receipt_integrity.sql
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0009_campaigns.sql
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0010_recipient_optins.sql
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0011_platform_tenant.sql
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0012_deferred_messages.sql
-```
+
+It reads the directory, so it is right the moment a phase adds a file. This
+section used to carry the commands by hand, and the hand-written list stopped at
+`0012` while the directory reached `0021` — nine migrations an operator
+following this page would never have applied. `docs/LOCAL_DEV.md` had already
+learned the same lesson and replaced its list with a loop; this is the copy that
+was missed.
+
+`npm run migrate:print` also separates the two files that are **not** baseline,
+with a reason and an instruction for each — see below.
 
 Each file is idempotent (`IF NOT EXISTS` / guarded `DO` blocks) and wrapped in a
-transaction.
+transaction, so applying the whole set again after a later phase adds a file is
+safe and is the intended workflow.
+
+> **Idempotent is not an upgrade path.** Because the baseline is
+> `CREATE TABLE IF NOT EXISTS`, re-running it does **not** apply a change made
+> by *editing* an earlier file — that lands only on databases created
+> afterwards. `0014` exists for exactly one such change. To check any database
+> against a clean build, apply the baseline to a throwaway database and diff the
+> two schemas (`testing/TEST_PLAN.md` §0.4).
 
 | File | Creates |
 |---|---|
@@ -35,6 +43,24 @@ transaction.
 | `0010_recipient_optins.sql` | The five display-only opt-in flags on `recipient_preferences`. **Apply before `9006_preferences.sql`**, which loads them. Adds columns only; no index, nothing reads them for consent. |
 | `0011_platform_tenant.sql` | The `platform` tenant, for identity-level mail that belongs to no medspa — email verification and password reset. Refuses to run if a migrated medspa already holds the id. Set `OUTREACH_PLATFORM_TENANT_ID=platform` in providers-service after applying. |
 | `0012_deferred_messages.sql` | `messages.deferred_until` and the partial index the deferral sweeper runs on. Without it, a message the compliance gate held for quiet hours or a rate limit is never retried. Catalogue-only `ADD COLUMN`; no table rewrite. |
+| `0015_consent.sql` | `UNIQUE (tenant_id, recipient_id, channel)` on `consent_records`. The table shipped in `0001` with no writer; P13 added one, and the moment rows can be written the missing constraint becomes load-bearing. |
+| `0016_playbook_context_mapping.sql` | Lets a playbook declare how a caller's field names map onto its `dataContract`. `aliases.json` rewrites names inside a template body and cannot touch the render context's keys, so a contract expecting a different name than the caller sends failed validation with no way to reconcile the two. |
+| `0017_receipt_idempotency.sql` | Makes `(tenant_id, provider_message_id)` unique. Twilio retries any callback it does not get a 2xx for and its payload carries no timestamp, so — unlike SendGrid and Slack — nothing at the signature layer rejects a replay, and every retry inserted another inbound message. |
+| `0018_playbook_run_reservation.sql` | Turns a playbook run into a reservation taken *before* the send rather than a record written after. The old shape was check-then-act with the whole fan-out in the gap, so two concurrent deliveries of one event both sent. |
+| `0019_campaign_recipient_uniqueness.sql` | A recipient appears in a campaign once. `expand()` deduped by reading then inserting the difference, so two concurrent launches both read nothing and both inserted the whole audience — and every duplicated row is a second message to a real person. |
+| `0020_webhook_credentials.sql` | Moves the webhook signing secret into `tenant_channel_configs`, where every other channel's credentials live. It used to come off the message, which put it in a BullMQ job payload sitting in Redis in plaintext for the queue's retention window. |
+| `0021_twilio_account_uniqueness.sql` | `UNIQUE (twilio_account_sid)`. An inbound Twilio callback resolves to a tenant by `AccountSid` with `LIMIT 1` and no `ORDER BY`, and nothing stopped two rows carrying the same SID. A reseller running several tenants off one Twilio account cannot be configured — see the open items. |
+
+## The two files that are not baseline
+
+Both are excluded from the loop `npm run migrate:print` produces, **for
+opposite reasons**. They are listed separately there, with the reasoning, for
+the same reason they are separated here.
+
+| File | When |
+|---|---|
+| `0013_encrypt_credentials.sql` | **Inside the cutover window only.** Retires the plaintext credential columns once `credentials_encrypted` holds the same values sealed. It must run *after* the data load — applying it before `9003_channel_configs.sql` has inserted anything seals credentials that do not exist yet and every send fails. Needs `CREDENTIAL_ENCRYPTION_KEYS`. Runbook §8b. |
+| `0014_drop_queued_message.sql` | **Any time, and required if the database predates P12.** Every statement is `IF EXISTS`. It is a genuine no-op against the current `0001` — which is exactly why re-running the baseline will not do its job for you: `0001` is `CREATE TABLE IF NOT EXISTS` and cannot drop a column a *previous* `0001` created. Check with `SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='queued_message'`; a row back means apply it. |
 
 **There is no `0004`.** Everything it was scheduled to create already exists in
 `0001`, so the content plane shipped no migration. The number is left unused

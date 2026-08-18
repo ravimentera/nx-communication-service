@@ -16,12 +16,18 @@
  */
 import { createHmac } from 'node:crypto';
 
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import request from 'supertest';
 
 import winston from 'winston';
 
-import { messageAnalytics, messages, recipients, tenantChannelConfigs } from '../../src/db/schema.js';
+import {
+  messageAnalytics,
+  messages,
+  recipients,
+  tenantChannelConfigs,
+  tenants,
+} from '../../src/db/schema.js';
 import { MessageService } from '../../src/engine/messaging/message.service.js';
 import { startHarness, TENANT, PROVIDER, type Harness } from '../contract/legacy/harness.js';
 
@@ -291,6 +297,57 @@ describe('delivery receipts', () => {
   });
 });
 
+/**
+ * A validly-signed callback acts on its own tenant's messages and nobody
+ * else's.
+ *
+ * `apply()` looked the message up by `provider_message_id` alone, globally.
+ * Provider message ids are the provider's namespace, not ours — and a tenant
+ * running its own Twilio account can put any id it likes into a callback it
+ * signs correctly with its own token. So tenant A could flip tenant B's message
+ * to FAILED and, through the bounce path, set B's recipient to `bounced`: a
+ * permanent send block on a real person, caused from another tenant's webhook
+ * traffic, where nobody would think to look for it.
+ */
+describe('receipts cannot cross a tenant boundary', () => {
+  it('leaves another tenant’s message alone even with a valid signature', async () => {
+    const OTHER = 'other-tenant-wh';
+    await h.db
+      .insert(tenants)
+      .values({ id: OTHER, name: 'Other clinic' })
+      .onConflictDoNothing();
+
+    // Same provider message id, different tenant. Nothing stops a provider
+    // reusing an id across accounts, and nothing stops a tenant claiming one.
+    const [victim] = await h.db
+      .insert(messages)
+      .values({
+        tenantId: OTHER,
+        channel: 'sms',
+        content: 'Another tenant’s message',
+        status: 'SENT',
+        direction: 'outbound',
+        sentAt: new Date(),
+        providerMessageId: 'SMcrosstenant',
+      })
+      .returning({ id: messages.id });
+
+    const res = await postTwilio({
+      MessageSid: 'SMcrosstenant',
+      MessageStatus: 'failed',
+      AccountSid: 'ACcontracttest',
+      ErrorCode: '30003',
+    });
+    expect(res.status).toBe(204);
+
+    const [after] = await h.db
+      .select({ status: messages.status })
+      .from(messages)
+      .where(eq(messages.id, victim!.id));
+    expect(after!.status).toBe('SENT');
+  });
+});
+
 describe('inbound messages', () => {
   it('records a reply, resolving the tenant from our number and the sender from theirs', async () => {
     const res = await postTwilio({
@@ -323,6 +380,32 @@ describe('inbound messages', () => {
       content: 'Yes, tomorrow works',
       senderName: 'Grace Hopper',
     });
+  });
+
+  /**
+   * Twilio retries any callback it does not get a 2xx for, and its payload
+   * carries no timestamp — so unlike SendGrid and Slack there is nothing to
+   * reject a replay against at the signature layer. Before `0017` this insert
+   * was unguarded and every retry put a second copy of the same patient reply
+   * into the thread a provider reads.
+   */
+  it('records a retried reply once, not twice', async () => {
+    const params = {
+      MessageSid: 'SMinboundDup',
+      From: THEIR_NUMBER,
+      To: OUR_NUMBER,
+      Body: 'Confirming, see you then',
+      AccountSid: 'ACcontracttest',
+    };
+
+    expect((await postTwilio(params)).status).toBe(200);
+    expect((await postTwilio(params)).status).toBe(200);
+
+    const rows = await h.db
+      .select({ id: messages.id })
+      .from(messages)
+      .where(eq(messages.providerMessageId, 'SMinboundDup'));
+    expect(rows).toHaveLength(1);
   });
 
   it('drops a reply to a number no tenant owns rather than 500ing', async () => {
@@ -378,5 +461,55 @@ describe('Slack', () => {
       .post('/v1/webhooks/slack')
       .send({ type: 'url_verification', challenge: 'abc123' });
     expect(res.status).toBe(401);
+  });
+});
+
+/**
+ * One tenant owns a Twilio account.
+ *
+ * `getTenantConfigByTwilioAccount` resolves an inbound callback to a tenant by
+ * Account SID with `LIMIT 1` and no ORDER BY, and nothing stopped two rows
+ * carrying the same SID — so the answer was whichever row the planner returned.
+ *
+ * The routing bug is the smaller half. `twilio_account_sid` is settable through
+ * `PUT /v1/channels/config`, which a tenant may call for itself, so tenant B
+ * could enter tenant A's SID and be resolved as the owner of A's callbacks.
+ * Ownership cannot be verified against Twilio from here; first-registrant-wins
+ * is the honest approximation and `0021` is what makes it true.
+ */
+describe('a Twilio account belongs to one tenant', () => {
+  it('refuses a second tenant claiming an account already configured', async () => {
+    const OTHER = 'twilio-claimant';
+    await h.db.insert(tenants).values({ id: OTHER, name: 'Claimant' }).onConflictDoNothing();
+
+    await expect(
+      h.channelConfigs.upsertTenantConfig(OTHER, {
+        name: 'claimant',
+        // The SID the suite's own tenant registered in `beforeAll`.
+        twilioAccountSid: 'ACcontracttest',
+      }),
+    ).rejects.toThrow(/already configured by another tenant/);
+  });
+
+  it('lets the owning tenant re-save its own account', async () => {
+    // Idempotent: a PUT that re-sends the same config must not trip the check
+    // against the row it is itself updating.
+    await expect(
+      h.channelConfigs.upsertTenantConfig(TENANT, {
+        name: 'Webhook tenant',
+        twilioAccountSid: 'ACcontracttest',
+      }),
+    ).resolves.toMatchObject({ tenantId: TENANT });
+  });
+
+  it('is enforced by the database, not only by the check', async () => {
+    // The check is for the message; the constraint is the guarantee. A path
+    // that bypassed the service would otherwise reintroduce the ambiguity.
+    await expect(
+      h.db.execute(
+        sql`INSERT INTO tenant_channel_configs (tenant_id, name, twilio_account_sid)
+            VALUES ('twilio-direct', 'direct', 'ACcontracttest')`,
+      ),
+    ).rejects.toThrow(/unique/i);
   });
 });

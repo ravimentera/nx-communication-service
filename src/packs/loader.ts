@@ -37,7 +37,11 @@ import {
   describeIssues,
   manifestSchema,
   playbookDefinitionSchema,
+  ehrMappingSchema,
+  eventTypeCatalogueSchema,
+  lintRulesSchema,
   policyDefinitionSchema,
+  promptPackSchema,
   templateDefinitionSchema,
   type PackManifest,
   type PlaybookDefinition,
@@ -91,13 +95,6 @@ function stripComments(raw: Record<string, string>): AliasMap {
   return Object.fromEntries(Object.entries(raw).filter(([key]) => !key.startsWith('$')));
 }
 
-/** Same `$comment` convention, for the rules file. */
-function stripRuleComments(raw: Record<string, unknown>): LintRules {
-  return Object.fromEntries(
-    Object.entries(raw).filter(([key]) => !key.startsWith('$')),
-  ) as LintRules;
-}
-
 export function loadPacks(packsDir: string, logger: Logger): PackRegistry {
   const packs = new Map<string, LoadedPack>();
   const promptsByKey = new Map<string, PromptPack>();
@@ -112,6 +109,11 @@ export function loadPacks(packsDir: string, logger: Logger): PackRegistry {
     const packId = entry.name;
     const packPath = join(packsDir, packId);
 
+    // Declared first: every load below reports into it, and `GET /v1/packs`
+    // serves it so "why is this playbook missing?" is answerable from the API
+    // rather than from the boot log.
+    const errors: string[] = [];
+
     let aliases: AliasMap = {};
     const aliasPath = join(packPath, 'aliases.json');
     if (existsSync(aliasPath)) {
@@ -125,45 +127,38 @@ export function loadPacks(packsDir: string, logger: Logger): PackRegistry {
       }
     }
 
+    // Validated, not cast. `constraints` is joined into the system prompt, so a
+    // bare string where an array belongs spreads character by character and the
+    // model receives a bulleted list of single letters where its safety rules
+    // should be.
     const prompts = new Map<string, PromptPack>();
     const promptsPath = join(packPath, 'prompts');
     if (existsSync(promptsPath)) {
       for (const file of readdirSync(promptsPath).filter((f) => f.endsWith('.json'))) {
-        try {
-          const pack = readJson<PromptPack>(join(promptsPath, file));
-          if (!pack.key) {
-            logger.error('prompt pack has no key — skipped', { packId, file });
-            continue;
-          }
-          prompts.set(pack.key, pack);
-          promptsByKey.set(pack.key, pack);
-        } catch (error) {
-          logger.error('failed to load prompt pack', {
-            packId,
-            file,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-      }
-    }
-
-    // Lint rules. A pack that ships none simply inherits the engine defaults;
-    // a malformed file is logged and skipped rather than failing boot, because
-    // the consequence of missing rules is "fewer warnings", not "wrong sends".
-    let compliance: LintRules | undefined;
-    const compliancePath = join(packPath, 'compliance.json');
-    if (existsSync(compliancePath)) {
-      try {
-        compliance = stripRuleComments(readJson<Record<string, unknown>>(compliancePath));
-      } catch (error) {
-        logger.error('failed to load pack compliance rules', {
+        const pack = readValidated(
+          join(promptsPath, file),
+          promptPackSchema,
           packId,
-          error: error instanceof Error ? error.message : String(error),
-        });
+          errors,
+        );
+        if (!pack) continue;
+        prompts.set(pack.key, pack);
+        promptsByKey.set(pack.key, pack);
       }
     }
 
-    const errors: string[] = [];
+    // Lint rules. A pack that ships none inherits the engine defaults; a
+    // malformed one costs the rules, not the pack.
+    //
+    // `phiPatterns` are compiled as regexes at lint time, so the schema
+    // compiles them here — an invalid pattern is a startup error naming the
+    // file rather than a throw inside the compliance gate, on the send path.
+    const compliance = readValidated(
+      join(packPath, 'compliance.json'),
+      lintRulesSchema,
+      packId,
+      errors,
+    );
 
     const manifest = readValidated(
       join(packPath, 'manifest.json'),
@@ -171,25 +166,24 @@ export function loadPacks(packsDir: string, logger: Logger): PackRegistry {
       packId,
       errors,
     );
-    // EHR mapping. Same `$comment` convention, same tolerance as the lint
-    // rules: a malformed file costs the mapping, not the pack.
-    let ehrMapping: EhrMapping | undefined;
-    const ehrPath = join(packPath, 'ehr-mapping.json');
-    if (existsSync(ehrPath)) {
-      try {
-        const raw = readJson<Record<string, unknown>>(ehrPath);
-        ehrMapping = { rules: (raw.rules as EhrMapping['rules']) ?? [] };
-      } catch (error) {
-        logger.error('failed to load pack EHR mapping', {
-          packId,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
 
-    const eventTypes = existsSync(join(packPath, 'event-types.json'))
-      ? safeRead<EventTypeCatalogue>(join(packPath, 'event-types.json'), packId, errors)
-      : undefined;
+    // EHR mapping. A rule's `contains` is ITERATED, so a bare string where an
+    // array belongs matches per character — `"appointment"` would then match
+    // any event name containing a, p, p, o, i, n, t, m, e, n, t, which is very
+    // nearly all of them.
+    const ehrMapping = readValidated(
+      join(packPath, 'ehr-mapping.json'),
+      ehrMappingSchema,
+      packId,
+      errors,
+    ) as EhrMapping | undefined;
+
+    const eventTypes = readValidated(
+      join(packPath, 'event-types.json'),
+      eventTypeCatalogueSchema,
+      packId,
+      errors,
+    );
 
     const policies = readDirectory(join(packPath, 'policies'), policyDefinitionSchema, packId, errors);
     const templateDefs = readDirectory(
@@ -252,6 +246,31 @@ export function loadPacks(packsDir: string, logger: Logger): PackRegistry {
  * `.default()` has different input and output types, and inferring from the
  * input would leave defaulted fields optional downstream.
  */
+/**
+ * Every `$`-prefixed key removed, at every depth.
+ *
+ * `docs/PACKS.md` describes the `$comment` convention as applying to "every
+ * file that takes a flat map". The pack authors did not read it that way, and
+ * they were right not to — `$comment` appears in prompt packs, in
+ * `ehr-mapping.json`, and as per-field `$comment.<field>` keys nested inside
+ * objects. The convention is only useful if it is universal, so it is applied
+ * universally and the document is corrected to match.
+ *
+ * This runs before `.strict()` sees anything. Without it, adding validation
+ * would have made the documented way to comment a pack file a startup error.
+ */
+function stripDollarKeys(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripDollarKeys);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([key]) => !key.startsWith('$'))
+        .map(([key, inner]) => [key, stripDollarKeys(inner)]),
+    );
+  }
+  return value;
+}
+
 function readValidated<S extends z.ZodTypeAny>(
   path: string,
   schema: S,
@@ -263,7 +282,7 @@ function readValidated<S extends z.ZodTypeAny>(
   const raw = safeRead<unknown>(path, packId, errors);
   if (raw === undefined) return undefined;
 
-  const parsed = schema.safeParse(raw);
+  const parsed = schema.safeParse(stripDollarKeys(raw));
   if (!parsed.success) {
     errors.push(`${path}: ${describeIssues(parsed.error)}`);
     return undefined;

@@ -44,8 +44,18 @@ export function createPlaybookEventProcessor(runtime: PlaybookRuntime, logger: L
       idempotencyKey: event.eventId,
       recipientId: event.recipientId,
       senderId: event.senderId,
+      // Coerced defensively, not cast.
+      //
+      // `(payload.channels as string[]).map(c => c.toLowerCase())` throws on an
+      // array of anything that is not a string — `[1, 2]`, `[null]`, an array of
+      // objects — and it threw BEFORE the run was classified, so BullMQ saw an
+      // infrastructure failure and retried the malformed event five times. A bad
+      // payload is a caller error, and it should cost one UNMATCHED row rather
+      // than five attempts and an alert.
       channels: Array.isArray(payload.channels)
-        ? (payload.channels as string[]).map((c) => c.toLowerCase() as ChannelType)
+        ? (payload.channels as unknown[])
+            .filter((c): c is string => typeof c === 'string')
+            .map((c) => c.toLowerCase() as ChannelType)
         : undefined,
       priority: payload.priority as Priority | undefined,
     };

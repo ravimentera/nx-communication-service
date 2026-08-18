@@ -21,6 +21,7 @@ import {
   pgTable,
   text,
   unique,
+  uniqueIndex,
   uuid,
 } from 'drizzle-orm/pg-core';
 
@@ -76,6 +77,19 @@ export const approvalPolicies = pgTable(
   (t) => [
     check('approval_policies_mode_check', sql`${t.mode} IN ('always','threshold','sample','none')`),
     index('idx_approval_policies_key').on(t.key),
+    // ── LOAD-BEARING, and both were missing from this model ────────────────
+    //
+    // They are what the pack installer's ON CONFLICT relies on, and what stops
+    // `load()` finding two candidate rows for one key. Both are PARTIAL, and
+    // the split is the point: a pack default has `tenant_id IS NULL` and must
+    // be unique on key alone, while two tenants may each hold their own row
+    // keyed `medspa.provider-always` and must be able to.
+    //
+    // Declared in 0006; the predicates are not expressible here, which is
+    // exactly why they went unnoticed — the drift test compares what this file
+    // says to what the database has.
+    uniqueIndex('approval_policies_pack_key_unique').on(t.key),
+    uniqueIndex('approval_policies_tenant_key_unique').on(t.tenantId, t.key),
   ],
 );
 

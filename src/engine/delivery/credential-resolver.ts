@@ -51,7 +51,6 @@ export interface ResolveScope {
   senderId?: string;
 }
 
-const CACHE_TTL_SECONDS = 120;
 
 export class CredentialResolver {
   constructor(
@@ -62,14 +61,25 @@ export class CredentialResolver {
     private readonly logger: Logger,
   ) {}
 
+  /**
+   * ───────────────────────────────────────────────────────────────────────────
+   * NO CACHE HERE, DELIBERATELY. THE ROWS BENEATH IT ARE CACHED INSTEAD.
+   *
+   * This used to write the RESOLVED credential to Redis — decrypted, ready to
+   * use, TTL'd. `0013` seals credentials at rest in Postgres, and this quietly
+   * put the cleartext into a second store with its own access rules and its own
+   * backups. Sealing one copy while caching another is not encryption at rest;
+   * it is encryption at rest of the copy nobody reads.
+   *
+   * Removing it costs almost nothing, which is the point.
+   * `ChannelConfigService` already caches both config rows — as stored, so
+   * still sealed — and decrypts after the cache. So a resolve is a Redis GET
+   * plus a decrypt rather than a Redis GET, and the plaintext exists only for
+   * the life of one send.
+   * ───────────────────────────────────────────────────────────────────────────
+   */
   async resolve(channel: ChannelType, scope: ResolveScope): Promise<ChannelCredentials> {
-    const key = this.cache.key('creds', `${scope.tenantId}:${scope.senderId ?? '-'}:${channel}`);
-    const cached = await this.cache.get<ChannelCredentials>(key);
-    if (cached) return cached;
-
-    const resolved = await this.resolveUncached(channel, scope);
-    await this.cache.set(key, resolved, CACHE_TTL_SECONDS);
-    return resolved;
+    return this.resolveUncached(channel, scope);
   }
 
   private async resolveUncached(

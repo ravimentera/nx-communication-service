@@ -14,7 +14,7 @@ import type { Logger } from 'winston';
 import type { Db } from '../../db/index.js';
 import { messages } from '../../db/schema.js';
 import type { Priority } from '../../domain/index.js';
-import { NotFoundError } from '../../platform/http/errors.js';
+import { ConflictError, NotFoundError } from '../../platform/http/errors.js';
 import type {
   ChannelRegistry,
   ChannelType,
@@ -22,6 +22,7 @@ import type {
   RenderedMessage,
 } from '../../ports/channel.js';
 import type { ComplianceGate } from '../compliance/gate.js';
+import type { RecipientService } from '../recipients/recipient.service.js';
 import type { CredentialResolver } from './credential-resolver.js';
 import type { NotificationQueue } from './notification-queue.js';
 
@@ -98,7 +99,22 @@ export interface DispatcherDeps {
   logger: Logger;
   /** Present from P5. Absent means no gate — used only in delivery-plane tests. */
   compliance?: ComplianceGate;
+  /**
+   * Resolves a recipient from a bare address, so the compliance gate has
+   * something to key on. See `resolveRecipient` below.
+   */
+  recipients?: RecipientService;
 }
+
+/**
+ * Channels whose `to` is a person's address, and therefore the ones where a
+ * missing recipient is a compliance hole rather than a fact about the channel.
+ *
+ * Slack, webhook and in_app address a room, a URL and our own table. Minting a
+ * recipient for `#staff-alerts` would put a Slack channel in the recipients
+ * table and give it preferences.
+ */
+const PERSONAL_CHANNELS = new Set(['email', 'sms', 'push', 'voice', 'letter']);
 
 export class Dispatcher {
   constructor(private readonly deps: DispatcherDeps) {}
@@ -118,6 +134,8 @@ export class Dispatcher {
       status: string;
       rendered?: RenderedMessage;
       suppressionReason?: string;
+      /** The resolved recipient, when the caller supplied only an address. */
+      recipientId?: string;
       extraMetadata?: Record<string, unknown>;
       /** Set when deferring; explicit null clears a previous deferral. */
       deferredUntil?: Date | null;
@@ -146,12 +164,47 @@ export class Dispatcher {
           metadata: sql`coalesce(${messages.metadata}, '{}'::jsonb) || ${JSON.stringify(metadata)}::jsonb`,
           updatedAt: new Date(),
         })
-        // Tenant predicate on every write, without exception (Rule 4).
-        .where(and(eq(messages.tenantId, msg.tenantId), eq(messages.id, msg.messageId)))
+        .where(
+          and(
+            // Tenant predicate on every write, without exception (Rule 4).
+            eq(messages.tenantId, msg.tenantId),
+            eq(messages.id, msg.messageId),
+            // ─────────────────────────────────────────────────────────────────
+            // A DELIVERED MESSAGE IS NOT A DRAFT AGAIN.
+            //
+            // This UPDATE named only (tenant, id), so any second dispatch of an
+            // adopted row rewrote its status — including SENT back to QUEUED,
+            // which is how the approve-then-schedule double-send stayed
+            // invisible in the log: two sends, one row, reading QUEUED.
+            //
+            // The terminal states are the ones no further dispatch may
+            // contradict: the message has left, or a person has been told it
+            // never will. Everything before them is legitimately re-dispatched
+            // — the deferral sweeper adopts a SUPPRESSED row on purpose, and an
+            // approve retries a FAILED one (D105).
+            // ─────────────────────────────────────────────────────────────────
+            sql`${messages.status} NOT IN ('SENT', 'DELIVERED', 'CANCELLED')`,
+          ),
+        )
         .returning({ id: messages.id });
 
       if (!updated) {
-        throw new NotFoundError(`Message '${msg.messageId}' not found for this tenant`);
+        // Either the row is not this tenant's, or it has already been delivered
+        // and nothing may move it. Distinguish the two, because the first is a
+        // caller error and the second is a race this dispatch just lost.
+        const [existing] = await this.deps.db
+          .select({ status: messages.status })
+          .from(messages)
+          .where(and(eq(messages.tenantId, msg.tenantId), eq(messages.id, msg.messageId)))
+          .limit(1);
+
+        if (!existing) {
+          throw new NotFoundError(`Message '${msg.messageId}' not found for this tenant`);
+        }
+        throw new ConflictError(
+          `Message '${msg.messageId}' is ${existing.status} and cannot be dispatched again`,
+          { status: existing.status },
+        );
       }
       return updated.id;
     }
@@ -161,7 +214,7 @@ export class Dispatcher {
       .values({
         tenantId: msg.tenantId,
         subTenantId: msg.subTenantId,
-        recipientId: msg.recipientId,
+        recipientId: options.recipientId ?? msg.recipientId,
         senderId: msg.senderId,
         channel: msg.channel,
         direction: 'outbound',
@@ -179,6 +232,52 @@ export class Dispatcher {
 
     if (!row) throw new Error('failed to persist message row');
     return row.id;
+  }
+
+  /**
+   * The recipient this message is for, resolved from its address when the
+   * caller did not name one.
+   *
+   * ───────────────────────────────────────────────────────────────────────────
+   * THE GATE IS A NO-OP WITHOUT THIS
+   *
+   * `ComplianceGate.evaluate` keys consent, per-channel preferences,
+   * per-playbook opt-out and both throttles on `recipientId`. Every call site
+   * that omitted one got a gate that checked the tenant's TCPA window and
+   * nothing else: all five MCP send tools, `POST /v1/messages` with a bare
+   * address, the compat test-SMS route, and `compat/send.ts` when `patientId`
+   * was absent. An agent could text a number that had unsubscribed.
+   *
+   * Resolving in the DISPATCHER rather than at each call site is the whole
+   * point. There were eight such paths and a ninth will be written; the fix has
+   * to be somewhere the ninth cannot get past.
+   *
+   * Failure is not fatal. A resolution error must not stop a send that is
+   * otherwise fine — it degrades to the previous behaviour, loudly.
+   */
+  private async resolveRecipient(msg: OutboundMessage): Promise<string | undefined> {
+    if (msg.recipientId) return msg.recipientId;
+    if (!this.deps.recipients) return undefined;
+    if (!PERSONAL_CHANNELS.has(msg.channel)) return undefined;
+    if (!msg.to?.value) return undefined;
+
+    try {
+      const recipient = await this.deps.recipients.resolveByContactPoint(
+        { tenantId: msg.tenantId, subTenantId: msg.subTenantId },
+        msg.to,
+      );
+      return recipient?.id;
+    } catch (error) {
+      this.deps.logger.error(
+        'could not resolve a recipient for this address — the compliance gate will not see their preferences',
+        {
+          tenantId: msg.tenantId,
+          channel: msg.channel,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      );
+      return undefined;
+    }
   }
 
   async dispatch(msg: OutboundMessage): Promise<DispatchResult> {
@@ -219,12 +318,17 @@ export class Dispatcher {
     let rendered = msg.rendered;
     let shadowed: string | undefined;
 
+    // WHO IS THIS GOING TO? The gate needs an answer before it can apply
+    // consent, per-channel preference, per-playbook opt-out or any throttle —
+    // without a recipientId it skips all four.
+    const recipientId = await this.resolveRecipient(msg);
+
     if (this.deps.compliance) {
       const verdict = await this.deps.compliance.check({
         scope: { tenantId: msg.tenantId, subTenantId: msg.subTenantId },
         channel: msg.channel,
         priority,
-        recipientId: msg.recipientId,
+        recipientId,
         playbookKey: msg.playbookKey,
         transactional: msg.transactional,
         throttle: msg.throttle,
@@ -236,6 +340,7 @@ export class Dispatcher {
         // never had — today a preference failure leaves no evidence at all.
         const suppressed = await this.persist(msg, correlationId, {
           status: 'SUPPRESSED',
+          ...(recipientId ? { recipientId } : {}),
           suppressionReason: verdict.reason,
           // The queryable copy of retryAt. A hard suppression has no retryAt
           // and leaves the column NULL, which is what keeps it out of the sweep.
@@ -287,6 +392,7 @@ export class Dispatcher {
 
     const messageId = await this.persist(msg, correlationId, {
       status: 'QUEUED',
+      ...(recipientId ? { recipientId } : {}),
       rendered,
       // Released: whether this is a first dispatch or the sweeper's retry, the
       // message is no longer waiting on a window.
@@ -300,7 +406,7 @@ export class Dispatcher {
         tenantId: msg.tenantId,
         subTenantId: msg.subTenantId,
         channel: msg.channel,
-        recipientId: msg.recipientId,
+        recipientId,
         senderId: msg.senderId,
         to: msg.to,
         rendered,

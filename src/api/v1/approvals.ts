@@ -29,6 +29,7 @@ import {
   requireTenant,
 } from '../../platform/http/auth.middleware.js';
 import { AuthError, ForbiddenError, NotFoundError } from '../../platform/http/errors.js';
+import { uuidParam } from '../../platform/http/params.js';
 
 const listQuerySchema = z.object({
   approverRef: z.string().optional(),
@@ -128,13 +129,30 @@ function approverRefFor(req: Request, requested: string | undefined): string | u
   const identity = req.identity;
   if (!identity) throw new AuthError();
 
-  if (!requested) return identity.senderId;
-  if (requested === identity.senderId) return requested;
-
   const privileged =
     identity.role === 'admin' ||
     identity.permissions.includes(Permission.ADMIN) ||
     identity.permissions.includes(Permission.APPROVE);
+
+  if (!requested) {
+    // A privileged caller asking for no particular queue gets the whole tenant's
+    // — which is what an admin inbox is.
+    if (privileged) return undefined;
+
+    // Everyone else must have an identity to filter on. This used to return
+    // `identity.senderId` unconditionally, so a caller with no `x-sender-id`
+    // header got `undefined` — the filter was dropped, and the list returned
+    // every pending approval in the tenant with its message body. Failing open
+    // on a missing header is the one direction this must never fail.
+    if (!identity.senderId) {
+      throw new ForbiddenError(
+        'Access denied: reading approvals requires a sender identity (x-sender-id) or the outreach:approve permission',
+      );
+    }
+    return identity.senderId;
+  }
+
+  if (requested === identity.senderId) return requested;
 
   if (!privileged) {
     throw new ForbiddenError('Access denied: you can only view your own approvals');
@@ -144,6 +162,10 @@ function approverRefFor(req: Request, requested: string | undefined): string | u
 
 export function createApprovalRouter(deps: ApprovalApiDeps): Router {
   const router = Router();
+
+  // Every `:id` on this router is a uuid column. Registered as a param handler
+  // rather than per-route so a route added later cannot forget it (params.ts).
+  router.param('id', uuidParam());
 
   // ── approvals ─────────────────────────────────────────────────────────────
 
@@ -204,7 +226,15 @@ export function createApprovalRouter(deps: ApprovalApiDeps): Router {
     '/approvals/:id',
     handle(async (req, res) => {
       const scope = requireTenant(req);
-      const approval = await deps.approvals.getById(scope, req.params.id as string);
+      // Authorized per row, like every mutation on this router. Reading one
+      // approval by id used to apply the tenant predicate and nothing else, so
+      // any authenticated user in the tenant could pull any approval — and its
+      // message body — out of somebody else's queue.
+      const approval = await deps.approvals.getByIdFor(
+        scope,
+        req.params.id as string,
+        actorOf(req),
+      );
       if (!approval) throw new NotFoundError(`Approval '${req.params.id}' not found`);
       res.json(approval);
     }),

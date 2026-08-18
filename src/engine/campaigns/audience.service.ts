@@ -34,6 +34,10 @@ import type { Db } from '../../db/index.js';
 import { audienceMembers, audiences, importErrors, recipients } from '../../db/schema.js';
 import { NotFoundError, ValidationError } from '../../platform/http/errors.js';
 import { tenantWhere, type TenantScope } from '../../platform/db/tenant-scope.js';
+import type {
+  ConsentService,
+  GrantInput,
+} from '../compliance/consent.service.js';
 import type { RecipientService } from '../recipients/recipient.service.js';
 
 export const AUDIENCE_KINDS = ['static', 'query', 'accumulating'] as const;
@@ -82,10 +86,18 @@ export interface ImportRow {
   attributes?: Record<string, unknown>;
 }
 
+/**
+ * The lawful basis a caller asserts for an imported list, and the evidence for
+ * it. Deliberately the same shape `ConsentService.grant()` takes.
+ */
+export type ImportConsent = GrantInput;
+
 export interface ImportResult {
   importId: string;
   imported: number;
   skipped: number;
+  /** Consent rows written. Zero unless the import declared a basis. */
+  consented?: number;
   errors: number;
 }
 
@@ -93,6 +105,11 @@ export interface AudienceServiceDeps {
   db: Db;
   logger: Logger;
   recipients: RecipientService;
+  /**
+   * P13. Absent means an import cannot record consent — the pre-P13 behaviour,
+   * kept optional so the P11-era tests construct this without it.
+   */
+  consent?: ConsentService;
   /**
    * The `external_ref.system` imported rows are keyed under. A tenant importing
    * its own list owns its own ids, so this is per-import rather than global —
@@ -102,6 +119,15 @@ export interface AudienceServiceDeps {
 }
 
 /** Rows are inserted in batches of this size. See `importRows`. */
+/** Rows per page when walking an audience. */
+const MEMBER_PAGE_SIZE = 5_000;
+
+/**
+ * The point at which expanding an audience in memory stops being reasonable.
+ * Reaching it is logged at `error` — a truncated campaign must never be silent.
+ */
+const MEMBER_HARD_CAP = 500_000;
+
 const IMPORT_BATCH = 1_000;
 
 export class AudienceService {
@@ -296,7 +322,7 @@ export class AudienceService {
     scope: TenantScope,
     audienceId: string,
     rows: AsyncIterable<ImportRow>,
-    options: { system?: string; importId?: string } = {},
+    options: { system?: string; importId?: string; consent?: ImportConsent } = {},
   ): Promise<ImportResult> {
     await this.require(scope, audienceId);
 
@@ -306,6 +332,7 @@ export class AudienceService {
     let valid = 0;
     let inserted = 0;
     let errors = 0;
+    let consented = 0;
     let rowNumber = 1; // 1 is the header, so the first data row is 2.
     let batch: { recipientId: string }[] = [];
     const failures: (typeof importErrors.$inferInsert)[] = [];
@@ -328,6 +355,26 @@ export class AudienceService {
           .onConflictDoNothing()
           .returning({ recipientId: audienceMembers.recipientId });
         inserted += added.length;
+
+        // Consent, captured in the same flush as the membership.
+        //
+        // An import is where a lead list arrives with a lawful basis attached —
+        // "these people ticked the box on our stand at the trade show" — and it
+        // is the only bulk path where that can be recorded. Without it, an
+        // imported audience is unreachable the moment enforcement is on, and
+        // the operator's only recourse is a consent call per recipient.
+        //
+        // It is opt-in, and the caller must name a source and a date. There is
+        // no default: "they were in the spreadsheet" is not a lawful basis, and
+        // defaulting would make it look like one.
+        if (options.consent && this.deps.consent) {
+          consented += await this.deps.consent.captureImported(
+            scope,
+            batch.map((b) => b.recipientId),
+            options.consent,
+          );
+        }
+
         batch = [];
       }
       if (failures.length > 0) {
@@ -398,8 +445,9 @@ export class AudienceService {
       imported: inserted,
       skipped,
       errors,
+      consented,
     });
-    return { importId, imported: inserted, skipped, errors };
+    return { importId, imported: inserted, skipped, errors, consented };
   }
 
   /** The downloadable report. Paginated, because a bad header rejects every row. */
@@ -428,25 +476,64 @@ export class AudienceService {
       .offset(options.offset ?? 0);
   }
 
-  /** Members, as recipient ids. The orchestrator's expand step reads this. */
+  /**
+   * Members, as recipient ids. The orchestrator's expand step reads this.
+   *
+   * ───────────────────────────────────────────────────────────────────────────
+   * IT PAGES, AND IT SAYS SO WHEN IT STOPS
+   *
+   * There was a bare `.limit(100_000)`, so an audience of 150,000 silently
+   * became one of 100,000: the campaign launched, reported `expanded: 100000`,
+   * completed, and 50,000 people were never contacted with nothing anywhere
+   * recording it. A silent cap reads as "covered everything".
+   *
+   * The explicit `options.limit` is still honoured — a caller asking for a page
+   * gets a page — but the default now walks the whole audience.
+   */
   async memberIds(
     scope: TenantScope,
     audienceId: string,
     options: { limit?: number; offset?: number } = {},
   ): Promise<string[]> {
-    const rows = await this.deps.db
-      .select({ recipientId: audienceMembers.recipientId })
-      .from(audienceMembers)
-      .where(
-        and(
-          eq(audienceMembers.audienceId, audienceId),
-          eq(audienceMembers.tenantId, scope.tenantId),
-        ),
-      )
-      .orderBy(audienceMembers.recipientId)
-      .limit(options.limit ?? 100_000)
-      .offset(options.offset ?? 0);
-    return rows.map((r) => r.recipientId);
+    const page = async (limit: number, offset: number): Promise<string[]> => {
+      const rows = await this.deps.db
+        .select({ recipientId: audienceMembers.recipientId })
+        .from(audienceMembers)
+        .where(
+          and(
+            eq(audienceMembers.audienceId, audienceId),
+            eq(audienceMembers.tenantId, scope.tenantId),
+          ),
+        )
+        .orderBy(audienceMembers.recipientId)
+        .limit(limit)
+        .offset(offset);
+      return rows.map((r) => r.recipientId);
+    };
+
+    // An explicit limit is a caller asking for one page. Honour it exactly.
+    if (options.limit !== undefined) return page(options.limit, options.offset ?? 0);
+
+    const all: string[] = [];
+    let offset = options.offset ?? 0;
+    for (;;) {
+      const batch = await page(MEMBER_PAGE_SIZE, offset);
+      all.push(...batch);
+      if (batch.length < MEMBER_PAGE_SIZE) break;
+      offset += batch.length;
+
+      if (all.length >= MEMBER_HARD_CAP) {
+        // A bound still has to exist — this array is held in memory — but it is
+        // loud now. An operator seeing this line knows the campaign is short,
+        // which is the entire difference from before.
+        this.deps.logger.error(
+          'audience is larger than the engine will expand in one pass — the campaign will be INCOMPLETE',
+          { tenantId: scope.tenantId, audienceId, expanded: all.length, cap: MEMBER_HARD_CAP },
+        );
+        break;
+      }
+    }
+    return all;
   }
 
   // ── internals ─────────────────────────────────────────────────────────────

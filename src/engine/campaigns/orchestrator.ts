@@ -180,6 +180,14 @@ export interface OrchestratorDeps {
   queue?: NotificationQueue;
 }
 
+/**
+ * Statuses a campaign may be launched from. DRAFT is the ordinary case; QUEUED
+ * and PAUSED are a launch after a scheduler or an operator parked it.
+ * COMPLETED, CANCELLED and PROCESSING are not launchable, which is what the
+ * atomic gate in `launch()` enforces.
+ */
+const LAUNCHABLE_STATUSES: string[] = ['DRAFT', 'QUEUED', 'PAUSED'];
+
 const DEFAULT_CONCURRENCY = 5;
 
 export class CampaignOrchestrator {
@@ -244,22 +252,51 @@ export class CampaignOrchestrator {
   ): Promise<{ expanded: number; batchId: string }> {
     const campaign = await this.require(scope, campaignId);
 
-    if (campaign.status === 'PROCESSING') {
-      throw new ConflictError(`Campaign '${campaignId}' is already running`);
-    }
-    if (campaign.status === 'COMPLETED' || campaign.status === 'CANCELLED') {
-      throw new ConflictError(
-        `Campaign '${campaignId}' is ${campaign.status} and cannot be launched again`,
-      );
-    }
     if (!campaign.audienceId) {
       throw new ValidationError('A campaign needs an audience before it can be launched');
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // THE STATUS WRITE IS THE GATE, AND IT HAS TO COME FIRST.
+    //
+    // This read the status, expanded the audience, and only then set
+    // PROCESSING — with the whole expansion sitting in the gap. Two concurrent
+    // `POST /launch` calls both read DRAFT, both passed, both expanded, and the
+    // audience was written twice; every duplicated recipient row is a second
+    // message to a real person.
+    //
+    // `UPDATE … WHERE status IN (launchable) RETURNING` decides it in one
+    // statement: exactly one caller gets a row back, and the loser sees the
+    // status the winner just wrote. Postgres serialises the two updates on the
+    // row lock, so there is no window left to lose.
+    // ─────────────────────────────────────────────────────────────────────────
+    const [claimed] = await this.deps.db
+      .update(campaigns)
+      .set({ status: 'PROCESSING', updatedAt: new Date() })
+      .where(
+        and(
+          tenantWhere(campaigns, scope),
+          eq(campaigns.id, campaignId),
+          inArray(campaigns.status, LAUNCHABLE_STATUSES),
+        ),
+      )
+      .returning({ id: campaigns.id });
+
+    if (!claimed) {
+      // Re-read to say what actually stopped it, rather than guessing from the
+      // status we saw before the race.
+      const now = await this.require(scope, campaignId);
+      throw new ConflictError(
+        now.status === 'PROCESSING'
+          ? `Campaign '${campaignId}' is already running`
+          : `Campaign '${campaignId}' is ${now.status} and cannot be launched again`,
+        { status: now.status },
+      );
     }
 
     const batchId = await this.openBatch(scope, campaign.id, campaign.name);
     const expanded = await this.expand(scope, campaign.id, campaign.audienceId);
 
-    await this.setStatus(scope, campaign.id, 'PROCESSING');
     await this.deps.db
       .update(messageBatches)
       .set({ status: 'PROCESSING', eventCount: expanded, updatedAt: new Date() })
@@ -482,6 +519,13 @@ export class CampaignOrchestrator {
     campaignId: string,
     options: { status?: string; limit?: number; offset?: number } = {},
   ) {
+    // Every other campaign read starts here, and this one did not: it queried
+    // `campaign_recipients` directly, so it answered for a campaign belonging to
+    // another sub-tenant with an empty list rather than a 404 — and, worse, for
+    // one belonging to a sub-tenant the caller is not scoped to with its actual
+    // recipients. `require` applies the same predicate as `getById`.
+    await this.require(scope, campaignId);
+
     const clauses: SQL[] = [
       tenantWhere(campaignRecipients, scope),
       eq(campaignRecipients.campaignId, campaignId),
@@ -515,30 +559,37 @@ export class CampaignOrchestrator {
     const memberIds = await this.deps.audiences.memberIds(scope, audienceId);
     if (memberIds.length === 0) return 0;
 
-    const existing = await this.deps.db
-      .select({ recipientId: campaignRecipients.recipientId })
-      .from(campaignRecipients)
-      .where(
-        and(
-          tenantWhere(campaignRecipients, scope),
-          eq(campaignRecipients.campaignId, campaignId),
-        ),
-      );
-    const seen = new Set(existing.map((e) => e.recipientId));
-    const fresh = memberIds.filter((id) => !seen.has(id));
-    if (fresh.length === 0) return 0;
-
-    for (let i = 0; i < fresh.length; i += 500) {
-      await this.deps.db.insert(campaignRecipients).values(
-        fresh.slice(i, i + 500).map((recipientId) => ({
-          tenantId: scope.tenantId,
-          campaignId,
-          recipientId,
-          status: 'PENDING' as const,
-        })),
-      );
+    // ON CONFLICT, not read-then-filter.
+    //
+    // The old shape read the existing rows, subtracted them and inserted the
+    // difference — check-then-act, so two expansions running at once both found
+    // nothing and both inserted the whole audience. Every duplicated row is a
+    // second message to a real person.
+    //
+    // `campaign_recipients_campaign_recipient_unique` (0019) decides it instead,
+    // and `returning()` counts what was actually added rather than what was
+    // attempted — which is also what makes a relaunch report the newcomers
+    // honestly instead of claiming to have added everyone again.
+    let added = 0;
+    for (let i = 0; i < memberIds.length; i += 500) {
+      const rows = await this.deps.db
+        .insert(campaignRecipients)
+        .values(
+          memberIds.slice(i, i + 500).map((recipientId) => ({
+            tenantId: scope.tenantId,
+            campaignId,
+            recipientId,
+            status: 'PENDING' as const,
+          })),
+        )
+        .onConflictDoNothing({
+          target: [campaignRecipients.campaignId, campaignRecipients.recipientId],
+          where: sql`${campaignRecipients.campaignId} IS NOT NULL AND ${campaignRecipients.recipientId} IS NOT NULL`,
+        })
+        .returning({ id: campaignRecipients.id });
+      added += rows.length;
     }
-    return fresh.length;
+    return added;
   }
 
   /**
@@ -582,6 +633,21 @@ export class CampaignOrchestrator {
       if (page.length === 0) break;
 
       for (let i = 0; i < page.length; i += concurrency) {
+        // Re-checked per SLICE, not per page.
+        //
+        // The status was read once between pages, and a page is
+        // `concurrency * 10` rows — so up to that many recipients were still
+        // generated and sent after an operator pressed cancel. Checking per
+        // slice bounds it to `concurrency`, which is the number genuinely
+        // in flight and cannot be reduced without abandoning work already
+        // started.
+        //
+        // One extra SELECT per slice, on a primary key. Cheap against the
+        // alternative, which is a hundred messages an operator asked not to
+        // send.
+        const live = await this.require(scope, campaignId);
+        if (live.status !== 'PROCESSING') break;
+
         const slice = page.slice(i, i + concurrency);
         const outcomes = await Promise.all(
           slice.map((row) =>
@@ -690,7 +756,24 @@ export class CampaignOrchestrator {
         sentAt: status === 'SENT' ? new Date() : undefined,
         updatedAt: new Date(),
       })
-      .where(and(tenantWhere(campaignRecipients, scope), eq(campaignRecipients.id, id)));
+      .where(
+        and(
+          tenantWhere(campaignRecipients, scope),
+          eq(campaignRecipients.id, id),
+          // PENDING only.
+          //
+          // Generation for a page is already in flight when `cancel` runs, and
+          // this had no status predicate — so a row `cancel` had just marked
+          // CANCELLED was stamped back to SENT moments later by the generator
+          // that had not noticed yet. The operator was told it was cancelled and
+          // the table said it went out.
+          //
+          // A row that is no longer PENDING has been decided by somebody else;
+          // this update simply loses, and the generator's own outcome for that
+          // recipient is discarded along with it.
+          eq(campaignRecipients.status, 'PENDING'),
+        ),
+      );
   }
 
   private async countPending(scope: TenantScope, campaignId: string): Promise<number> {
@@ -764,7 +847,18 @@ function mapStatus(result: PlaybookRunResult): CampaignRecipientStatus {
     case 'PENDING_APPROVAL':
       return 'PENDING_APPROVAL';
     case 'SUPPRESSED':
-      return 'SUPPRESSED';
+      // ── DEFERRED IS NOT SUPPRESSED ──────────────────────────────────────
+      //
+      // A quiet-hours or rate-limit deferral produces a SUPPRESSED run with a
+      // `retryAt`, and `DeferralWorker` re-dispatches the message when it comes
+      // due. The recipient row said SUPPRESSED, which reads terminal — so
+      // campaign stats under-reported a campaign that was still going, and an
+      // operator looking at the tail of a large send saw a wall of suppressions
+      // for messages that were about to go out.
+      //
+      // The message is retried either way; this is the bookkeeping catching up
+      // with it.
+      return result.deferredUntil ? 'PENDING' : 'SUPPRESSED';
     case 'SKIPPED':
       return 'SKIPPED';
     case 'FAILED':

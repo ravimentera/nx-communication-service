@@ -98,8 +98,36 @@ export interface AuthMiddlewareOptions {
   logger: Logger;
   /** Paths that skip auth entirely. Default: /health, /docs, /public. */
   skipPaths?: string[];
-  /** Per-route bypasses: path -> { method, param, value }. */
-  bypassRules?: Record<string, { method: string; param: string; value: string }>;
+  /**
+   * Per-route bypasses: a request matching one skips authentication.
+   *
+   * ───────────────────────────────────────────────────────────────────────────
+   * AN ARRAY, NOT A MAP KEYED BY PATH
+   *
+   * It was `Record<path, rule>`, which silently allows exactly one rule per
+   * path: declaring an unauthenticated `GET /x` and a separate rule for
+   * `POST /x` left only whichever was written second, and the loser was either
+   * unreachable or unprotected depending on which way round they went. A
+   * security control whose shape cannot express its own domain is one waiting
+   * to be got wrong.
+   *
+   * ───────────────────────────────────────────────────────────────────────────
+   * NOTHING PASSES THIS TODAY, DELIBERATELY
+   *
+   * The one case it was written for — the unsubscribe link, which arrives from
+   * an email client with no gateway headers — is served by mounting that router
+   * BEFORE the auth middleware in `app.ts`, which is both simpler and visible
+   * in one place. Prefer that. This stays because a bypass that must live
+   * inside an authenticated mount has nowhere else to go, and because leaving a
+   * broken shape in place is worse than either using it or removing it.
+   */
+  bypassRules?: readonly {
+    method: string;
+    path: string;
+    /** Query parameter that must carry `value`. */
+    param: string;
+    value: string;
+  }[];
   /**
    * `apikey` mode: verify a presented key. Injected rather than imported so the
    * platform layer keeps knowing nothing about the database — the same reason
@@ -143,15 +171,21 @@ function parsePermissions(raw: string | undefined, logger: Logger): string[] {
 export function createAuthMiddleware(options: AuthMiddlewareOptions): RequestHandler {
   const { config, logger } = options;
   const skipPaths = options.skipPaths ?? DEFAULT_SKIP_PATHS;
-  const bypassRules = options.bypassRules ?? {};
+  const bypassRules = options.bypassRules ?? [];
   const gatewayOnly = config.gatewayOnly ?? true;
 
   return (req: Request, res: Response, next: NextFunction) => {
     try {
-      const rule = bypassRules[req.path];
-      if (rule && rule.method === req.method && req.query[rule.param] === rule.value) {
-        return next();
-      }
+      // Method AND path, so two rules on one path can coexist. Every condition
+      // is checked in the predicate rather than split between the lookup and
+      // the guard, which is what made the old shape lossy.
+      const bypass = bypassRules.find(
+        (rule) =>
+          rule.path === req.path &&
+          rule.method === req.method &&
+          req.query[rule.param] === rule.value,
+      );
+      if (bypass) return next();
 
       if (
         req.method === 'OPTIONS' ||
@@ -315,7 +349,12 @@ function readApiKey(req: Request): string | undefined {
  * Require permissions. Admins always pass, by role or by the admin permission.
  */
 export function requirePermissions(...required: (Permission | string)[]): RequestHandler {
-  return (req: Request, _res: Response, next: NextFunction) => {
+  // Named, not anonymous, and that is load-bearing: `tests/contract/
+  // permissions.test.ts` walks the live router stack and identifies the gate by
+  // this name. Two whole routers shipped without a permission check because the
+  // convention was enforced by memory; the test is what replaced the memory, and
+  // inlining this as an arrow would blind it.
+  return function permissionGate(req: Request, _res: Response, next: NextFunction) {
     const identity = req.identity;
     if (!identity) return next(new AuthError());
 

@@ -34,10 +34,19 @@
 import { Router, type NextFunction, type Request, type Response } from 'express';
 import { z } from 'zod';
 
+import { isValidTimezone, TIMEZONE_ERROR } from '../../domain/timezone.js';
+
 import type { AudienceService, ImportRow } from '../../engine/campaigns/audience.service.js';
+import { CONSENT_SOURCES } from '../../engine/compliance/consent.service.js';
 import type { CampaignOrchestrator } from '../../engine/campaigns/orchestrator.js';
-import { requireTenant } from '../../platform/http/auth.middleware.js';
+import {
+  Permission,
+  requirePermissions,
+  requireTenant,
+} from '../../platform/http/auth.middleware.js';
 import { NotFoundError } from '../../platform/http/errors.js';
+import { CHANNEL_TYPES } from '../../ports/channel.js';
+import { uuidParam } from '../../platform/http/params.js';
 
 const audienceSchema = z.object({
   name: z.string().min(1),
@@ -62,7 +71,7 @@ const importRowSchema = z.object({
   firstName: z.string().optional(),
   lastName: z.string().optional(),
   locale: z.string().optional(),
-  timezone: z.string().optional(),
+  timezone: z.string().refine(isValidTimezone, TIMEZONE_ERROR).optional(),
   attributes: z.record(z.string(), z.unknown()).optional(),
 });
 
@@ -74,6 +83,22 @@ const importRowSchema = z.object({
 const importSchema = z.object({
   system: z.string().min(1).optional(),
   rows: z.array(z.unknown()).min(1),
+  /**
+   * The lawful basis for contacting this list, if the caller has one.
+   *
+   * Optional, and with no default. An imported audience with no consent is
+   * unreachable once enforcement is on, which is the correct outcome for a list
+   * whose provenance nobody can state — defaulting it would turn "we have a
+   * spreadsheet" into a recorded claim that these people agreed.
+   */
+  consent: z
+    .object({
+      channels: z.array(z.enum(CHANNEL_TYPES)).min(1),
+      source: z.enum(CONSENT_SOURCES),
+      grantedAt: z.string().datetime().optional(),
+      proof: z.record(z.unknown()).optional(),
+    })
+    .optional(),
 });
 
 const campaignSchema = z.object({
@@ -104,6 +129,10 @@ function handle(
 export function createCampaignRouter(deps: CampaignApiDeps): Router {
   const router = Router();
 
+  // Every `:id` on this router is a uuid column. Registered as a param handler
+  // rather than per-route so a route added later cannot forget it (params.ts).
+  router.param('id', uuidParam());
+
   // ── audiences ─────────────────────────────────────────────────────────────
 
   router.get(
@@ -115,6 +144,7 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
 
   router.post(
     '/audiences',
+    requirePermissions(Permission.CONFIG_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       const body = audienceSchema.parse(req.body);
@@ -134,6 +164,7 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
 
   router.post(
     '/audiences/:id/members',
+    requirePermissions(Permission.CONFIG_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       const body = membersSchema.parse(req.body);
@@ -145,6 +176,7 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
 
   router.delete(
     '/audiences/:id/members',
+    requirePermissions(Permission.CONFIG_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       const body = membersSchema.parse(req.body);
@@ -154,6 +186,7 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
 
   router.post(
     '/audiences/:id/import',
+    requirePermissions(Permission.CONFIG_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       const body = importSchema.parse(req.body);
@@ -169,6 +202,18 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
 
       const result = await deps.audiences.importRows(scope, req.params.id as string, rows(), {
         ...(body.system ? { system: body.system } : {}),
+        ...(body.consent
+          ? {
+              consent: {
+                channels: body.consent.channels,
+                source: body.consent.source,
+                ...(body.consent.grantedAt
+                  ? { grantedAt: new Date(body.consent.grantedAt) }
+                  : {}),
+                ...(body.consent.proof ? { proof: body.consent.proof } : {}),
+              },
+            }
+          : {}),
       });
       res.status(result.errors > 0 ? 207 : 200).json(result);
     }),
@@ -190,6 +235,7 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
 
   router.post(
     '/audiences/:id/materialize',
+    requirePermissions(Permission.CONFIG_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       res.json(await deps.audiences.materialize(scope, req.params.id as string));
@@ -207,6 +253,7 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
 
   router.post(
     '/campaigns',
+    requirePermissions(Permission.CONFIG_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       const body = campaignSchema.parse(req.body);
@@ -245,6 +292,7 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
   // 202, not 200: the work outlives the request. See the header.
   router.post(
     '/campaigns/:id/launch',
+    requirePermissions(Permission.SEND),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       const result = await deps.campaigns.launch(scope, req.params.id as string);
@@ -254,6 +302,7 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
 
   router.post(
     '/campaigns/:id/pause',
+    requirePermissions(Permission.CONFIG_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       await deps.campaigns.pause(scope, req.params.id as string);
@@ -263,6 +312,7 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
 
   router.post(
     '/campaigns/:id/resume',
+    requirePermissions(Permission.SEND),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       await deps.campaigns.resume(scope, req.params.id as string);
@@ -282,6 +332,7 @@ export function createCampaignRouter(deps: CampaignApiDeps): Router {
    */
   router.post(
     '/campaigns/:id/cancel',
+    requirePermissions(Permission.CONFIG_WRITE),
     handle(async (req, res) => {
       const scope = requireTenant(req);
       const result = await deps.campaigns.cancel(scope, req.params.id as string);

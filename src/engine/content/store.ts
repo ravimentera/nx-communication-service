@@ -11,6 +11,11 @@ import { and, asc, desc, eq, isNull, sql, type SQL } from 'drizzle-orm';
 import type { Logger } from 'winston';
 
 import type { Db } from '../../db/index.js';
+import {
+  subTenantValueForInsert,
+  tenantWhere,
+  type TenantScope,
+} from '../../platform/db/tenant-scope.js';
 import { templates, templateVersions } from '../../db/schema.js';
 import { NotFoundError } from '../../platform/http/errors.js';
 import type {
@@ -36,8 +41,22 @@ export class DrizzleTemplateStore implements TemplateStore {
     private readonly logger: Logger,
   ) {}
 
+  /**
+   * The tenant predicate every method here uses.
+   *
+   * `includeShared: true` is the whole point: a template with a NULL
+   * `sub_tenant_id` is ORG-WIDE, and that is what a pack install writes when it
+   * is not scoped to a location. A location-scoped caller must see its own
+   * templates and the org-wide ones — a plain `sub_tenant_id = X` would hide
+   * every pack template from every location user, which looks like a fix and is
+   * a worse bug.
+   */
+  private scoped(scope: TenantScope): SQL {
+    return tenantWhere(templates, scope, { includeShared: true });
+  }
+
   /** Accepts a uuid or a pack key — callers should not have to know which. */
-  async get(tenantId: string, idOrKey: string): Promise<TemplateRecord | null> {
+  async get(scope: TenantScope, idOrKey: string): Promise<TemplateRecord | null> {
     const match = UUID_RE.test(idOrKey)
       ? eq(templates.id, idOrKey)
       : eq(templates.key, idOrKey);
@@ -45,14 +64,14 @@ export class DrizzleTemplateStore implements TemplateStore {
     const [row] = await this.db
       .select()
       .from(templates)
-      .where(and(eq(templates.tenantId, tenantId), match))
+      .where(and(this.scoped(scope), match))
       .limit(1);
 
     return row ? toRecord(row) : null;
   }
 
-  async list(tenantId: string, filter: TemplateFilter = {}): Promise<TemplateRecord[]> {
-    const conditions: SQL[] = [eq(templates.tenantId, tenantId)];
+  async list(scope: TenantScope, filter: TemplateFilter = {}): Promise<TemplateRecord[]> {
+    const conditions: SQL[] = [this.scoped(scope)];
     if (filter.channel) conditions.push(eq(templates.channel, filter.channel));
     if (filter.category) conditions.push(eq(templates.category, filter.category));
     if (filter.templateType) conditions.push(eq(templates.templateType, filter.templateType));
@@ -73,15 +92,18 @@ export class DrizzleTemplateStore implements TemplateStore {
   }
 
   async create(
-    tenantId: string,
+    scope: TenantScope,
     template: TemplateCreate,
     actor?: string,
   ): Promise<TemplateRecord> {
     const [row] = await this.db
       .insert(templates)
       .values({
-        tenantId,
-        subTenantId: template.subTenantId ?? null,
+        tenantId: scope.tenantId,
+        // The caller's explicit choice, else the scope's own sub-tenant. A
+        // location-scoped user creating a template gets a template for their
+        // location, not one silently shared with every other location.
+        subTenantId: template.subTenantId ?? subTenantValueForInsert(scope),
         packId: template.packId ?? null,
         key: template.key ?? null,
         name: template.name,
@@ -105,17 +127,17 @@ export class DrizzleTemplateStore implements TemplateStore {
       .returning();
 
     if (!row) throw new Error('template insert returned no row');
-    await this.snapshot(tenantId, row, actor, 'created');
+    await this.snapshot(scope.tenantId, row, actor, 'created');
     return toRecord(row);
   }
 
   async update(
-    tenantId: string,
+    scope: TenantScope,
     id: string,
     patch: TemplateUpdate,
     actor?: string,
   ): Promise<TemplateRecord> {
-    const current = await this.get(tenantId, id);
+    const current = await this.get(scope, id);
     if (!current) throw new NotFoundError(`Template '${id}' not found`);
 
     // A content change bumps the version and snapshots the previous body, so
@@ -131,30 +153,30 @@ export class DrizzleTemplateStore implements TemplateStore {
         updatedBy: actor,
         updatedAt: new Date(),
       })
-      .where(and(eq(templates.tenantId, tenantId), eq(templates.id, id)))
+      .where(and(this.scoped(scope), eq(templates.id, id)))
       .returning();
 
     if (!row) throw new NotFoundError(`Template '${id}' not found`);
-    if (contentChanged) await this.snapshot(tenantId, row, actor, 'content updated');
+    if (contentChanged) await this.snapshot(scope.tenantId, row, actor, 'content updated');
     return toRecord(row);
   }
 
-  async delete(tenantId: string, id: string): Promise<boolean> {
+  async delete(scope: TenantScope, id: string): Promise<boolean> {
     const deleted = await this.db
       .delete(templates)
-      .where(and(eq(templates.tenantId, tenantId), eq(templates.id, id)))
+      .where(and(this.scoped(scope), eq(templates.id, id)))
       .returning({ id: templates.id });
     return deleted.length > 0;
   }
 
-  async incrementUsage(tenantId: string, id: string): Promise<void> {
+  async incrementUsage(scope: TenantScope, id: string): Promise<void> {
     await this.db
       .update(templates)
       .set({
         usageCount: sql`${templates.usageCount} + 1`,
         lastUsedAt: new Date(),
       })
-      .where(and(eq(templates.tenantId, tenantId), eq(templates.id, id)));
+      .where(and(this.scoped(scope), eq(templates.id, id)));
   }
 
   /**
@@ -169,13 +191,15 @@ export class DrizzleTemplateStore implements TemplateStore {
    * Both writes run in one transaction: a crash between them would leave the
    * tenant with no default at all.
    */
-  async setDefault(tenantId: string, id: string): Promise<TemplateRecord> {
-    const target = await this.get(tenantId, id);
+  async setDefault(scope: TenantScope, id: string): Promise<TemplateRecord> {
+    const target = await this.get(scope, id);
     if (!target) throw new NotFoundError(`Template '${id}' not found`);
 
     return this.db.transaction(async (tx) => {
       const siblingConditions: SQL[] = [
-        eq(templates.tenantId, tenantId),
+        // Siblings are scoped the same way the target was found, so a location
+        // setting its own default does not clear the org-wide one for everybody.
+        this.scoped(scope),
         eq(templates.channel, target.channel),
         eq(templates.isDefault, true),
         target.category
@@ -191,12 +215,12 @@ export class DrizzleTemplateStore implements TemplateStore {
       const [row] = await tx
         .update(templates)
         .set({ isDefault: true, updatedAt: new Date() })
-        .where(and(eq(templates.tenantId, tenantId), eq(templates.id, target.id)))
+        .where(and(this.scoped(scope), eq(templates.id, target.id)))
         .returning();
 
       if (!row) throw new NotFoundError(`Template '${id}' not found`);
       this.logger.info('template set as default', {
-        tenantId,
+        tenantId: scope.tenantId,
         templateId: row.id,
         channel: row.channel,
         category: row.category,
@@ -205,13 +229,19 @@ export class DrizzleTemplateStore implements TemplateStore {
     });
   }
 
-  async versions(tenantId: string, templateId: string): Promise<TemplateVersionRecord[]> {
+  async versions(scope: TenantScope, templateId: string): Promise<TemplateVersionRecord[]> {
+    // Guarded through the template, not just the version rows: `template_versions`
+    // has a tenant column and no sub-tenant one, so reading it directly would
+    // hand a location every other location's revision history.
+    const template = await this.get(scope, templateId);
+    if (!template) return [];
+
     const rows = await this.db
       .select()
       .from(templateVersions)
       .where(
         and(
-          eq(templateVersions.tenantId, tenantId),
+          eq(templateVersions.tenantId, scope.tenantId),
           eq(templateVersions.templateId, templateId),
         ),
       )

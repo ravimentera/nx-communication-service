@@ -58,4 +58,15 @@ export interface PlaybookRunResult {
   reason?: string;
   /** Schema errors when the context failed the playbook's data contract. */
   contractErrors?: string[];
+  /**
+   * When a SUPPRESSED result will be retried.
+   *
+   * Present only for a DEFERRAL — quiet hours, a rate limit — which the
+   * `DeferralWorker` re-dispatches. Its absence on a SUPPRESSED result means
+   * the suppression is terminal. Callers that record an outcome need the
+   * difference: campaigns marked every deferral SUPPRESSED, which reads
+   * terminal, so the tail of a large send looked like a wall of failures for
+   * messages that were about to go out.
+   */
+  deferredUntil?: Date;
 }

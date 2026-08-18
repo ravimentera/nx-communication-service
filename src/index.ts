@@ -13,6 +13,7 @@ import { InlineContextProvider } from './adapters/context/inline.provider.js';
 import { MenteraContextProvider } from './adapters/context/mentera.provider.js';
 import { BedrockProvider } from './adapters/llm/bedrock.provider.js';
 import { RecordingLlmProvider } from './adapters/llm/recording.provider.js';
+import { StubLlmProvider } from './adapters/llm/stub.provider.js';
 import { createStorageProvider } from './adapters/storage/index.js';
 import { tenantPacks } from './db/schema.js';
 import { ApprovalService } from './engine/approvals/approval.service.js';
@@ -20,8 +21,10 @@ import { PolicyService } from './engine/approvals/policy.service.js';
 import { TenantConfigAuthorizationProvider } from './engine/approvals/authorization.js';
 import { ApprovalSlaWorker } from './engine/approvals/sla.worker.js';
 import { DeferralWorker } from './engine/delivery/deferral.worker.js';
+import { RetentionWorker } from './engine/compliance/retention.job.js';
+import { ConsentService } from './engine/compliance/consent.service.js';
 import { ComplianceGate } from './engine/compliance/gate.js';
-import { lintContent, mergeRules } from './engine/compliance/lint.js';
+import { lintContent, mergeRules, type LintRules } from './engine/compliance/lint.js';
 import { ErasureService } from './engine/compliance/erasure.service.js';
 import { PreferenceService } from './engine/compliance/preference.service.js';
 import { CORE_PACK, ContextRegistry } from './engine/context/registry.js';
@@ -36,6 +39,7 @@ import { UsageService } from './engine/tenancy/usage.service.js';
 import { hasDuplicateKeys, parseKeyList, Sealer } from './platform/crypto/envelope.js';
 import { AssetService } from './engine/content/asset.service.js';
 import { ContentGenerator } from './engine/content/generator.js';
+import { IdentityResolver } from './engine/content/identity.js';
 import { PromptAssembler } from './engine/content/prompt-assembler.js';
 import { Renderer } from './engine/content/renderer.js';
 import { DrizzleTemplateStore } from './engine/content/store.js';
@@ -116,6 +120,11 @@ async function main(): Promise<void> {
     logger,
     db,
     dryRun: config.channels.dryRun,
+    // Derived from NODE_ENV rather than read from a setting: this switch turns
+    // off the outbound-webhook SSRF guard, and a production image must not be
+    // able to turn it on by configuration. Local development needs it to reach
+    // a webhook receiver on localhost.
+    allowPrivateWebhookTargets: !config.server.isProduction,
     preferSmtp: !config.channels.sendgrid.apiKey && Boolean(config.channels.smtp.host),
   });
 
@@ -148,6 +157,8 @@ async function main(): Promise<void> {
             urgentAttempts: config.queue.urgentAttempts,
             backoffDelayMs: 5_000,
             concurrency: config.queue.notificationConcurrency,
+            maxPerInterval: config.queue.sendMaxPerInterval,
+            limiterIntervalMs: config.queue.sendLimiterIntervalMs,
           },
           resolveCredentials: (channel, scope) => credentials.resolve(channel, scope),
           onResult: createResultRecorder(db, logger, {
@@ -185,9 +196,45 @@ async function main(): Promise<void> {
   const preferences = new PreferenceService({
     db,
     logger,
+    enforceQuietHours: config.compliance.enforceQuietHours,
     defaultTimezone: config.compliance.defaultTimezone,
     unsubscribeBaseUrl: config.compliance.unsubscribeBaseUrl,
   });
+  /**
+   * The lint rules for ONE tenant: the engine defaults, plus the rules of the
+   * packs that tenant actually installed.
+   *
+   * It was `mergeRules(...packs.compliance())` — every pack on disk, merged
+   * once at boot, applied to everybody. A law firm running the lead-generation
+   * pack inherited medspa's HIPAA patterns, which is the harmless half. The
+   * harmful half is `allowedDomains`: the lists concatenate, so one pack's
+   * link allow-list silently widened every other pack's, and a rule that was
+   * meant to constrain became one that permits.
+   *
+   * `docs/PACKS.md` argued the merge was fine because a false warning costs one
+   * human glance. That is true of a phrase check and false of an allow-list,
+   * and the document is corrected alongside this.
+   *
+   * Cached briefly: this is on the send path via the gate's PHI check, and the
+   * set of installed packs changes at install time, not per message.
+   */
+  const packRulesCache = new Map<string, { at: number; rules: LintRules }>();
+  const PACK_RULES_TTL_MS = 30_000;
+
+  const rulesFor = async (tenantId: string): Promise<LintRules> => {
+    const hit = packRulesCache.get(tenantId);
+    if (hit && Date.now() - hit.at < PACK_RULES_TTL_MS) return hit.rules;
+
+    const rows = await db
+      .select({ packId: tenantPacks.packId })
+      .from(tenantPacks)
+      .where(and(eq(tenantPacks.tenantId, tenantId), eq(tenantPacks.isActive, true)));
+
+    const rules = mergeRules(...rows.flatMap((row) => packs.compliance(row.packId)));
+    packRulesCache.set(tenantId, { at: Date.now(), rules });
+    return rules;
+  };
+
   const complianceGate = new ComplianceGate({
     db,
     logger,
@@ -200,8 +247,38 @@ async function main(): Promise<void> {
     // P12: the `hipaa` profile's PHI rule. Runs only for that profile, on the
     // channels it applies to — see engine/compliance/profiles.ts.
     lint: async ({ content, channel, tenantId }) =>
-      lintContent({ content, channel, tenantId }, lintRules),
+      lintContent({ content, channel, tenantId }, await rulesFor(tenantId)),
   });
+
+  // ── context plane ─────────────────────────────────────────────────────────
+  // Ahead of the dispatcher, because the dispatcher now resolves a recipient
+  // from a bare address: without one, the compliance gate skips consent,
+  // per-channel preference, per-playbook opt-out and every throttle.
+  const contextRegistry = new ContextRegistry({
+    installedPacks: async (tenantId) => {
+      const rows = await db
+        .select({ packId: tenantPacks.packId })
+        .from(tenantPacks)
+        .where(and(eq(tenantPacks.tenantId, tenantId), eq(tenantPacks.isActive, true)));
+      return rows.map((r) => r.packId);
+    },
+  });
+  // Available to every tenant: the caller supplied the data themselves.
+  contextRegistry.register(new InlineContextProvider(), CORE_PACK);
+  // Pack-gated: reaching patient-service requires the medspa pack. A tenant
+  // without it cannot resolve this kind even by crafting a ContextRef.
+  contextRegistry.register(
+    new MenteraContextProvider({
+      config: {
+        patientServiceUrl: config.context.patientServiceUrl,
+        providerServiceUrl: config.context.providerServiceUrl,
+      },
+      logger,
+    }),
+    'medspa',
+  );
+
+  const recipientService = new RecipientService({ db, logger, context: contextRegistry });
 
   const dispatcher = new Dispatcher({
     db,
@@ -210,6 +287,7 @@ async function main(): Promise<void> {
     queue,
     logger,
     compliance: complianceGate,
+    recipients: recipientService,
   });
 
   // ── approvals plane ───────────────────────────────────────────────────────
@@ -285,32 +363,19 @@ async function main(): Promise<void> {
   });
   await deferralWorker.start();
 
-  // ── context plane ─────────────────────────────────────────────────────────
-  const contextRegistry = new ContextRegistry({
-    installedPacks: async (tenantId) => {
-      const rows = await db
-        .select({ packId: tenantPacks.packId })
-        .from(tenantPacks)
-        .where(and(eq(tenantPacks.tenantId, tenantId), eq(tenantPacks.isActive, true)));
-      return rows.map((r) => r.packId);
-    },
+  // The retention purge. Shipped in P12 and never instantiated — no cron, no
+  // route, nothing — so `tenant_channel_configs.retention_days` remained a
+  // column that read like a promise nobody kept. `RETENTION_DRY_RUN` defaults
+  // to true, so what this starts doing today is counting and reporting; the
+  // deletion an operator has to sign off on now has numbers behind it.
+  const retentionWorker = new RetentionWorker({
+    db,
+    logger,
+    dryRun: config.compliance.retentionDryRun,
+    connection: redis.connection,
   });
-  // Available to every tenant: the caller supplied the data themselves.
-  contextRegistry.register(new InlineContextProvider(), CORE_PACK);
-  // Pack-gated: reaching patient-service requires the medspa pack. A tenant
-  // without it cannot resolve this kind even by crafting a ContextRef.
-  contextRegistry.register(
-    new MenteraContextProvider({
-      config: {
-        patientServiceUrl: config.context.patientServiceUrl,
-        providerServiceUrl: config.context.providerServiceUrl,
-      },
-      logger,
-    }),
-    'medspa',
-  );
+  await retentionWorker.start();
 
-  const recipientService = new RecipientService({ db, logger, context: contextRegistry });
 
   // ── messaging plane ───────────────────────────────────────────────────────
   const messageService = new MessageService({ db, logger });
@@ -324,16 +389,27 @@ async function main(): Promise<void> {
   const packs = loadPacks(join(process.cwd(), 'packs'), logger);
   const renderer = new Renderer({ logger, aliases: packs.aliasMaps() });
   const templateStore = new DrizzleTemplateStore(db, logger);
+  // `stub` still goes through RecordingLlmProvider, deliberately: the audit row
+  // and the usage counters are part of what a local tester needs to exercise,
+  // and skipping the decorator would make `GET /v1/usage` untestable in exactly
+  // the mode built for testing it.
   const llm = new RecordingLlmProvider(
-    new BedrockProvider({
-      config: {
-        region: config.llm.region,
-        defaultModel: config.llm.defaultModel,
-        maxRetries: config.llm.maxRetries,
-        timeoutMs: config.llm.timeoutMs,
-      },
-      logger,
-    }),
+    config.llm.provider === 'stub'
+      ? new StubLlmProvider({
+          logger,
+          defaultModel: config.llm.defaultModel,
+          failMode: config.llm.stubFail,
+          latencyMs: config.llm.stubLatencyMs,
+        })
+      : new BedrockProvider({
+          config: {
+            region: config.llm.region,
+            defaultModel: config.llm.defaultModel,
+            maxRetries: config.llm.maxRetries,
+            timeoutMs: config.llm.timeoutMs,
+          },
+          logger,
+        }),
     db,
     logger,
   );
@@ -377,13 +453,23 @@ async function main(): Promise<void> {
   // to be will want to apply to a period that has already happened.
   const usageService = new UsageService({ db, logger });
 
-  const lintRules = mergeRules(...packs.compliance());
+  // The write side of `consent_records`. Until P13 the compliance gate read a
+  // table nothing could fill, which made `require_opt_in` — default true —
+  // impossible to satisfy and enforcement impossible to switch on.
+  const consentService = new ConsentService({ db, logger });
+
+  // Fills the `tenant` and `sender` namespaces every render context needs.
+  // Shared by the runtime, the draft service and the three content routers —
+  // each of which used to spread `emptyContext()` and ship `{{tenant.name}}`
+  // blank to the recipient and to the model.
+  const identity = new IdentityResolver({ db, logger });
+
   const generator = new ContentGenerator({
     llm,
     assembler: new PromptAssembler(renderer),
     logger,
     lint: async ({ content, channel, tenantId }) =>
-      lintContent({ content, channel, tenantId }, lintRules),
+      lintContent({ content, channel, tenantId }, await rulesFor(tenantId)),
   });
 
   // ── playbook plane ────────────────────────────────────────────────────────
@@ -400,6 +486,7 @@ async function main(): Promise<void> {
     templates: templateStore,
     renderer,
     generator,
+    identity,
     approvals,
     policies,
     dispatcher,
@@ -423,6 +510,7 @@ async function main(): Promise<void> {
     db,
     logger,
     recipients: recipientService,
+    consent: consentService,
     defaultImportSystem: 'import',
   });
   const campaignOrchestrator = new CampaignOrchestrator({
@@ -441,6 +529,7 @@ async function main(): Promise<void> {
   // `/communications/generate-message` — which used to own this logic (D101).
   const draftService = new DraftService({
     generator,
+    identity,
     packs,
     recipients: recipientService,
     approvals,
@@ -464,12 +553,13 @@ async function main(): Promise<void> {
     redis,
     dispatcher,
     queue,
-    content: { renderer, store: templateStore, generator, packs, assets: assetService, logger },
+    content: { renderer, store: templateStore, generator, identity, packs, assets: assetService, logger },
     assets: { assets: assetService },
     tenancy: { apiKeys, usage: usageService },
     recipients: {
       recipients: recipientService,
       preferences,
+      consent: consentService,
       gate: complianceGate,
       erasure: new ErasureService({ db, logger }),
     },
@@ -494,7 +584,7 @@ async function main(): Promise<void> {
         logger,
         verifyApiKey: (key) => apiKeys.verify(key),
       }),
-      render: createBodyResolver({ templates: templateStore, renderer }),
+      render: createBodyResolver({ templates: templateStore, renderer, senderIdentity: identity }),
       // P12 workstream 5. Tera's half of the surface: draft, review, decide,
       // read the conversation, start a campaign.
       drafts: draftService,
@@ -520,8 +610,13 @@ async function main(): Promise<void> {
       channels: { configs: channelConfigs, dispatcher, queue },
       approvals: { approvals, policies },
       playbooks: { runtime: runtimeRef.current, registry: playbookRegistry, packs },
-      recipients: { recipients: recipientService, preferences, gate: complianceGate },
-      content: { renderer, store: templateStore, generator, packs, assets: assetService, logger },
+      recipients: {
+        recipients: recipientService,
+        preferences,
+        consent: consentService,
+        gate: complianceGate,
+      },
+      content: { renderer, store: templateStore, generator, identity, packs, assets: assetService, logger },
       receipts: receiptService,
       context: contextRegistry,
       drafts: draftService,
@@ -547,18 +642,47 @@ async function main(): Promise<void> {
     shuttingDown = true;
     logger.info('shutting down', { signal });
 
-    server.close(() => {
-      void (async () => {
-        // Drain the workers before dropping the connections they use.
-        await queue.close();
-        await eventQueue.close();
-        await slaWorker.close();
-        await deferralWorker.close();
-        await redis.close();
-        await closeDb(pool, logger);
-        process.exit(0);
-      })();
+    // ── WORKERS FIRST, IN PARALLEL WITH THE SERVER CLOSING ──────────────────
+    //
+    // These used to run INSIDE the `server.close()` callback, which fires only
+    // once every open HTTP connection has finished. With keep-alive connections
+    // or a slow request in flight — routine during a rolling deploy — that is
+    // seconds, and the workers went on pulling jobs off the queue the whole
+    // time. When the container's grace period ran out the process took SIGKILL
+    // mid-dispatch, leaving a message half-sent and its row saying QUEUED.
+    //
+    // Closing them first is the point: a worker that has stopped pulling cannot
+    // start work it will not be allowed to finish. `Worker.close()` waits for
+    // the jobs already in hand, so in-flight sends complete rather than being
+    // abandoned — which is the opposite of what the old ordering achieved.
+    //
+    // In parallel with `server.close()`, not before it: draining a worker and
+    // draining HTTP are independent, and doing them in sequence doubles the
+    // window in which the grace period can expire.
+    const stopAcceptingWork = Promise.all([
+      queue.close(),
+      eventQueue.close(),
+      slaWorker.close(),
+      deferralWorker.close(),
+      retentionWorker.close(),
+    ]).catch((error: unknown) => {
+      logger.error('a worker did not close cleanly', {
+        error: error instanceof Error ? error.message : String(error),
+      });
     });
+
+    const stopAcceptingRequests = new Promise<void>((resolve) => {
+      server.close(() => resolve());
+    });
+
+    void (async () => {
+      await Promise.all([stopAcceptingWork, stopAcceptingRequests]);
+      // Connections last: everything above uses them.
+      await redis.close();
+      await closeDb(pool, logger);
+      logger.info('shutdown complete');
+      process.exit(0);
+    })();
 
     // Don't hang forever on a stuck connection.
     setTimeout(() => {

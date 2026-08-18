@@ -7,6 +7,7 @@
  * `providers-service/src/services/template.service.ts` becomes an HTTP client
  * against this interface.
  */
+import type { TenantScope } from '../platform/db/tenant-scope.js';
 import type { ChannelType } from './channel.js';
 
 export interface TemplateRecord {
@@ -67,23 +68,42 @@ export interface TemplateVersionRecord {
   changeNote?: string | null;
 }
 
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * EVERY METHOD TAKES A SCOPE, NOT A TENANT ID.
+ *
+ * It used to take a bare `tenantId`, so a caller scoped to one location could
+ * read, edit, default and **delete** another location's templates by id. The
+ * delete is the sharp one: it cascades into `template_versions` (Seam A, D66).
+ *
+ * A `TenantScope` carries the optional `subTenantId`, and the store applies
+ * `tenantWhere(..., { includeShared: true })` — so a location sees its own
+ * templates AND the org-wide ones, which is the semantics that helper was
+ * written for and never used.
+ *
+ * `includeShared` is not a nicety here. `installTemplates` stamps
+ * `subTenantId: scope.subTenantId`, which is NULL for an org-wide pack install
+ * — so a plain equality filter would hide every pack template from every
+ * location-scoped user, which is the shape of fix a reader reaches for first.
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
 export interface TemplateStore {
   /** Accepts either a uuid or a pack key such as `medspa.reminder.sms`. */
-  get(tenantId: string, idOrKey: string): Promise<TemplateRecord | null>;
-  list(tenantId: string, filter?: TemplateFilter): Promise<TemplateRecord[]>;
-  create(tenantId: string, template: TemplateCreate, actor?: string): Promise<TemplateRecord>;
+  get(scope: TenantScope, idOrKey: string): Promise<TemplateRecord | null>;
+  list(scope: TenantScope, filter?: TemplateFilter): Promise<TemplateRecord[]>;
+  create(scope: TenantScope, template: TemplateCreate, actor?: string): Promise<TemplateRecord>;
   update(
-    tenantId: string,
+    scope: TenantScope,
     id: string,
     patch: TemplateUpdate,
     actor?: string,
   ): Promise<TemplateRecord>;
-  delete(tenantId: string, id: string): Promise<boolean>;
-  incrementUsage(tenantId: string, id: string): Promise<void>;
+  delete(scope: TenantScope, id: string): Promise<boolean>;
+  incrementUsage(scope: TenantScope, id: string): Promise<void>;
   /**
    * Marks one template default and clears the flag on its siblings — the same
    * `(tenant, channel, category)` group, **including when category is NULL**.
    */
-  setDefault(tenantId: string, id: string): Promise<TemplateRecord>;
-  versions(tenantId: string, templateId: string): Promise<TemplateVersionRecord[]>;
+  setDefault(scope: TenantScope, id: string): Promise<TemplateRecord>;
+  versions(scope: TenantScope, templateId: string): Promise<TemplateVersionRecord[]>;
 }

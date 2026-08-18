@@ -23,6 +23,30 @@ import type {
 } from '../../ports/channel.js';
 import { dryRunResult, failure, retryableForStatus, type ChannelDeps } from './base.js';
 
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * THIS ADAPTER CANNOT WORK, AND SAYS SO RATHER THAN PRETENDING
+ *
+ * `https://fcm.googleapis.com/fcm/send` is the FCM **legacy** HTTP API, which
+ * Google decommissioned in 2024. It is also unreachable: `fcmApiKey` has no
+ * entry in the config schema, `secretlessMapper` returned `{}` for this
+ * channel, and the composition root never passed one — so the credential this
+ * needs has no source anywhere in the service.
+ *
+ * Every test of it asserts the DRY-RUN path, which is why none of that showed.
+ *
+ * Two honest options: implement FCM v1 with per-tenant service-account
+ * credentials, or say it is not implemented. Ported code that calls a dead
+ * endpoint with a credential nobody can supply is the third option, and it is
+ * the one that costs somebody an afternoon at 3am.
+ *
+ * The adapter stays registered so `push` remains a valid channel in the data
+ * model — `recipient_preferences.push_opt_in` and the enum both reference it —
+ * and returns a permanent, named failure. `voice` and `letter` have never had
+ * an adapter at all and now answer the same way through the registry rather
+ * than a bare "no channel registered" 404.
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
 const FCM_ENDPOINT = 'https://fcm.googleapis.com/fcm/send';
 /** FCM rejects payloads over 4KB. */
 const FCM_MAX_PAYLOAD_BYTES = 4096;
@@ -63,9 +87,13 @@ export class PushChannel implements Channel {
 
     const apiKey = creds.values.fcmApiKey ?? this.deps.fcmApiKey;
     if (!apiKey) {
+      // Not retryable and not a configuration prompt a tenant can act on: there
+      // is no supported way to configure this today. Naming the reason is the
+      // whole value of the branch.
       return failure({
-        code: 'MISSING_FCM_KEY',
-        message: 'no FCM API key configured',
+        code: 'PUSH_NOT_IMPLEMENTED',
+        message:
+          'Push is not implemented: the adapter targets the FCM legacy API, decommissioned in 2024, and no credential path exists. Implement FCM v1 with per-tenant service-account credentials, or send on another channel.',
         retryable: false,
       });
     }

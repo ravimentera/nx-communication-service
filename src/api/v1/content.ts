@@ -9,7 +9,8 @@ import { z } from 'zod';
 
 import type { AssetService } from '../../engine/content/asset.service.js';
 import type { ContentGenerator } from '../../engine/content/generator.js';
-import { emptyContext, type RenderContext } from '../../engine/content/render-context.js';
+import type { IdentityResolver } from '../../engine/content/identity.js';
+import type { RenderContext } from '../../engine/content/render-context.js';
 import type { Renderer } from '../../engine/content/renderer.js';
 import type { PackRegistry } from '../../packs/loader.js';
 import type { ImageProvider } from '../../ports/image.js';
@@ -17,6 +18,7 @@ import { NotFoundError, ValidationError } from '../../platform/http/errors.js';
 import { Permission, requirePermissions, requireTenant } from '../../platform/http/auth.middleware.js';
 import { CHANNEL_TYPES } from '../../ports/channel.js';
 import type { TemplateStore } from '../../ports/template-store.js';
+import { requireUuidParams } from '../../platform/http/params.js';
 
 const contextSchema = z.object({
   recipient: z.record(z.unknown()).optional(),
@@ -65,6 +67,8 @@ export interface ContentApiDeps {
   renderer: Renderer;
   store: TemplateStore;
   generator: ContentGenerator;
+  /** Fills the `tenant` and `sender` namespaces the caller does not supply. */
+  identity: IdentityResolver;
   packs: PackRegistry;
   /**
    * P12. Optional so the P4-era tests that build this object without a storage
@@ -87,11 +91,23 @@ function handle(
   };
 }
 
-function buildContext(
+/**
+ * The caller's context, over the tenant and sender the engine resolved.
+ *
+ * Engine-resolved identity is the BASE and the caller's fields are spread over
+ * it, which is the same precedence the prompt assembler now enforces: a caller
+ * may add to `tenant` or `sender`, and an absent field falls back to the real
+ * row rather than to nothing.
+ */
+async function buildContext(
+  identity: IdentityResolver,
   tenantId: string,
   supplied: z.infer<typeof contextSchema> | undefined,
-): RenderContext {
-  const base = emptyContext(tenantId);
+): Promise<RenderContext> {
+  const base = await identity.baseContext(
+    { tenantId },
+    (supplied?.sender as { id?: string } | undefined)?.id,
+  );
   return {
     recipient: { ...base.recipient, ...(supplied?.recipient ?? {}) },
     sender: { ...base.sender, ...(supplied?.sender ?? {}) },
@@ -110,7 +126,8 @@ export function createContentRouter(deps: ContentApiDeps): Router {
   router.post(
     '/content/render',
     handle(async (req, res) => {
-      const { tenantId } = requireTenant(req);
+      const scope = requireTenant(req);
+      const { tenantId } = scope;
       const body = renderSchema.parse(req.body);
 
       let source = body.content;
@@ -118,7 +135,7 @@ export function createContentRouter(deps: ContentApiDeps): Router {
       let packId = body.packId;
 
       if (body.templateId) {
-        const template = await deps.store.get(tenantId, body.templateId);
+        const template = await deps.store.get(scope, body.templateId);
         if (!template) throw new NotFoundError(`Template '${body.templateId}' not found`);
         source = template.content;
         format = (body.format ?? template.format) as typeof format;
@@ -129,7 +146,7 @@ export function createContentRouter(deps: ContentApiDeps): Router {
         throw new ValidationError('Provide either templateId or content');
       }
 
-      const result = await deps.renderer.render(source, buildContext(tenantId, body.data), {
+      const result = await deps.renderer.render(source, await buildContext(deps.identity, tenantId, body.data), {
         format,
         aliases: deps.renderer.aliasesFor(packId),
       });
@@ -146,7 +163,8 @@ export function createContentRouter(deps: ContentApiDeps): Router {
     '/content/generate',
     requirePermissions(Permission.SEND),
     handle(async (req, res) => {
-      const { tenantId, subTenantId } = requireTenant(req);
+      const scope = requireTenant(req);
+      const { tenantId, subTenantId } = scope;
       const body = generateSchema.parse(req.body);
 
       const pack = deps.packs.prompt(body.promptPackKey);
@@ -163,7 +181,7 @@ export function createContentRouter(deps: ContentApiDeps): Router {
         channel: body.channel,
         playbookKey: body.playbookKey,
         playbookGoal: body.playbookGoal,
-        context: buildContext(tenantId, body.data),
+        context: await buildContext(deps.identity, tenantId, body.data),
         overrides: body.overrides,
       });
 
@@ -176,8 +194,8 @@ export function createContentRouter(deps: ContentApiDeps): Router {
   router.get(
     '/templates',
     handle(async (req, res) => {
-      const { tenantId } = requireTenant(req);
-      const templates = await deps.store.list(tenantId, {
+      const scope = requireTenant(req);
+      const templates = await deps.store.list(scope, {
         channel: req.query.channel as string | undefined,
         category: req.query.category as string | undefined,
         templateType: req.query.templateType as string | undefined,
@@ -192,10 +210,11 @@ export function createContentRouter(deps: ContentApiDeps): Router {
     '/templates',
     requirePermissions(Permission.TEMPLATES_WRITE),
     handle(async (req, res) => {
-      const { tenantId, subTenantId } = requireTenant(req);
+      const scope = requireTenant(req);
+      const { subTenantId } = scope;
       const body = templateBodySchema.parse(req.body);
       const created = await deps.store.create(
-        tenantId,
+        scope,
         {
           ...body,
           subTenantId,
@@ -213,21 +232,30 @@ export function createContentRouter(deps: ContentApiDeps): Router {
   router.get(
     '/templates/:id',
     handle(async (req, res) => {
-      const { tenantId } = requireTenant(req);
-      const template = await deps.store.get(tenantId, req.params.id as string);
+      const scope = requireTenant(req);
+      const template = await deps.store.get(scope, req.params.id as string);
       if (!template) throw new NotFoundError(`Template '${req.params.id}' not found`);
       res.json(template);
     }),
   );
 
+  // ── uuid-only, unlike their GET sibling ───────────────────────────────────
+  //
+  // `store.get` accepts an id OR a key and branches on the shape, so a non-uuid
+  // on `GET /templates/:id` and `POST /templates/:id/render` is a legitimate
+  // key lookup and must reach the store. `update`, `delete`, `setDefault` and
+  // `versions` take the value straight to a `uuid` column, so the same input
+  // there was a 500. Guarded per route rather than on the router for exactly
+  // that reason (params.ts).
   router.put(
     '/templates/:id',
+    requireUuidParams('id'),
     requirePermissions(Permission.TEMPLATES_WRITE),
     handle(async (req, res) => {
-      const { tenantId } = requireTenant(req);
+      const scope = requireTenant(req);
       const patch = templateBodySchema.partial().parse(req.body);
       const updated = await deps.store.update(
-        tenantId,
+        scope,
         req.params.id as string,
         patch,
         req.identity?.userId,
@@ -238,10 +266,11 @@ export function createContentRouter(deps: ContentApiDeps): Router {
 
   router.delete(
     '/templates/:id',
+    requireUuidParams('id'),
     requirePermissions(Permission.TEMPLATES_WRITE),
     handle(async (req, res) => {
-      const { tenantId } = requireTenant(req);
-      const deleted = await deps.store.delete(tenantId, req.params.id as string);
+      const scope = requireTenant(req);
+      const deleted = await deps.store.delete(scope, req.params.id as string);
       if (!deleted) throw new NotFoundError(`Template '${req.params.id}' not found`);
       res.status(204).end();
     }),
@@ -249,38 +278,41 @@ export function createContentRouter(deps: ContentApiDeps): Router {
 
   router.post(
     '/templates/:id/default',
+    requireUuidParams('id'),
     requirePermissions(Permission.TEMPLATES_WRITE),
     handle(async (req, res) => {
-      const { tenantId } = requireTenant(req);
-      res.json(await deps.store.setDefault(tenantId, req.params.id as string));
+      const scope = requireTenant(req);
+      res.json(await deps.store.setDefault(scope, req.params.id as string));
     }),
   );
 
   router.get(
     '/templates/:id/versions',
+    requireUuidParams('id'),
     handle(async (req, res) => {
-      const { tenantId } = requireTenant(req);
-      res.json({ versions: await deps.store.versions(tenantId, req.params.id as string) });
+      const scope = requireTenant(req);
+      res.json({ versions: await deps.store.versions(scope, req.params.id as string) });
     }),
   );
 
   router.post(
     '/templates/:id/render',
     handle(async (req, res) => {
-      const { tenantId } = requireTenant(req);
-      const template = await deps.store.get(tenantId, req.params.id as string);
+      const scope = requireTenant(req);
+      const { tenantId } = scope;
+      const template = await deps.store.get(scope, req.params.id as string);
       if (!template) throw new NotFoundError(`Template '${req.params.id}' not found`);
 
       const body = renderSchema.parse({ ...req.body, templateId: template.id });
       const result = await deps.renderer.render(
         template.content,
-        buildContext(tenantId, body.data),
+        await buildContext(deps.identity, tenantId, body.data),
         {
           format: template.format as 'TEXT' | 'HTML' | 'MARKDOWN' | 'MJML',
           aliases: deps.renderer.aliasesFor(template.packId),
         },
       );
-      await deps.store.incrementUsage(tenantId, template.id);
+      await deps.store.incrementUsage(scope, template.id);
       res.json({ output: result.output, format: result.format, warnings: result.warnings });
     }),
   );

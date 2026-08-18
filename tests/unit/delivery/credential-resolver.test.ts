@@ -230,7 +230,20 @@ describe('level 4 — nothing configured', () => {
 });
 
 describe('caching', () => {
-  it('does not re-read config for a repeated resolve', async () => {
+  /**
+   * The resolver deliberately does NOT cache.
+   *
+   * It used to write the resolved credential — decrypted and ready to use — to
+   * Redis. `0013` seals credentials at rest in Postgres, and this put the
+   * cleartext into a second store with its own access rules and backups.
+   * Sealing one copy while caching another is not encryption at rest.
+   *
+   * The cost of removing it is one Redis GET plus a decrypt instead of one
+   * Redis GET: `ChannelConfigService` caches both config rows AS STORED, so the
+   * rows are still cached and still sealed. This test now pins the read
+   * reaching the config service, which is where the caching belongs.
+   */
+  it('delegates to the config service on every resolve, so no plaintext is cached', async () => {
     let tenantReads = 0;
     const service = {
       getTenantConfig: async () => {
@@ -248,10 +261,12 @@ describe('caching', () => {
     const resolver = await resolverFor(service);
     await resolver.resolve('sms', { tenantId: 't1' });
     await resolver.resolve('sms', { tenantId: 't1' });
-    expect(tenantReads).toBe(1);
+    // Two calls, two reads — of the config service, whose own cache is what
+    // makes that cheap and which stores the row still encrypted.
+    expect(tenantReads).toBe(2);
   });
 
-  it('keys the cache by sender, so two agents do not share a from', async () => {
+  it('resolves per sender, so two agents do not share a from', async () => {
     const resolver = await resolverFor(
       configs(
         tenantConfig({

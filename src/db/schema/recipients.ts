@@ -16,6 +16,7 @@ import {
   pgTable,
   text,
   unique,
+  uniqueIndex,
   uuid,
 } from 'drizzle-orm/pg-core';
 
@@ -76,7 +77,18 @@ export const consentRecords = pgTable(
     updatedAt: updatedAt(),
   },
   (t) => [
-    index('idx_consent_recipient_channel').on(t.tenantId, t.recipientId, t.channel),
+    // Load-bearing, not a lookup aid: it is what every consent write's
+    // ON CONFLICT targets, and what makes a revocation win over an older grant
+    // rather than sitting beside it. Added in 0015 alongside the first writer.
+    uniqueIndex('consent_records_recipient_channel_unique').on(
+      t.tenantId,
+      t.recipientId,
+      t.channel,
+    ),
+    // The gate's own predicate, which is on the hot path of every send once
+    // enforcement is switched on. Partial — declared in 0015, and the `WHERE`
+    // is not expressible here.
+    index('idx_consent_active').on(t.tenantId, t.recipientId, t.channel),
   ],
 );
 

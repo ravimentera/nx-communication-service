@@ -25,7 +25,7 @@
  * reason, counted, and written by the dispatcher as a `SUPPRESSED` message row.
  * ─────────────────────────────────────────────────────────────────────────────
  */
-import { and, eq, gte, isNull, sql } from 'drizzle-orm';
+import { and, eq, gte, inArray, isNull, sql } from 'drizzle-orm';
 import type { Logger } from 'winston';
 
 import type { Db } from '../../db/index.js';
@@ -133,6 +133,24 @@ export interface ComplianceGateDeps {
   }) => Promise<string[]>;
 }
 
+/**
+ * Message statuses that represent capacity actually used.
+ *
+ * QUEUED counts because it is on its way and double-counting a send in flight
+ * is the safe direction; SUPPRESSED, FAILED and CANCELLED do not, because
+ * nothing was sent and nobody received anything.
+ */
+const CONSUMES_QUOTA = ['QUEUED', 'SENT', 'DELIVERED'];
+
+/**
+ * What a tenant with no `tenant_channel_configs` row gets.
+ *
+ * Mirrors the column's own `NOT NULL DEFAULT true`. Named rather than inlined
+ * so the two cannot drift: if the column's default ever changes, this is the
+ * line that has to change with it.
+ */
+const REQUIRE_OPT_IN_DEFAULT = true;
+
 export class ComplianceGate {
   constructor(private readonly deps: ComplianceGateDeps) {}
 
@@ -214,10 +232,24 @@ export class ComplianceGate {
     if (!this.deps.preferences.channelAllowed(prefs, input.channel)) {
       return this.block('CHANNEL_OPTED_OUT');
     }
-    // GDPR widens this: marketing needs a consent record whatever the tenant's
-    // `require_opt_in` column says, because under GDPR consent is the lawful
-    // basis rather than a tenant preference.
-    if (recipientId && (tenantConfig?.requireOptIn || gdprRequiresConsent(profile, input))) {
+    // ── A MISSING CONFIG MEANS THE COLUMN'S DEFAULT, NOT `false` ────────────
+    //
+    // `require_opt_in` is `NOT NULL DEFAULT true`, so every row that exists
+    // says opt-in is required. `loadTenantConfig()` returns null for a tenant
+    // with no row at all, and `tenantConfig?.requireOptIn` made that `undefined`
+    // — falsy — so the ONE tenant state that has never been configured was the
+    // one that skipped the check entirely.
+    //
+    // That is backwards in the direction that matters: a brand-new tenant, the
+    // least likely to have consent records or a considered policy, got the
+    // most permissive treatment, and it contradicted what the schema promises
+    // anyone reading it.
+    //
+    // GDPR widens this again: marketing needs a consent record whatever the
+    // column says, because there consent is the lawful basis rather than a
+    // tenant preference.
+    const requireOptIn = tenantConfig?.requireOptIn ?? REQUIRE_OPT_IN_DEFAULT;
+    if (recipientId && (requireOptIn || gdprRequiresConsent(profile, input))) {
       const consented = await this.hasConsent(scope, recipientId, input.channel);
       if (!consented) return this.block('CONSENT_REQUIRED');
     }
@@ -232,6 +264,11 @@ export class ComplianceGate {
       const quiet = this.deps.preferences.quietHoursFor(
         prefs,
         recipient?.timezone ?? tenantRow?.timezone ?? undefined,
+        // The tenant's own default window, which applies when the recipient has
+        // expressed nothing. Almost nobody has — a freshly imported lead list
+        // has no preference rows at all — so without this the courtesy window
+        // was off for exactly the audiences most likely to get a bulk send.
+        tenantQuietHours(tenantRow?.settings),
       );
       if (quiet.configured && quiet.inQuietHours) {
         return { allow: false, reason: 'QUIET_HOURS', deferrable: true, retryAt: quiet.endsAt };
@@ -363,7 +400,11 @@ export class ComplianceGate {
 
   private async loadTenant(tenantId: string) {
     const [row] = await this.deps.db
-      .select({ timezone: tenants.timezone, complianceProfile: tenants.complianceProfile })
+      .select({
+        timezone: tenants.timezone,
+        complianceProfile: tenants.complianceProfile,
+        settings: tenants.settings,
+      })
       .from(tenants)
       .where(eq(tenants.id, tenantId))
       .limit(1);
@@ -413,6 +454,21 @@ export class ComplianceGate {
     return null;
   }
 
+  /**
+   * Messages that actually consumed capacity.
+   *
+   * ───────────────────────────────────────────────────────────────────────────
+   * A SUPPRESSED MESSAGE COSTS NOTHING AND MUST NOT COUNT
+   *
+   * This had no status predicate, so every row counted — including the
+   * SUPPRESSED ones the gate itself had just refused. A tenant near its limit
+   * therefore entered a spiral: suppressions filled the window, the window
+   * suppressed more, and each suppression made the next one likelier. Nothing
+   * was sent and the quota stayed full.
+   *
+   * FAILED rows are excluded for the same reason: a message the provider
+   * rejected consumed no send. CANCELLED never left either.
+   */
   private async countSent(scope: TenantScope, channel: ChannelType, since: Date): Promise<number> {
     const [row] = await this.deps.db
       .select({ count: sql<number>`count(*)::int` })
@@ -423,6 +479,7 @@ export class ComplianceGate {
           eq(messages.channel, channel),
           eq(messages.direction, 'outbound'),
           gte(messages.createdAt, since),
+          inArray(messages.status, CONSUMES_QUOTA),
         ),
       );
     return row?.count ?? 0;
@@ -446,6 +503,10 @@ export class ComplianceGate {
             eq(messages.recipientId, recipientId),
             eq(messages.direction, 'outbound'),
             gte(messages.createdAt, since),
+            // A suppression is not a message this recipient received, and
+            // counting it burned their daily allowance without them hearing
+            // from anyone.
+            inArray(messages.status, CONSUMES_QUOTA),
           ),
         );
       if ((row?.count ?? 0) >= maxPerRecipientPerDay) return true;
@@ -462,6 +523,7 @@ export class ComplianceGate {
             eq(messages.recipientId, recipientId),
             eq(messages.direction, 'outbound'),
             gte(messages.createdAt, since),
+            inArray(messages.status, CONSUMES_QUOTA),
             sql`${messages.metadata}->>'playbookKey' = ${input.playbookKey}`,
           ),
         );
@@ -470,4 +532,29 @@ export class ComplianceGate {
 
     return false;
   }
+}
+
+/**
+ * `tenants.settings.quietHours` — the tenant's default window.
+ *
+ * Read defensively: `settings` is free-form JSONB an operator edits, and a
+ * malformed window must not throw on the send path. A partial or unparseable
+ * value means "no default", which is the behaviour every tenant had before.
+ */
+function tenantQuietHours(
+  settings: unknown,
+): { start?: string; end?: string; timezone?: string } | null {
+  const quiet = (settings as { quietHours?: unknown } | null)?.quietHours;
+  if (!quiet || typeof quiet !== 'object') return null;
+
+  const { start, end, timezone } = quiet as Record<string, unknown>;
+  const isTime = (v: unknown): v is string =>
+    typeof v === 'string' && /^([01]?\d|2[0-3]):[0-5]\d$/.test(v);
+
+  if (!isTime(start) || !isTime(end)) return null;
+  return {
+    start,
+    end,
+    ...(typeof timezone === 'string' && timezone ? { timezone } : {}),
+  };
 }

@@ -11,18 +11,20 @@ import { join } from 'node:path';
 
 import { baselineMigrations } from '../helpers/migrations.js';
 
-import { and, eq } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { Client } from 'pg';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import winston from 'winston';
 
 import { createDb, type Db } from '../../src/db/index.js';
 import {
+  approvalPolicies,
   approvals,
   messages,
   playbookRuns,
   playbooks,
   recipients,
+  templates,
   tenantPacks,
   tenants,
 } from '../../src/db/schema.js';
@@ -31,6 +33,7 @@ import { PolicyService } from '../../src/engine/approvals/policy.service.js';
 import { ComplianceGate } from '../../src/engine/compliance/gate.js';
 import { PreferenceService } from '../../src/engine/compliance/preference.service.js';
 import { ContentGenerator } from '../../src/engine/content/generator.js';
+import { IdentityResolver } from '../../src/engine/content/identity.js';
 import { PromptAssembler } from '../../src/engine/content/prompt-assembler.js';
 import { Renderer } from '../../src/engine/content/renderer.js';
 import { DrizzleTemplateStore } from '../../src/engine/content/store.js';
@@ -44,6 +47,38 @@ import type { OutreachTrigger } from '../../src/engine/playbooks/trigger.js';
 import { RecipientService } from '../../src/engine/recipients/recipient.service.js';
 import { loadPacks } from '../../src/packs/loader.js';
 import type { Channel, ChannelRegistry, ChannelType } from '../../src/ports/channel.js';
+import { SWITCH_CASES } from '../contract/medspa-parity.test.js';
+
+/**
+ * Every field any of the seventeen playbooks' contracts requires, in one bag.
+ *
+ * A single context for all of them rather than one per family: what is under
+ * test is SELECTION — which playbook, which channels, which approval — and a
+ * per-family fixture would drift from the contracts without anything noticing.
+ * A contract violation fails the run loudly, so a missing field here shows up
+ * as a FAILED status rather than a false pass.
+ */
+const PARITY_CONTEXT: Record<string, unknown> = {
+  appointmentDate: 'Tuesday 9 March',
+  appointmentTime: '09:00',
+  oldDate: 'Monday 8 March',
+  newDate: 'Tuesday 9 March',
+  location: 'Suite 2',
+  provider: 'Dr Byron',
+  doctorName: 'Dr Byron',
+  treatmentName: 'Hydrafacial',
+  treatmentDate: '2026-03-09',
+  // An OBJECT, not a string. `medspa.treatment-instructions` requires it that
+  // way, because the source used `instructions` as an object for the email and
+  // read `instructions.summary` for the SMS — the same payload working on one
+  // channel and throwing on the other, which the contract now names.
+  instructions: { summary: 'Rest and hydrate.', detail: 'Avoid direct sun for 48h.' },
+  message: 'A message body',
+  subject: 'A subject',
+  feedbackUrl: 'https://example.test/feedback',
+  offer: 'Spring offer',
+  campaignName: 'Spring',
+};
 
 const logger = winston.createLogger({ silent: true });
 const TENANT = 't-pb';
@@ -54,7 +89,13 @@ let pool: ReturnType<typeof createDb>['pool'];
 let db: Db;
 let runtime: PlaybookRuntime;
 let registry: PlaybookRegistry;
-let sent: { channel: string; to: string; body: string; messageId: string }[] = [];
+let sent: {
+  channel: string;
+  to: string;
+  body: string;
+  messageId: string;
+  priority: string;
+}[] = [];
 
 const packs = loadPacks(join(process.cwd(), 'packs'), logger);
 
@@ -79,6 +120,7 @@ const queue: NotificationQueue = {
       to: job.to.value,
       body: job.rendered.body,
       messageId: job.messageId,
+      priority: job.priority,
     });
     return { queued: true, jobId: `job-${sent.length}` };
   },
@@ -175,6 +217,7 @@ beforeAll(async () => {
       assembler: new PromptAssembler(renderer),
       logger,
     }),
+    identity: new IdentityResolver({ db, logger }),
     approvals: new ApprovalService({ db, logger, policies, dispatcher }),
     policies,
     dispatcher,
@@ -319,6 +362,152 @@ describe('installing the medspa pack', () => {
   });
 });
 
+describe('uninstall and reinstall', () => {
+  /**
+   * Uninstall set `playbooks.is_active = false` as well as deactivating the
+   * pack. Reinstall skips rows that already exist, and even
+   * `overwriteCustomized`'s upsert omitted `is_active` from its SET — so the
+   * cycle left every playbook permanently inactive. Install reported success,
+   * `GET /v1/packs` showed the pack present, and every event went UNMATCHED
+   * with nothing anywhere saying why.
+   *
+   * The pack row alone is sufficient: the matcher requires an active
+   * `tenant_packs` entry, so flipping the playbooks was redundant — with a
+   * one-way ratchet attached.
+   */
+  it('leaves a tenant’s playbooks working after a round trip', async () => {
+    const fresh = { tenantId: 't-pb-cycle' };
+    await db.insert(tenants).values({ id: fresh.tenantId, name: 'Cycle' });
+    await registry.installPack(fresh, 'medspa', {
+      config: {
+        emergencyContacts: ['ops@clinic.test'],
+        slackChannels: { staffAlerts: '#s', emergencyAlerts: '#e', systemAlerts: '#y' },
+      },
+    });
+
+    const activeBefore = (await registry.listPlaybooks(fresh, { active: true })).length;
+    expect(activeBefore).toBeGreaterThan(0);
+
+    await registry.uninstallPack(fresh, 'medspa');
+
+    // Uninstalled means unreachable — the pack row is what the matcher checks.
+    expect(
+      await runtime.run({
+        type: 'event',
+        tenantId: fresh.tenantId,
+        eventType: 'APPOINTMENT_REMINDER',
+        payload: {},
+        correlationId: `cycle-off-${Math.random()}`,
+      }),
+    ).toHaveLength(0);
+
+    await registry.installPack(fresh, 'medspa', {
+      config: {
+        emergencyContacts: ['ops@clinic.test'],
+        slackChannels: { staffAlerts: '#s', emergencyAlerts: '#e', systemAlerts: '#y' },
+      },
+    });
+
+    // The same playbooks are active again, and matching again.
+    expect((await registry.listPlaybooks(fresh, { active: true })).length).toBe(activeBefore);
+
+    const recipient = await db
+      .insert(recipients)
+      .values({
+        tenantId: fresh.tenantId,
+        externalRef: { system: 'test', id: 'cycle-r' },
+        displayName: 'Ada',
+        contactPoints: [{ type: 'sms', value: '+15550001111' }],
+      })
+      .returning();
+
+    const results = await runtime.run({
+      type: 'event',
+      tenantId: fresh.tenantId,
+      eventType: 'APPOINTMENT_REMINDER',
+      channels: ['sms'],
+      recipientId: recipient[0]!.id,
+      payload: { context: { appointmentDate: 'Tuesday' } },
+      correlationId: `cycle-on-${Math.random()}`,
+    });
+    expect(results).toHaveLength(1);
+    expect(results[0]!.status).toBe('QUEUED');
+  });
+
+  /**
+   * A tenant that deliberately switched a playbook off keeps it off. AI
+   * playbooks ship inactive and are enabled one at a time; a reinstall that
+   * blanket-reactivated would silently start sending model-written messages
+   * nobody re-approved.
+   */
+  /**
+   * The overwrite path ended in `onConflictDoNothing()` and incremented its
+   * count regardless — so a pack shipping a corrected `sla.onExpiry` or a
+   * tightened `rights.bulk` never reached a tenant that already had the policy,
+   * and the install result said it had.
+   */
+  it('overwriteCustomized actually updates an approval policy', async () => {
+    const fresh = { tenantId: 't-pb-policy' };
+    await db.insert(tenants).values({ id: fresh.tenantId, name: 'Policy' });
+    const config = {
+      emergencyContacts: ['ops@clinic.test'],
+      slackChannels: { staffAlerts: '#s', emergencyAlerts: '#e', systemAlerts: '#y' },
+    };
+    await registry.installPack(fresh, 'medspa', { config });
+
+    // Stand in for a tenant edit, or for the previous version of the pack.
+    await db
+      .update(approvalPolicies)
+      .set({ mode: 'none', rights: { bulk: false }, name: 'Stale name' })
+      .where(
+        and(
+          eq(approvalPolicies.tenantId, fresh.tenantId),
+          eq(approvalPolicies.key, 'medspa.provider-always'),
+        ),
+      );
+
+    await registry.installPack(fresh, 'medspa', { config, overwriteCustomized: true });
+
+    const [after] = await db
+      .select({
+        mode: approvalPolicies.mode,
+        rights: approvalPolicies.rights,
+        name: approvalPolicies.name,
+      })
+      .from(approvalPolicies)
+      .where(
+        and(
+          eq(approvalPolicies.tenantId, fresh.tenantId),
+          eq(approvalPolicies.key, 'medspa.provider-always'),
+        ),
+      );
+
+    // The pack's own values are back, which is what "overwrite" was reporting
+    // while doing nothing at all.
+    expect(after!.mode).toBe('always');
+    expect(after!.name).toBe('Provider approves everything');
+    expect(after!.rights).toMatchObject({ bulk: true, approve: true });
+  });
+
+  it('does not resurrect a playbook the tenant turned off', async () => {
+    const fresh = { tenantId: 't-pb-choice' };
+    await db.insert(tenants).values({ id: fresh.tenantId, name: 'Choice' });
+    const config = {
+      emergencyContacts: ['ops@clinic.test'],
+      slackChannels: { staffAlerts: '#s', emergencyAlerts: '#e', systemAlerts: '#y' },
+    };
+    await registry.installPack(fresh, 'medspa', { config });
+
+    await registry.setActive(fresh, 'medspa.appointment-reminder', false);
+    await registry.installPack(fresh, 'medspa', { config, overwriteCustomized: true });
+
+    const [row] = await registry.listPlaybooks(fresh, { packId: 'medspa' }).then((rows) =>
+      rows.filter((r) => r.key === 'medspa.appointment-reminder'),
+    );
+    expect(row!.isActive).toBe(false);
+  });
+});
+
 describe('an APPOINTMENT_REMINDER, end to end', () => {
   it('produces the same two channels the switch produced', async () => {
     const recipient = await makeRecipient([
@@ -366,6 +555,38 @@ describe('an APPOINTMENT_REMINDER, end to end', () => {
     expect(sms.body.length).toBeLessThan(email.body.length);
   });
 
+  /**
+   * The assertion this suite was missing, and the reason a defect that made
+   * every message in the system unsigned went unnoticed through six phases.
+   *
+   * 23 of the 27 medspa templates interpolate `{{tenant.name}}`. The runtime
+   * built its context from `emptyContext()`, which sets `tenant: {id}` and
+   * nothing else, so the clinic's name resolved to the empty string and every
+   * SMS ended `— `. Every test here asserted on the *caller's* context, which
+   * was populated, so all of them passed.
+   */
+  it('signs the message with the tenant’s name, not an empty string', async () => {
+    const recipient = await makeRecipient([
+      { type: 'email', value: 'ada@example.test' },
+      { type: 'sms', value: '+15551234567' },
+    ]);
+
+    await runtime.run(
+      trigger({
+        recipientId: recipient.id,
+        payload: { context: { appointmentDate: 'Tuesday', doctorName: 'Dr Byron' } },
+      }),
+    );
+
+    expect(sent.length).toBeGreaterThan(0);
+    for (const message of sent) {
+      expect(message.body).toContain('Clinic');
+      // The shape of the failure, pinned so a regression is unambiguous: a
+      // dangling separator is what a blank `{{tenant.name}}` leaves behind.
+      expect(message.body).not.toMatch(/—\s*$/);
+    }
+  });
+
   it('honours the caller’s channel choice, as every switch case did', async () => {
     const recipient = await makeRecipient([
       { type: 'email', value: 'ada@example.test' },
@@ -410,6 +631,199 @@ describe('an APPOINTMENT_REMINDER, end to end', () => {
     const opened = await db.select().from(approvals).where(eq(approvals.tenantId, TENANT));
     expect(opened).toHaveLength(0);
   });
+});
+
+/**
+ * The shapes real callers actually send.
+ *
+ * Three of them exist and none agreed with the contract. `scheduling-service`
+ * — the only service posting these events, repointed in P10 — sends
+ * `startTime` / `oldStartTime` / `newStartTime`
+ * (`notification.service.ts:86,112,148,175`). The deleted source read a nested
+ * `appointmentDetails.date` / `oldAppointment.date`. The contract asks for
+ * `appointmentDate` / `oldDate` / `newDate`.
+ *
+ * Before `contextMapping`, every appointment event from the live caller failed
+ * its contract on arrival: a FAILED run, no message, no reminder. Renaming the
+ * contract would have picked one caller and broken the other two.
+ */
+describe('the field names a caller actually sends', () => {
+  it('accepts scheduling-service’s startTime for a contract that asks for appointmentDate', async () => {
+    const recipient = await makeRecipient([{ type: 'sms', value: '+15551234567' }]);
+
+    const results = await runtime.run(
+      trigger({
+        recipientId: recipient.id,
+        channels: ['sms'],
+        // Verbatim from notification.service.ts:112.
+        payload: {
+          context: { startTime: 'Tuesday 9 March, 09:00', type: 'consultation', location: 'Suite 2' },
+        },
+      }),
+    );
+
+    expect(results[0]).toMatchObject({
+      playbookKey: 'medspa.appointment-reminder',
+      status: 'QUEUED',
+    });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.body).toContain('Tuesday 9 March');
+  });
+
+  it('still prefers the contract’s own name when the caller sends it', async () => {
+    const recipient = await makeRecipient([{ type: 'sms', value: '+15551234567' }]);
+
+    await runtime.run(
+      trigger({
+        recipientId: recipient.id,
+        channels: ['sms'],
+        // Both spellings. The explicit one wins — a mapping fills gaps, it does
+        // not override what the caller actually said.
+        payload: {
+          context: { appointmentDate: 'Wednesday', startTime: 'Tuesday' },
+        },
+      }),
+    );
+
+    expect(sent[0]!.body).toContain('Wednesday');
+    expect(sent[0]!.body).not.toContain('Tuesday');
+  });
+
+  it('accepts the source’s nested appointmentDetails shape too', async () => {
+    const recipient = await makeRecipient([{ type: 'sms', value: '+15551234567' }]);
+
+    await runtime.run(
+      trigger({
+        recipientId: recipient.id,
+        channels: ['sms'],
+        payload: { context: { appointmentDetails: { date: 'Friday', location: 'Suite 1' } } },
+      }),
+    );
+
+    expect(sent[0]!.body).toContain('Friday');
+  });
+
+  it('maps the rescheduling pair, which the source read with no guard at all', async () => {
+    const recipient = await makeRecipient([{ type: 'email', value: 'ada@example.test' }]);
+
+    const results = await runtime.run(
+      trigger({
+        eventType: 'APPOINTMENT_RESCHEDULING',
+        recipientId: recipient.id,
+        channels: ['email'],
+        // notification.service.ts:175.
+        payload: {
+          context: {
+            oldStartTime: 'Monday 10:00',
+            newStartTime: 'Thursday 14:00',
+            newEndTime: 'Thursday 15:00',
+            type: 'follow-up',
+            location: 'Suite 2',
+          },
+        },
+      }),
+    );
+
+    expect(results[0]).toMatchObject({
+      playbookKey: 'medspa.appointment-rescheduling',
+      status: 'QUEUED',
+    });
+    expect(sent[0]!.body).toContain('Monday 10:00');
+    expect(sent[0]!.body).toContain('Thursday 14:00');
+  });
+});
+
+describe('priority rules', () => {
+  /**
+   * `medspa.system-alert` documented "URGENT when severity is CRITICAL" — the
+   * source applied it at :716 — and nothing implemented it, so a critical alert
+   * queued at MEDIUM behind every appointment reminder.
+   */
+  it('escalates a CRITICAL system alert to URGENT', async () => {
+    await runtime.run(
+      trigger({
+        eventType: 'SYSTEM_ALERT',
+        payload: { context: { message: 'disk full', severity: 'CRITICAL' } },
+      }),
+    );
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.priority).toBe('URGENT');
+  });
+
+  it('leaves a non-critical one at the default', async () => {
+    await runtime.run(
+      trigger({
+        eventType: 'SYSTEM_ALERT',
+        payload: { context: { message: 'nightly backup done', severity: 'INFO' } },
+      }),
+    );
+
+    expect(sent[0]!.priority).toBe('MEDIUM');
+  });
+});
+
+/**
+ * The parity table, executed.
+ *
+ * `tests/contract/medspa-parity.test.ts` reads the pack JSON and compares it to
+ * a table transcribed from `enhanced-event-handler.ts` line by line. That
+ * proves the pack SAYS the right thing. It never starts the engine, so a
+ * matcher that dropped a channel, a trigger whose predicate never fires, or a
+ * template that failed to install would all pass it.
+ *
+ * This drives one real run per PATIENT-directed event family from that same
+ * table — same source of truth, so a row edited there changes what the engine
+ * is asserted to do rather than only what the JSON is asserted to contain.
+ *
+ * Staff- and fixed-target families are excluded here: they resolve their
+ * destination from `$config`, which the suite covers separately above, and
+ * they have no recipient to hang a contact point on.
+ */
+describe('the switch cases, run through the engine', () => {
+  const PATIENT_CASES = SWITCH_CASES.filter((c) => c.recipient === 'patient');
+
+  it('covers every patient-directed family', () => {
+    // Guards the filter: a table row retyped from 'patient' to something else
+    // would otherwise silently drop a family from this suite.
+    expect(PATIENT_CASES.length).toBeGreaterThanOrEqual(11);
+  });
+
+  it.each(PATIENT_CASES.map((c) => [c.eventType, c] as const))(
+    '%s fires its playbook on exactly its channels',
+    async (_eventType, testCase) => {
+      const recipient = await makeRecipient([
+        { type: 'email', value: 'parity@example.test' },
+        { type: 'sms', value: '+15557654321' },
+      ]);
+
+      const results = await runtime.run(
+        trigger({
+          eventType: testCase.eventType,
+          recipientId: recipient.id,
+          // No `channels`, so the playbook's own plan decides — which is what
+          // the parity table describes.
+          payload: { context: PARITY_CONTEXT },
+        }),
+      );
+
+      expect(results.map((r) => r.playbookKey)).toEqual([testCase.playbook]);
+      expect(results[0]!.status).toBe('QUEUED');
+
+      // The channel SET the source produced, no more and no less. A channel
+      // silently added is a message the recipient did not get before; one
+      // silently dropped is one they stop getting.
+      expect(sent.map((s) => s.channel).sort()).toEqual([...testCase.channels].sort());
+
+      // And it sent immediately, with no approval — D53, the regression that
+      // would stop every appointment reminder at cutover.
+      const opened = await db
+        .select({ id: approvals.id })
+        .from(approvals)
+        .where(and(eq(approvals.tenantId, TENANT), inArray(approvals.messageId, results[0]!.messageIds)));
+      expect(opened).toHaveLength(0);
+    },
+  );
 });
 
 describe('the data contract', () => {
@@ -460,6 +874,127 @@ describe('idempotency', () => {
     expect(first[0]!.status).toBe('QUEUED');
     expect(second[0]).toMatchObject({ status: 'SKIPPED', reason: expect.stringMatching(/already ran/) });
     expect(sent).toHaveLength(1);
+  });
+});
+
+/**
+ * Redelivery under concurrency, which the "a redelivered event does not send
+ * twice" test above does not exercise — it delivers twice in sequence, and the
+ * old check-then-act guard handled that fine.
+ *
+ * The defect was the gap between reading `playbook_runs` and writing it at the
+ * very end: BullMQ concurrency above 1, a stalled-job reclaim, or a crash
+ * between the dispatch and the insert all put two deliveries inside it, and
+ * both sent. The unique index deduped the bookkeeping and not the sends.
+ */
+describe('concurrent redelivery', () => {
+  it('sends once when the same event arrives twice at the same moment', async () => {
+    const recipient = await makeRecipient([{ type: 'sms', value: '+15559990000' }]);
+    const t = trigger({
+      recipientId: recipient.id,
+      channels: ['sms'],
+      idempotencyKey: 'concurrent-key-1',
+      payload: { context: { appointmentDate: 'Tuesday' } },
+    });
+
+    const [a, b] = await Promise.all([runtime.run(t), runtime.run(t)]);
+
+    // Exactly one message, however the two runs interleaved.
+    expect(sent).toHaveLength(1);
+
+    // One ran; the other stood down and said why.
+    const statuses = [a[0]!.status, b[0]!.status].sort();
+    expect(statuses).toEqual(['QUEUED', 'SKIPPED']);
+    const skipped = [...a, ...b].find((r) => r.status === 'SKIPPED')!;
+    expect(skipped.reason).toMatch(/already ran/);
+
+    // And one run row, not two.
+    const runs = await db
+      .select({ id: playbookRuns.id, status: playbookRuns.status })
+      .from(playbookRuns)
+      .where(
+        and(eq(playbookRuns.tenantId, TENANT), eq(playbookRuns.idempotencyKey, 'concurrent-key-1')),
+      );
+    expect(runs).toHaveLength(1);
+    expect(runs[0]!.status).toBe('QUEUED');
+  });
+
+  it('populates runId on the success path, not only when skipping', async () => {
+    const recipient = await makeRecipient([{ type: 'sms', value: '+15559990001' }]);
+    const [result] = await runtime.run(
+      trigger({
+        recipientId: recipient.id,
+        channels: ['sms'],
+        payload: { context: { appointmentDate: 'Tuesday' } },
+      }),
+    );
+
+    // It was set only on the already-ran branch, so a caller could not follow
+    // a run it had just started.
+    expect(result!.runId).toBeDefined();
+    const [row] = await db
+      .select({ status: playbookRuns.status })
+      .from(playbookRuns)
+      .where(eq(playbookRuns.id, result!.runId as string));
+    expect(row!.status).toBe('QUEUED');
+  });
+});
+
+describe('a channel that fails mid-fan-out', () => {
+  /**
+   * `messageIds` was a local and the outer catch returned `[]`, so an email that
+   * had already dispatched vanished from the record. The run said FAILED and
+   * nothing-sent, an operator re-fired, and the recipient got the email twice.
+   */
+  it('keeps the messages the earlier channels already produced', async () => {
+    const recipient = await makeRecipient([
+      { type: 'email', value: 'partial@example.test' },
+      { type: 'sms', value: '+15559990002' },
+    ]);
+
+    // Break the SMS template only. The email is rendered and dispatched first.
+    await db
+      .update(templates)
+      .set({ key: 'medspa.appointment-reminder.sms.broken' })
+      .where(
+        and(
+          eq(templates.tenantId, TENANT),
+          eq(templates.key, 'medspa.appointment-reminder.sms'),
+        ),
+      );
+
+    try {
+      const [result] = await runtime.run(
+        trigger({
+          recipientId: recipient.id,
+          payload: { context: { appointmentDate: 'Tuesday', doctorName: 'Dr Byron' } },
+        }),
+      );
+
+      // The email went. The run says so, and says which channel failed.
+      expect(sent.map((s) => s.channel)).toEqual(['email']);
+      expect(result!.status).toBe('FAILED');
+      expect(result!.messageIds).toHaveLength(1);
+      expect(result!.reason).toMatch(/sms/i);
+
+      // And the row on disk agrees, which is what an operator reads.
+      const [row] = await db
+        .select({ messageIds: playbookRuns.messageIds, error: playbookRuns.error })
+        .from(playbookRuns)
+        .where(eq(playbookRuns.id, result!.runId as string));
+      expect(row!.messageIds).toHaveLength(1);
+      expect(row!.error).toMatch(/sms/i);
+    } finally {
+      await db
+        .update(templates)
+        .set({ key: 'medspa.appointment-reminder.sms' })
+        .where(
+          and(
+            eq(templates.tenantId, TENANT),
+            eq(templates.key, 'medspa.appointment-reminder.sms.broken'),
+          ),
+        );
+    }
   });
 });
 

@@ -173,6 +173,7 @@ export function createCompatMounts(deps: CompatDeps): Array<{ path: string; rout
   const send = createLegacySendRouters({
     dispatcher: deps.messaging.dispatcher,
     identity,
+    senderIdentity: deps.content.identity,
     templates: deps.content.store,
     renderer: deps.content.renderer,
   });

@@ -20,6 +20,7 @@ import {
   pgTable,
   primaryKey,
   text,
+  uniqueIndex,
   unique,
   uuid,
 } from 'drizzle-orm/pg-core';
@@ -75,6 +76,18 @@ export const playbooks = pgTable(
     priority: integer('priority').notNull().default(100),
     /** JSON Schema for caller-supplied context, generated from Zod (§0.9). */
     dataContract: jsonb('data_contract').notNull().default(sql`'{}'::jsonb`),
+    /**
+     * Target contract field → candidate source paths, tried in order. Lets a
+     * pack accept a caller's field names without renaming its contract; see
+     * `engine/playbooks/context-mapping.ts`. Added in 0016.
+     */
+    contextMapping: jsonb('context_mapping').notNull().default(sql`'{}'::jsonb`),
+    /**
+     * `[{when: <predicate>, priority: 'URGENT'}]` — raise a run's priority when
+     * the context says so. The medspa system alert documented a CRITICAL →
+     * URGENT escalation that nothing implemented. Added in 0016.
+     */
+    priorityRules: jsonb('priority_rules').notNull().default(sql`'[]'::jsonb`),
     /** {kind:'template',templateKey} | {kind:'ai',promptPackKey} | {kind:'hybrid',...} */
     contentSource: jsonb('content_source').notNull().default(sql`'{}'::jsonb`),
     /** [{channel, priority, fallbackAfterMs}] — replaces the dispatch switch. */
@@ -136,6 +149,18 @@ export const playbookRuns = pgTable(
     ),
     index('idx_playbook_runs_tenant_playbook').on(t.tenantId, t.playbookId, t.startedAt.desc()),
     index('idx_playbook_runs_correlation').on(t.correlationId),
+    // LOAD-BEARING, and it was missing from this model while living in 0007.
+    // It is what `reserveRun`'s ON CONFLICT targets — the reservation that
+    // makes a redelivered event send once rather than twice. Partial on
+    // `idempotency_key IS NOT NULL`, which is declared in the migration and is
+    // not expressible here.
+    uniqueIndex('playbook_runs_idempotency_unique').on(
+      t.tenantId,
+      t.playbookId,
+      t.idempotencyKey,
+    ),
+    // Runs that died mid-flight: RUNNING with an old started_at. Partial, 0018.
+    index('idx_playbook_runs_in_flight').on(t.tenantId, t.startedAt),
     // The idempotency guard is a PARTIAL unique index (WHERE idempotency_key IS
     // NOT NULL) declared in 0007 — a trigger without a key must not collide
     // with every other keyless run. Drizzle cannot express the WHERE clause.

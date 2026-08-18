@@ -1,6 +1,6 @@
 import winston from 'winston';
 
-import { applyAliases } from '../../../src/engine/content/render-context.js';
+import { applyAliases, emptyContext } from '../../../src/engine/content/render-context.js';
 import { Renderer } from '../../../src/engine/content/renderer.js';
 import type { RenderContext } from '../../../src/engine/content/render-context.js';
 
@@ -34,6 +34,24 @@ describe('alias map — existing medspa templates render unchanged', () => {
     expect(applyAliases('Hi {{patientName}}', MEDSPA_ALIASES)).toBe(
       'Hi {{recipient.displayName}}',
     );
+  });
+
+  /**
+   * The triple stash is how a template emits UNESCAPED markup, so it is
+   * exactly what a migrated HTML template uses — and the alias rewriter could
+   * not see inside it. `{{{patientName}}}` survived into the compiled template
+   * and Handlebars resolved it against a context with no `patientName`,
+   * rendering nothing at all: a blank where a patient's name should be, with no
+   * error anywhere.
+   */
+  it('rewrites inside a triple stash, which migrated HTML templates use', () => {
+    expect(applyAliases('Hi {{{patientName}}}', MEDSPA_ALIASES)).toBe(
+      'Hi {{{recipient.displayName}}}',
+    );
+  });
+
+  it('leaves an unbalanced stash alone rather than moving the bug', () => {
+    expect(applyAliases('{{{patientName}}', MEDSPA_ALIASES)).toBe('{{{patientName}}');
   });
 
   it('rewrites inside a block helper', () => {
@@ -72,6 +90,55 @@ describe('alias map — existing medspa templates render unchanged', () => {
       { aliases: MEDSPA_ALIASES },
     );
     expect(result.output).toBe('Hi Ada Lovelace, Dr. Rivera at Northside Clinic is checking in.');
+  });
+});
+
+/**
+ * HTML escaping follows the format.
+ *
+ * Every template compiled with escaping on, so a plain-text SMS rendered
+ * `O'Brien` as `O&#x27;Brien` in a message a person reads. There is nothing to
+ * escape in a text message; the default exists to defend a markup document.
+ */
+describe('escaping follows the format', () => {
+  const ctx = () => {
+    const c = emptyContext('t1');
+    c.recipient = { displayName: "Aoife O'Brien & Co." };
+    return c;
+  };
+
+  it('does not escape TEXT', async () => {
+    const out = await renderer().render('Hi {{recipient.displayName}}', ctx(), {
+      format: 'TEXT',
+    });
+    expect(out.output).toBe("Hi Aoife O'Brien & Co.");
+  });
+
+  it('does not escape MARKDOWN', async () => {
+    const out = await renderer().render('Hi {{recipient.displayName}}', ctx(), {
+      format: 'MARKDOWN',
+    });
+    expect(out.output).toBe("Hi Aoife O'Brien & Co.");
+  });
+
+  it('still escapes HTML — that is what the default is for', async () => {
+    // A recipient's own display name goes into an HTML document here. Turning
+    // escaping off for symmetry would be an injection.
+    const out = await renderer().render('<p>Hi {{recipient.displayName}}</p>', ctx(), {
+      format: 'HTML',
+    });
+    expect(out.output).toContain('&#x27;');
+    expect(out.output).toContain('&amp;');
+  });
+
+  it('caches per (format, source), so an SMS never gets the HTML template', async () => {
+    const r = renderer();
+    const source = 'Hi {{recipient.displayName}}';
+    const html = await r.render(source, ctx(), { format: 'HTML' });
+    const text = await r.render(source, ctx(), { format: 'TEXT' });
+
+    expect(html.output).toContain('&#x27;');
+    expect(text.output).toBe("Hi Aoife O'Brien & Co.");
   });
 });
 

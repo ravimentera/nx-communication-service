@@ -40,8 +40,26 @@ let pool: { end: () => Promise<void> };
 let redis: RedisHandle;
 let service: ApiKeyService;
 
-/** A tiny app in `apikey` mode, so the middleware is exercised as mounted. */
+/**
+ * A tiny app in `apikey` mode, so the middleware is exercised as mounted.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * THE WINDOW IS PINNED PER APP, NOT TO THE WALL CLOCK
+ *
+ * Production derives the window from `Math.floor(Date.now() / windowMs)` — a
+ * FIXED window aligned to the minute, which is the right behaviour there and a
+ * source of nondeterminism here: a test issuing five requests that happen to
+ * straddle a minute boundary has its counter reset midway and sees
+ * `[200,200,200,200,200]` where it expected two 429s. How often that happens
+ * depends only on what second the suite starts at.
+ *
+ * Each app gets its own window id instead. The middleware's limiting logic is
+ * what these tests are about; deriving the window is not.
+ */
+let windowSeq = 0;
+
 function buildApp(rateLimitPerMinute = 0): Express {
+  const windowId = `w${(windowSeq += 1)}`;
   const app = express();
   app.use(express.json());
   app.use(
@@ -50,10 +68,7 @@ function buildApp(rateLimitPerMinute = 0): Express {
       logger,
       verifyApiKey: (key) => service.verify(key),
       countRequest: (keyId, windowSeconds) =>
-        redis.store.incrWithTtl(
-          `rl:${keyId}:${Math.floor(Date.now() / (windowSeconds * 1000))}`,
-          windowSeconds,
-        ),
+        redis.store.incrWithTtl(`rl:${keyId}:${windowId}`, windowSeconds),
     }),
   );
   app.get('/whoami', (req, res) => {

@@ -1,5 +1,5 @@
 import cors from 'cors';
-import express, { type Express } from 'express';
+import express, { type Express, type Request } from 'express';
 import helmet from 'helmet';
 import type pg from 'pg';
 import type { Logger } from 'winston';
@@ -96,11 +96,40 @@ export interface AppDeps {
  *   4. The legacy compat surface is mounted LAST, so a root-mounted legacy
  *      router can never shadow a `/v1` path.
  */
+/**
+ * The socket's own peer address.
+ *
+ * Deliberately NOT `req.ip`, which honours `X-Forwarded-For` once
+ * `trust proxy` is set — and a header any caller can send is not an access
+ * control. The metrics allow-list has to be about who actually connected.
+ */
+function callerIp(req: Request): string {
+  const raw = req.socket.remoteAddress ?? '';
+  // Node reports IPv4 peers over a dual-stack socket as ::ffff:127.0.0.1.
+  return raw.startsWith('::ffff:') ? raw.slice('::ffff:'.length) : raw;
+}
+
 export function createApp(deps: AppDeps): Express {
   const { config, logger } = deps;
   const app = express();
 
   app.disable('x-powered-by');
+
+  // ── trust proxy ──────────────────────────────────────────────────────────
+  //
+  // Without this, `req.ip` is the load balancer's address for EVERY request —
+  // so `express-rate-limit` on `/unsubscribe/:token` put every client in the
+  // world into one bucket. The limiter did not protect the endpoint; it broke
+  // it, and the people it 429'd were recipients clicking unsubscribe.
+  //
+  // A NUMBER, not `true`. `trust proxy: true` tells Express to believe the
+  // whole `X-Forwarded-For` chain, which any client can prepend to — turning
+  // the limiter back off, this time silently. The hop count says "believe
+  // exactly the proxies we actually have in front of us".
+  //
+  // It does NOT affect the /metrics allow-list, which reads the socket's peer
+  // address directly for this exact reason: a header is not an access control.
+  app.set('trust proxy', config.server.trustProxyHops);
 
   // First, so every request downstream is measured and correlated.
   app.use(
@@ -111,12 +140,45 @@ export function createApp(deps: AppDeps): Express {
   );
 
   // (1) Pre-auth: Prometheus has no gateway headers.
+  //
+  // ALLOW-LISTED BY SOURCE ADDRESS, because pre-auth and tenant-labelled is a
+  // bad pair. Eight metric families carry a `tenant` label, so one
+  // unauthenticated GET returns the tenant roster along with each one's send
+  // volume and model spend. Defaults to loopback — a sidecar scrape keeps
+  // working, an exposed pod stops answering — and `METRICS_ALLOWED_IPS=*`
+  // restores the old behaviour where the network perimeter already handles it.
+  const metricsAllowed = new Set(config.observability.metricsAllowedIps);
+  const metricsOpen = metricsAllowed.has('*');
+
   app.get('/metrics', (req, res) => {
+    if (!metricsOpen && !metricsAllowed.has(callerIp(req))) {
+      // 404, not 403: whether this deployment exposes metrics at all is not
+      // something an unauthorized caller needs confirmed.
+      res.status(404).end();
+      return;
+    }
     void metricsHandler(req, res);
   });
 
   app.use(helmet());
-  app.use(cors());
+
+  // ── CORS ──────────────────────────────────────────────────────────────────
+  //
+  // `cors()` with no argument reflects ANY origin, which is how this shipped.
+  // Every route is behind gateway auth so it was never the only control, but
+  // the default should not be "any website may make cross-origin calls to the
+  // outreach engine".
+  //
+  // The default is now no CORS headers at all, which is correct for a service
+  // reached through the gateway and never from a browser directly.
+  // `CORS_ALLOWED_ORIGINS` names the exceptions; `*` restores the old
+  // behaviour for a deployment that needs it.
+  const origins = config.server.corsAllowedOrigins;
+  if (origins.includes('*')) {
+    app.use(cors());
+  } else if (origins.length > 0) {
+    app.use(cors({ origin: origins, credentials: true }));
+  }
 
   // (2) Pre-auth AND pre-body-parser: a provider callback carries no gateway
   //     headers — the signature is the credential — and verifying it needs the
@@ -149,6 +211,7 @@ export function createApp(deps: AppDeps): Express {
       redis: deps.redis,
       logger,
       queueStats: deps.queue ? () => deps.queue!.stats() : undefined,
+      packs: deps.playbooks?.packs,
     }),
   );
 

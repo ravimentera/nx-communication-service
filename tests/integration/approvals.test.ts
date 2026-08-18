@@ -156,6 +156,20 @@ beforeAll(async () => {
     await client.query(readFileSync(join(dir, file), 'utf8'));
   }
   await client.query(`INSERT INTO tenants (id, name, timezone) VALUES ('${TENANT}','Appr','UTC')`);
+  // ── THE TENANT'S OPT-IN POSTURE IS STATED, NOT INHERITED ────────────────────
+  //
+  // `require_opt_in` is `NOT NULL DEFAULT true`, and the gate honours that
+  // default for a tenant with no config row — a missing row used to read as
+  // `false`, so the least-configured tenant got the most permissive treatment.
+  //
+  // This suite is about approvals, not consent, and it enforces compliance for
+  // real (see `dispatcher(true)`). Without a row saying otherwise every approval
+  // here would be CANCELLED by a CONSENT_REQUIRED block, which would be the gate
+  // working and the test measuring the wrong thing.
+  await client.query(
+    `INSERT INTO tenant_channel_configs (tenant_id, name, require_opt_in)
+     VALUES ('${TENANT}', 'appr-cfg', false)`,
+  );
   await client.end();
 
   const handle = createDb({ url: container.getConnectionUri() }, logger);
@@ -592,6 +606,67 @@ describe('scheduling', () => {
     ]);
   });
 
+  /**
+   * `approve()` has an idempotency guard and `schedule()` had none, while
+   * APPROVED → SCHEDULED is a legal transition — so scheduling after an approve
+   * ran `release()` a second time. A second BullMQ job went out, and
+   * `dispatcher.persist()` reset the message row from SENT back to QUEUED, so
+   * the recipient got it twice and the log showed one send.
+   */
+  it('refuses to schedule an approval that has already been released', async () => {
+    const { approval } = await service.submit(scope, draft({ senderId: 'provider-Sched' }), {
+      key: 'medspa.provider-always',
+    });
+
+    await service.approve(scope, approval.id, {
+      ...provider,
+      senderId: 'provider-Sched',
+    });
+    expect(queued).toHaveLength(1);
+
+    await expect(
+      service.schedule(
+        scope,
+        approval.id,
+        { ...provider, senderId: 'provider-Sched' },
+        new Date(Date.now() + 3_600_000),
+      ),
+    ).rejects.toThrow(/already been released/);
+
+    // Still one job, and the message row was not walked back to QUEUED.
+    expect(queued).toHaveLength(1);
+  });
+
+  it('will not let a second dispatch move a SENT message back to QUEUED', async () => {
+    const { approval } = await service.submit(scope, draft({ senderId: 'provider-Sent' }), {
+      key: 'medspa.provider-always',
+    });
+    await service.approve(scope, approval.id, { ...provider, senderId: 'provider-Sent' });
+
+    // The worker reports the send.
+    await db
+      .update(messages)
+      .set({ status: 'SENT', sentAt: new Date() })
+      .where(and(eq(messages.tenantId, TENANT), eq(messages.id, approval.messageId)));
+
+    // Anything reaching the dispatcher for this row now is a duplicate.
+    await expect(
+      dispatcher(false).dispatch({
+        messageId: approval.messageId,
+        tenantId: TENANT,
+        channel: 'email',
+        to: { type: 'email', value: 'ada@example.test' },
+        rendered: { body: 'again' },
+      }),
+    ).rejects.toThrow(/cannot be dispatched again/);
+
+    const [row] = await db
+      .select({ status: messages.status })
+      .from(messages)
+      .where(and(eq(messages.tenantId, TENANT), eq(messages.id, approval.messageId)));
+    expect(row!.status).toBe('SENT');
+  });
+
   it('refuses a time in the past', async () => {
     const { approval } = await service.submit(scope, draft(), { key: 'medspa.provider-always' });
     await expect(
@@ -687,6 +762,54 @@ describe('the inbox', () => {
   });
 });
 
+/**
+ * Reads are authorized the same way writes are.
+ *
+ * The mutations were tightened per row in P6 (D45) and the reads were missed —
+ * so `getById` applied the tenant predicate and nothing else, and the list
+ * filter was dropped entirely when the caller had no sender identity. Both
+ * failed OPEN, which is the one direction an access check must not fail.
+ */
+describe('reading an approval is authorized per row', () => {
+  it('hides another sender’s approval behind 404, not 403', async () => {
+    const { approval } = await service.submit(scope, draft({ senderId: 'provider-Owner' }), {
+      key: 'medspa.provider-always',
+    });
+
+    const owner: Actor = { type: 'user', ref: 'u-1', senderId: 'provider-Owner', role: 'provider', permissions: [] };
+    const other: Actor = { type: 'user', ref: 'u-2', senderId: 'provider-Other', role: 'provider', permissions: [] };
+
+    expect(await service.getByIdFor(scope, approval.id, owner)).not.toBeNull();
+
+    // Not 403: answering "forbidden" would confirm an approval with this id
+    // exists in the tenant, which is more than this caller should learn.
+    expect(await service.getByIdFor(scope, approval.id, other)).toBeNull();
+  });
+
+  it('lets an approve-permission holder read any queue', async () => {
+    const { approval } = await service.submit(scope, draft({ senderId: 'provider-Owner2' }), {
+      key: 'medspa.provider-always',
+    });
+
+    const lead: Actor = {
+      type: 'user',
+      ref: 'u-3',
+      senderId: 'provider-Lead',
+      role: 'provider',
+      permissions: ['outreach:approve'],
+    };
+    expect(await service.getByIdFor(scope, approval.id, lead)).not.toBeNull();
+  });
+
+  it('still hides it from another tenant', async () => {
+    const { approval } = await service.submit(scope, draft({ senderId: PROVIDER }), {
+      key: 'medspa.provider-always',
+    });
+    const admin: Actor = { type: 'user', ref: 'u-4', role: 'admin', permissions: ['outreach:admin'] };
+    expect(await service.getByIdFor({ tenantId: 'other-tenant' }, approval.id, admin)).toBeNull();
+  });
+});
+
 describe('the SLA sweeper', () => {
   it('expires and escalates a pending approval past its deadline', async () => {
     const [policy] = await db
@@ -731,6 +854,92 @@ describe('the SLA sweeper', () => {
       'EXPIRED',
       'PENDING_APPROVAL',
     ]);
+  });
+
+  /**
+   * The regression this suite did not have.
+   *
+   * The unit test asserted that the sweeper *called* `approve()` — against a
+   * mock. It did, and `approve()` returned immediately: `AUTO_APPROVED` is in
+   * `APPROVED_STATES`, so the idempotency guard treated an approval the sweeper
+   * had just written as one already handled, and `release()` was never reached.
+   * One of the three documented SLA outcomes sent nothing while the audit trail
+   * said it had been approved. Only a real service and a real queue show it.
+   */
+  it('onExpiry: approve actually dispatches the message', async () => {
+    const [policy] = await db
+      .insert(approvalPolicies)
+      .values({
+        tenantId: TENANT,
+        key: 'test.sla-auto-approve',
+        name: 'Auto-approve on expiry',
+        mode: 'always',
+        approverResolution: { kind: 'agent' },
+        rights: { approve: true },
+        sla: { deadlineMs: 1, onExpiry: 'approve' },
+      })
+      .returning();
+
+    const { approval } = await service.submit(scope, draft({ senderId: 'provider-Auto' }), {
+      policyId: policy!.id,
+    });
+
+    const sweeper = new SlaSweeper({ db, logger, approvals: service, policies });
+    const report = await sweeper.sweep(new Date(Date.now() + 60_000));
+    expect(report).toMatchObject({ approved: 1, failed: 0 });
+
+    const after = await service.getById(scope, approval.id);
+    expect(after!.status).toBe('AUTO_APPROVED');
+    // The policy decided, not a person — and the trail says so.
+    expect(after!.decidedBy).toBe('sla.worker');
+    expect(after!.auditTrail.map((e) => e.to)).toEqual([
+      'PENDING_APPROVAL',
+      'EXPIRED',
+      'AUTO_APPROVED',
+    ]);
+
+    // The assertion that matters: a job exists for this message.
+    expect(queued.map((j) => j.messageId)).toContain(approval.messageId);
+
+    const [row] = await db
+      .select()
+      .from(messages)
+      .where(and(eq(messages.tenantId, TENANT), eq(messages.id, approval.messageId)));
+    expect(row!.status).toBe('QUEUED');
+  });
+
+  it('recovers a row left EXPIRED by a crash between the two writes', async () => {
+    const [policy] = await db
+      .insert(approvalPolicies)
+      .values({
+        tenantId: TENANT,
+        key: 'test.sla-stranded',
+        name: 'Auto-approve on expiry (stranded)',
+        mode: 'always',
+        approverResolution: { kind: 'agent' },
+        rights: { approve: true },
+        sla: { deadlineMs: 1, onExpiry: 'approve' },
+      })
+      .returning();
+
+    const { approval } = await service.submit(scope, draft({ senderId: 'provider-Stranded' }), {
+      policyId: policy!.id,
+    });
+
+    // Exactly what a crash between `markExpired` and its follow-up leaves
+    // behind. The old scan filtered on PENDING_APPROVAL, so from here on the
+    // row was invisible: never sent, never declined, never seen again.
+    await db
+      .update(approvals)
+      .set({ status: 'EXPIRED' })
+      .where(and(eq(approvals.tenantId, TENANT), eq(approvals.id, approval.id)));
+
+    const sweeper = new SlaSweeper({ db, logger, approvals: service, policies });
+    const report = await sweeper.sweep(new Date(Date.now() + 60_000));
+
+    expect(report).toMatchObject({ approved: 1, failed: 0 });
+    expect((await service.getById(scope, approval.id))!.status).toBe('AUTO_APPROVED');
+    expect(queued.map((j) => j.messageId)).toContain(approval.messageId);
   });
 
   it('leaves an approval with no deadline alone forever', async () => {

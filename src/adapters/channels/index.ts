@@ -29,11 +29,17 @@ export interface ChannelRegistryOptions {
    */
   preferSmtp?: boolean;
   fcmApiKey?: string;
+  /** Passed to the webhook adapter; see `base.ts`. */
+  allowPrivateWebhookTargets?: boolean;
 }
 
 export function createChannelRegistry(options: ChannelRegistryOptions): ChannelRegistry {
   const { logger, db, dryRun } = options;
-  const deps = { logger, dryRun };
+  const deps = {
+    logger,
+    dryRun,
+    ...(options.allowPrivateWebhookTargets ? { allowPrivateWebhookTargets: true } : {}),
+  };
 
   const registry = new InMemoryChannelRegistry();
 

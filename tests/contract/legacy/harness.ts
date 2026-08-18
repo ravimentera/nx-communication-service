@@ -28,6 +28,7 @@ import { loadConfig } from '../../../src/config/index.js';
 import { createDb, type Db } from '../../../src/db/index.js';
 import { ApprovalService } from '../../../src/engine/approvals/approval.service.js';
 import { PolicyService } from '../../../src/engine/approvals/policy.service.js';
+import { ConsentService } from '../../../src/engine/compliance/consent.service.js';
 import { ComplianceGate } from '../../../src/engine/compliance/gate.js';
 import { ErasureService } from '../../../src/engine/compliance/erasure.service.js';
 import { PreferenceService } from '../../../src/engine/compliance/preference.service.js';
@@ -60,6 +61,7 @@ import { createChannelRegistry } from '../../../src/adapters/channels/index.js';
 import { createCredentialMappers } from '../../../src/adapters/channels/credentials.js';
 import { InlineContextProvider } from '../../../src/adapters/context/inline.provider.js';
 import { createBodyResolver } from '../../../src/api/compat/send.js';
+import { IdentityResolver } from '../../../src/engine/content/identity.js';
 import { loadPacks } from '../../../src/packs/loader.js';
 import { createAuthMiddleware } from '../../../src/platform/http/auth.middleware.js';
 import { Cache, createRedis } from '../../../src/platform/redis/index.js';
@@ -103,6 +105,8 @@ export interface Harness {
   db: Db;
   receipts: ReceiptService;
   queue: NotificationQueue;
+  /** Exposed so a suite can assert the Twilio-account ownership check (0021). */
+  channelConfigs: ChannelConfigService;
   stop: () => Promise<void>;
 }
 
@@ -237,6 +241,8 @@ export async function startHarness(): Promise<Harness> {
     logger,
   });
 
+  const identity = new IdentityResolver({ db, logger });
+
   const runtime = new PlaybookRuntime({
     db,
     logger,
@@ -246,6 +252,7 @@ export async function startHarness(): Promise<Harness> {
     templates: templateStore,
     renderer,
     generator,
+    identity,
     approvals,
     policies,
     dispatcher,
@@ -267,6 +274,7 @@ export async function startHarness(): Promise<Harness> {
   const recipientDeps = {
     recipients,
     preferences,
+    consent: new ConsentService({ db, logger }),
     gate,
     erasure: new ErasureService({ db, logger }),
   };
@@ -285,7 +293,7 @@ export async function startHarness(): Promise<Harness> {
     }),
   });
 
-  const contentDeps = { renderer, store: templateStore, generator, packs, assets, logger };
+  const contentDeps = { renderer, store: templateStore, generator, identity, packs, assets, logger };
 
   // P11. Registered here so the OpenAPI contract test actually SEES the
   // campaign routes — a harness that omits a dep bundle makes
@@ -297,7 +305,7 @@ export async function startHarness(): Promise<Harness> {
   // P12 (D101). The compat shim's `/communications/generate-message` and
   // `/automated-messages/generate` both delegate here now, and so does
   // `POST /v1/outreach/generate` and the `generateDraft` MCP tool.
-  const drafts = new DraftService({ generator, packs, recipients, approvals });
+  const drafts = new DraftService({ generator, identity, packs, recipients, approvals });
 
   const app = createApp({
     config,
@@ -325,7 +333,7 @@ export async function startHarness(): Promise<Harness> {
       queue,
       logger,
       authenticate: createAuthMiddleware({ config: config.auth, logger }),
-      render: createBodyResolver({ templates: templateStore, renderer }),
+      render: createBodyResolver({ templates: templateStore, renderer, senderIdentity: identity }),
       drafts,
       approvals,
       conversations: messaging.conversations,
@@ -353,6 +361,7 @@ export async function startHarness(): Promise<Harness> {
 
   return {
     app,
+    channelConfigs,
     db,
     receipts,
     queue,

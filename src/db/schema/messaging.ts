@@ -16,6 +16,7 @@ import {
   numeric,
   pgTable,
   text,
+  uniqueIndex,
   uuid,
 } from 'drizzle-orm/pg-core';
 
@@ -159,6 +160,12 @@ export const messages = pgTable(
     index('idx_messages_channel').on(t.channel),
     index('idx_messages_tenant_subtenant').on(t.tenantId, t.subTenantId),
     index('idx_messages_provider_message_id').on(t.tenantId, t.providerMessageId),
+    // Partial on `direction = 'inbound' AND provider_message_id IS NOT NULL` —
+    // declared in 0017; the predicate is not expressible here. It is what makes
+    // a retried Twilio callback a no-op instead of a second copy of the same
+    // patient reply, and Twilio sends no timestamp so nothing upstream can
+    // reject the replay.
+    uniqueIndex('messages_inbound_provider_id_unique').on(t.tenantId, t.providerMessageId),
     // The compliance gate's rate-limit and throttle windows (P5, 0005).
     index('idx_messages_rate_window').on(t.tenantId, t.channel, t.direction, t.createdAt.desc()),
     index('idx_messages_recipient_window').on(

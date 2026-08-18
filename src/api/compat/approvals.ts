@@ -30,6 +30,7 @@ import { Permission, requireTenant } from '../../platform/http/auth.middleware.j
 import { ForbiddenError, NotFoundError } from '../../platform/http/errors.js';
 import type { TenantScope } from '../../platform/db/tenant-scope.js';
 import { deprecate } from './index.js';
+import { uuidParam } from '../../platform/http/params.js';
 
 const contentSchema = z.object({
   content: z.string().min(1),
@@ -52,15 +53,39 @@ function handle(
  * is the point of D45, so it lives here rather than being left to the service.
  */
 function assertOwnQueue(req: Request, pathProviderId: string): void {
-  const senderId = req.identity?.senderId;
+  // Admin only, deliberately narrower than the `/v1` read path — which also
+  // lets an `outreach:approve` holder widen to another queue. This is the
+  // legacy surface and D45's tightening is documented in BREAKING.md as "403
+  // outside the caller's queue"; widening it here would change a documented
+  // contract while fixing a bug, which are two different changes.
   const isAdmin = req.identity?.permissions?.includes(Permission.ADMIN);
-  if (!isAdmin && senderId && senderId !== pathProviderId) {
+  if (isAdmin) return;
+
+  const senderId = req.identity?.senderId;
+
+  // The missing-header case is the whole point. This used to read
+  // `!isAdmin && senderId && senderId !== pathProviderId`, so a request with no
+  // `x-sender-id` short-circuited on the middle term and passed — any caller
+  // could read any provider's queue by leaving a header off. A check that is
+  // satisfied by supplying less is not a check.
+  if (!senderId) {
+    throw new ForbiddenError(
+      'Access denied: reading an approval queue requires a sender identity (x-sender-id)',
+    );
+  }
+
+  if (senderId !== pathProviderId) {
     throw new ForbiddenError('Access denied: you can only access your own approval queue');
   }
 }
 
 export function createLegacyApprovalRouter(deps: ApprovalApiDeps): Router {
   const router = Router();
+
+  // The legacy routes key on the MESSAGE id, not the approval id — two
+  // different identifiers for one decision. `:providerId` beside it is a
+  // sender string, not a uuid, so it stays unguarded.
+  router.param('messageId', uuidParam());
   router.use(deprecate('/approvals', '/v1/approvals'));
 
   /** message id in, approval id out. 404 when this tenant owns neither. */

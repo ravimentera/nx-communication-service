@@ -38,6 +38,13 @@ import type { Request, Response } from 'express';
 /** Reject a callback older than this, so a captured request cannot be replayed. */
 const REPLAY_WINDOW_SECONDS = 300;
 
+/**
+ * How far ahead of us a caller's clock may legitimately be. Seconds, not
+ * minutes: NTP-synced hosts differ by milliseconds, and every second of slack
+ * here is a second of extra life for a captured signature.
+ */
+const CLOCK_SKEW_SECONDS = 30;
+
 export interface RawBodyRequest extends Request {
   rawBody?: Buffer;
 }
@@ -60,11 +67,25 @@ function safeEqual(a: string, b: string): boolean {
   return timingSafeEqual(left, right);
 }
 
+/**
+ * Is this timestamp recent enough to be a live callback rather than a replay?
+ *
+ * The window is asymmetric on purpose. A timestamp in the **past** is normal —
+ * network latency, a provider's retry queue — and gets the full window. A
+ * timestamp in the **future** is not: the only innocent cause is clock skew,
+ * which is seconds, and an attacker replaying a captured callback can date it
+ * whenever they like. `Math.abs` treated a callback stamped four minutes from
+ * now as fresh, which extends any captured signature's usable life by the whole
+ * window in the direction an attacker controls.
+ */
 function withinReplayWindow(timestamp: string | undefined, now: number): boolean {
   if (!timestamp) return false;
   const seconds = Number(timestamp);
   if (!Number.isFinite(seconds)) return false;
-  return Math.abs(now / 1000 - seconds) <= REPLAY_WINDOW_SECONDS;
+
+  const ageSeconds = now / 1000 - seconds;
+  if (ageSeconds < -CLOCK_SKEW_SECONDS) return false;
+  return ageSeconds <= REPLAY_WINDOW_SECONDS;
 }
 
 /**
@@ -75,6 +96,18 @@ function withinReplayWindow(timestamp: string | undefined, now: number): boolean
  * requested; behind a gateway that strips `/api/communication` and a load
  * balancer that terminates TLS, `req.protocol` and `req.originalUrl` reconstruct
  * something else entirely. `config.webhooks.publicUrl` states the real one.
+ *
+ * NO REPLAY WINDOW, AND THERE CANNOT BE ONE. Twilio's callback carries no
+ * timestamp — it is not part of the protocol — so there is nothing to compare a
+ * clock against, unlike SendGrid and Slack which both sign one. Inventing a
+ * check against `Date.now()` here would reject nothing and imply a protection
+ * that does not exist.
+ *
+ * The defence against a replayed Twilio callback is idempotency at the other
+ * end instead: an inbound message is uniquely keyed on
+ * (tenant, provider_message_id) and upserted, and a status receipt cannot move
+ * a message out of a terminal state. A replay is therefore a no-op rather than
+ * a duplicate patient reply or a resurrected status.
  *
  * https://www.twilio.com/docs/usage/security#validating-requests
  */

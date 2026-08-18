@@ -160,6 +160,10 @@ export function createWebhookRouter(deps: WebhookDeps): Router {
           event,
           at: new Date(),
           reason: body.ErrorCode ? `twilio ${body.ErrorCode}` : undefined,
+          // The tenant whose auth token verified the signature above. Scopes
+          // the message lookup, so a validly-signed callback can only act on
+          // messages belonging to the account that signed it.
+          ...(tenantConfig?.tenantId ? { tenantId: tenantConfig.tenantId } : {}),
           raw: body,
         });
       }

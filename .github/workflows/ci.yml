@@ -10,8 +10,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Static checks and the suites that need nothing but Node. Fast, and the ones
+  # that catch most mistakes — so they report before the containers finish.
   verify:
     runs-on: ubuntu-latest
+    # Every job gets a bound. Without one a hung suite holds a runner for the
+    # account default (6 hours), and the failure looks like a queue problem
+    # rather than a test that never returned.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -21,11 +27,28 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
-      - run: npm test
+      - run: npm run test:fast
       - run: npm run build
+
+  # Separate, because these start a Postgres container per suite: they are the
+  # slow half and they fail for different reasons — a container that would not
+  # start is not a broken test, and reading that off one combined job is
+  # guesswork.
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run test:integration
 
   docker:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
